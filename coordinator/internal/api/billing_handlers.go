@@ -643,7 +643,7 @@ func (s *Server) handleAdminDeleteModel(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleModelCatalog(w http.ResponseWriter, r *http.Request) {
 	allModels := s.store.ListSupportedModels()
 
-	// Optional filter: ?type=text or ?type=transcription
+	// Optional filter: ?type=text
 	typeFilter := r.URL.Query().Get("type")
 
 	// Filter to active models only (and by type if specified)

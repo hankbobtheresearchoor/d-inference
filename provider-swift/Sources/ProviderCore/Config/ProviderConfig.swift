@@ -1,8 +1,11 @@
 /// Provider configuration management.
 ///
-/// Configuration is stored in TOML format at `~/.config/eigeninference/provider.toml`
-/// (legacy path, kept for backward compatibility with existing installations).
-/// The same path the Rust CLI uses, via `dirs::config_dir()`. The config includes:
+/// Configuration is stored in TOML format at `~/.config/darkbloom/provider.toml`.
+/// For backward compatibility with existing installations, the loader also
+/// reads from `~/.config/eigeninference/provider.toml` and the legacy
+/// `~/Library/Application Support/{darkbloom,eigeninference}/provider.toml`
+/// paths. New installs always write to the canonical `~/.config/darkbloom/`
+/// path. The config includes:
 ///   - Provider identity (name, memory reserve)
 ///   - Backend settings (port, model, continuous batching, idle timeout)
 ///   - Coordinator connection settings (URL, heartbeat interval)
@@ -186,53 +189,44 @@ public enum ConfigError: Error, CustomStringConvertible {
 
 public enum ConfigManager: Sendable {
 
-    /// Default config file path: `~/.config/eigeninference/provider.toml`
+    /// Default config file path. Resolution order, first hit wins:
     ///
-    /// The `~/.config/eigeninference/` path is a legacy path kept for backward
-    /// compatibility with existing Rust CLI installations. This matches the Rust
-    /// `dirs::config_dir()` behavior on macOS, which maps to
-    /// `~/Library/Application Support/`. We check both XDG-style and App Support paths.
+    /// 1. `~/.config/darkbloom/provider.toml`  (canonical, new installs)
+    /// 2. `~/Library/Application Support/darkbloom/provider.toml`
+    /// 3. `~/.config/eigeninference/provider.toml`  (legacy, Rust-CLI era)
+    /// 4. `~/Library/Application Support/eigeninference/provider.toml`
+    ///
+    /// If none of those files exist yet, we return path #1 so first-time
+    /// `save()` writes to the canonical location.
     public static func defaultConfigPath() throws -> URL {
-        // The Rust `dirs` crate maps config_dir() to ~/Library/Application Support/
-        // on macOS, but the Darkbloom provider historically uses ~/.config/ via
-        // dirs::config_dir() which follows XDG on macOS when $XDG_CONFIG_HOME is set.
-        // Check both locations, preferring the one that exists.
-        // Note: ~/.config/eigeninference/ is a legacy path kept for backward compatibility.
         let home = FileManager.default.homeDirectoryForCurrentUser
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first
 
-        // Primary: ~/.config/eigeninference/provider.toml (legacy path, matches Rust CLI)
-        let xdgPath = home
+        let xdgNew = home
+            .appendingPathComponent(".config")
+            .appendingPathComponent("darkbloom")
+            .appendingPathComponent("provider.toml")
+        let xdgLegacy = home
             .appendingPathComponent(".config")
             .appendingPathComponent("eigeninference")
             .appendingPathComponent("provider.toml")
 
-        // Secondary: ~/Library/Application Support/eigeninference/provider.toml (legacy path)
-        if let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask
-        ).first {
-            let appSupportPath = appSupport
-                .appendingPathComponent("eigeninference")
-                .appendingPathComponent("provider.toml")
+        let appNew = appSupport?
+            .appendingPathComponent("darkbloom")
+            .appendingPathComponent("provider.toml")
+        let appLegacy = appSupport?
+            .appendingPathComponent("eigeninference")
+            .appendingPathComponent("provider.toml")
 
-            // Also check legacy "darkbloom" directory
-            let legacyPath = appSupport
-                .appendingPathComponent("darkbloom")
-                .appendingPathComponent("provider.toml")
-
-            // Return whichever exists, preferring xdg > appSupport > legacy > xdg (default)
-            if FileManager.default.fileExists(atPath: xdgPath.path) {
-                return xdgPath
-            }
-            if FileManager.default.fileExists(atPath: appSupportPath.path) {
-                return appSupportPath
-            }
-            if FileManager.default.fileExists(atPath: legacyPath.path) {
-                return legacyPath
+        let candidates = [xdgNew, appNew, xdgLegacy, appLegacy].compactMap { $0 }
+        for candidate in candidates {
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
             }
         }
-
-        // Default to XDG path for new installs
-        return xdgPath
+        return xdgNew
     }
 
     /// Load config from a file path.

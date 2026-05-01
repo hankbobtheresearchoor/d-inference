@@ -1,5 +1,5 @@
 {
-  "originHash" : "3906467b4323a865d27fbc7b5eb877ca0a7e1b924f5858ce90b85c971199d039",
+  "originHash" : "2050b27a7e0fe9fe84457cdcafc350d769e590c35dfbf24d1e756d126d55d6a3",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -8,6 +8,24 @@
       "state" : {
         "revision" : "3a5b74a58782c3b4c1f0bc75e9b67b10c2494e8f",
         "version" : "1.33.1"
+      }
+    },
+    {
+      "identity" : "compress-nio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/adam-fowler/compress-nio.git",
+      "state" : {
+        "revision" : "e1caa19077dda4b00441142ef57da3db02acd466",
+        "version" : "1.4.2"
+      }
+    },
+    {
+      "identity" : "eventsource",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mattt/EventSource.git",
+      "state" : {
+        "revision" : "a3a85a85214caf642abaa96ae664e4c772a59f6e",
+        "version" : "1.4.1"
       }
     },
     {
@@ -20,12 +38,12 @@
       }
     },
     {
-      "identity" : "jinja",
+      "identity" : "hummingbird-websocket",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/johnmai-dev/Jinja",
+      "location" : "https://github.com/hummingbird-project/hummingbird-websocket.git",
       "state" : {
-        "revision" : "5c0a87846dfd36ca6621795ad2f09fdaab82b739",
-        "version" : "1.3.0"
+        "revision" : "716c54294152c6d3301a6239a1d74db57cbcd6dc",
+        "version" : "2.6.0"
       }
     },
     {
@@ -134,6 +152,24 @@
       "state" : {
         "revision" : "45eb0224913ea070ec4fba17291b9e7ecf4749ca",
         "version" : "1.5.1"
+      }
+    },
+    {
+      "identity" : "swift-huggingface",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/huggingface/swift-huggingface.git",
+      "state" : {
+        "revision" : "b721959445b617d0bf03910b2b4aced345fd93bf",
+        "version" : "0.9.0"
+      }
+    },
+    {
+      "identity" : "swift-jinja",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/huggingface/swift-jinja.git",
+      "state" : {
+        "revision" : "0aeefadec459ce8e11a333769950fb86183aca43",
+        "version" : "2.3.5"
       }
     },
     {
@@ -258,8 +294,17 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/huggingface/swift-transformers",
       "state" : {
-        "revision" : "f000aa7aec0e78acd0211685e4094e1fca84cd8b",
-        "version" : "0.1.24"
+        "revision" : "b38443e44d93eca770f2eb68e2a4d0fa100f9aa2",
+        "version" : "1.3.0"
+      }
+    },
+    {
+      "identity" : "swift-websocket",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/hummingbird-project/swift-websocket.git",
+      "state" : {
+        "revision" : "ca48d46c25f8fa948d37eaa480c73172182cf90f",
+        "version" : "1.5.0"
       }
     },
     {
@@ -269,6 +314,15 @@
       "state" : {
         "revision" : "ec6198d37d495efc6acd4dffbd262cdca7ff9b3f",
         "version" : "0.6.0"
+      }
+    },
+    {
+      "identity" : "yyjson",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ibireme/yyjson.git",
+      "state" : {
+        "revision" : "8b4a38dc994a110abaec8a400615567bd996105f",
+        "version" : "0.12.0"
       }
     }
   ],

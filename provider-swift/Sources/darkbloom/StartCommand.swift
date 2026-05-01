@@ -28,7 +28,22 @@ struct Start: AsyncParsableCommand {
     @Flag(inversion: .prefixedNo, help: .hidden)
     var foreground = false
 
+    @Flag(help: "Run a local OpenAI-compatible HTTP server only; do not connect to the coordinator.")
+    var local = false
+
+    @Option(help: "Local server port (used with --local).")
+    var port: UInt16 = 8000
+
     mutating func run() async throws {
+        // GPU is required. Reject CPU fallback up-front so we never
+        // come up reporting healthy and then silently churn at 0.5 tok/s.
+        do {
+            _ = try GPUEnforcement.requireMetal()
+        } catch {
+            printError("\(error)")
+            throw ExitCode.failure
+        }
+
         let snapshot = try loadRuntimeSnapshot(configOptions: configOptions)
         let effectiveCoordinator = coordinatorURL ?? snapshot.config.coordinator.url
         var effectiveConfig = snapshot.config
@@ -46,7 +61,13 @@ struct Start: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        if foreground {
+        if local {
+            try await runLocalStandalone(
+                snapshot: snapshot,
+                config: effectiveConfig,
+                hardware: hardware
+            )
+        } else if foreground {
             try await runForeground(
                 snapshot: snapshot,
                 hardware: hardware,
@@ -60,6 +81,52 @@ struct Start: AsyncParsableCommand {
                 coordinatorURL: effectiveCoordinator
             )
         }
+    }
+
+    // MARK: - Standalone (--local)
+
+    private func runLocalStandalone(
+        snapshot: RuntimeSnapshot,
+        config: ProviderConfig,
+        hardware: HardwareInfo
+    ) async throws {
+        let advertised = advertisedModels(
+            from: snapshot.models,
+            config: config,
+            modelOverrides: model
+        )
+
+        print("darkbloom \(ProviderCore.version) (standalone)")
+        print("Listening on 127.0.0.1:\(port)")
+        print("Models: \(advertised.count)")
+        for m in advertised {
+            print("  \(m.id) (\(String(format: "%.1f", m.estimatedMemoryGb)) GB)")
+        }
+        print("OpenAI-compatible: GET /health, GET /v1/models, POST /v1/chat/completions")
+        print()
+
+        // Standalone mode still benefits from the PID lock + sleep prevention.
+        try ProcessLifecycle.acquireSingleInstanceLock()
+        ProcessLifecycle.preventSystemSleep()
+        defer { ProcessLifecycle.releaseSingleInstanceLock() }
+
+        let scheduler = BatchScheduler(
+            maxConcurrentRequests: 4,
+            pendingTimeout: .seconds(120),
+            defaultMaxTokens: 4096
+        )
+
+        let server = StandaloneServer(
+            config: StandaloneServerConfig(port: port, host: "127.0.0.1"),
+            scheduler: scheduler,
+            models: advertised
+        )
+        try await server.start()
+
+        // Wait forever (until SIGINT). In standalone mode we don't have a
+        // coordinator event stream to drive the loop, so we just block.
+        let waitForever = AsyncStream<Never> { _ in }
+        for await _ in waitForever {}
     }
 
     // MARK: - Foreground (invoked by launchd)
@@ -88,6 +155,34 @@ struct Start: AsyncParsableCommand {
         let runtimeHashes = (try? RuntimeHashReporter().report().coordinatorRuntimeHashes)
         let authToken = AuthTokenStore.load()
 
+        // ----- Process-level lifecycle: PID lock + caffeinate. -----
+        try ProcessLifecycle.acquireSingleInstanceLock()
+        ProcessLifecycle.preventSystemSleep()
+        defer { ProcessLifecycle.releaseSingleInstanceLock() }
+
+        // Install panic hook BEFORE telemetry so a crash during telemetry
+        // setup is itself captured.
+        PanicHook.install()
+
+        // ----- Telemetry: configure now so reconnect/inference/panic events flow. -----
+        TelemetryClient.shared.configure(TelemetryClientConfig(
+            coordinatorURL: coordinatorURL,
+            source: .provider,
+            authToken: authToken,
+            version: ProviderCore.version,
+            machineId: macHardwareSerialNumber() ?? ""
+        ))
+
+        TelemetryClient.shared.emit(
+            kind: .log,
+            severity: .info,
+            message: "provider starting",
+            fields: [
+                "backend": .string("mlx-swift"),
+                "models": .int(models.count),
+            ]
+        )
+
         print("darkbloom \(ProviderCore.version)")
         print("Backend: mlx-swift")
         print("Config: \(describeConfigPath(snapshot))")
@@ -108,7 +203,18 @@ struct Start: AsyncParsableCommand {
         )
 
         let loop = try ProviderLoop(config: loopConfig)
-        try await loop.run()
+        do {
+            try await loop.run()
+        } catch {
+            TelemetryClient.shared.emit(
+                kind: .log,
+                severity: .error,
+                message: "provider loop terminated: \(error.localizedDescription)"
+            )
+            throw error
+        }
+
+        await TelemetryClient.shared.shutdown()
     }
 
     // MARK: - Daemon (interactive picker → launchd)

@@ -56,50 +56,57 @@ func TestInstallScriptTemplating(t *testing.T) {
 		}
 	})
 
-	t.Run("R2 CDN URL substituted when set", func(t *testing.T) {
-		srv := newTestServerWithR2(t, "https://pub-devxxx.r2.dev", "https://pub-devpkg.r2.dev")
+	// Post-Swift-cutover (v0.5.0+): install.sh no longer references R2
+	// placeholders directly. Model weights are downloaded by `darkbloom
+	// models download` from the public R2 CDN; the Python runtime tarball
+	// is gone entirely. The R2 placeholder constants in server.go were
+	// dropped along with these tests.
+	t.Run("install.sh has no leftover R2 placeholders", func(t *testing.T) {
+		srv := newTestServerWithBaseURL(t, "https://api.dev.darkbloom.xyz")
 		defer srv.Close()
 
 		body := fetchInstallScript(t, srv.URL)
 
 		if strings.Contains(body, "__DARKBLOOM_R2_CDN_URL__") {
-			t.Error("R2 CDN placeholder not substituted")
+			t.Error("install.sh still references __DARKBLOOM_R2_CDN_URL__ -- handler dropped substitution")
 		}
 		if strings.Contains(body, "__DARKBLOOM_R2_SITE_PACKAGES_CDN_URL__") {
-			t.Error("R2 site-packages CDN placeholder not substituted")
-		}
-		if !strings.Contains(body, "https://pub-devxxx.r2.dev") {
-			t.Error("dev R2 CDN URL not present after substitution")
-		}
-		if !strings.Contains(body, "https://pub-devpkg.r2.dev") {
-			t.Error("dev R2 site-packages URL not present after substitution")
+			t.Error("install.sh still references __DARKBLOOM_R2_SITE_PACKAGES_CDN_URL__ -- handler dropped substitution")
 		}
 	})
 
-	t.Run("R2 site-packages CDN defaults to R2 CDN when unset", func(t *testing.T) {
-		srv := newTestServerWithR2(t, "https://pub-devxxx.r2.dev", "")
+	t.Run("install.sh installs the Swift bundle, not the Python runtime", func(t *testing.T) {
+		srv := newTestServerWithBaseURL(t, "https://api.dev.darkbloom.xyz")
 		defer srv.Close()
 
 		body := fetchInstallScript(t, srv.URL)
 
-		if strings.Contains(body, "__DARKBLOOM_R2_SITE_PACKAGES_CDN_URL__") {
-			t.Error("R2 site-packages placeholder left unsubstituted when R2 CDN is set")
+		// Swift cutover invariants -- install.sh must not download Python
+		// or the vllm-mlx site-packages tarball.
+		bannedSubstrings := []string{
+			"vllm-mlx",
+			"vllm_mlx",
+			"PBS_PYTHON_VERSION",
+			"python-build-standalone",
+			"eigeninference-site-packages",
+			"eigeninference-python-macos-arm64",
+			"site-packages",
+		}
+		for _, b := range bannedSubstrings {
+			if strings.Contains(body, b) {
+				t.Errorf("install.sh contains forbidden Python-era reference %q -- Swift cutover regressed", b)
+			}
+		}
+
+		// Positive assertions: the Swift bundle is installed and metallib
+		// is verified.
+		if !strings.Contains(body, "mlx.metallib") {
+			t.Error("install.sh does not handle mlx.metallib")
+		}
+		if !strings.Contains(body, "eigeninference-enclave") {
+			t.Error("install.sh does not install the Secure Enclave helper")
 		}
 	})
-}
-
-func newTestServerWithR2(t *testing.T, cdnURL, sitePackagesURL string) *httptest.Server {
-	t.Helper()
-	logger := slog.New(slog.DiscardHandler)
-	st := store.NewMemory("")
-	reg := registry.New(logger)
-	s := NewServer(reg, st, logger)
-	s.SetBaseURL("https://api.dev.darkbloom.xyz")
-	s.SetR2CDNURL(cdnURL)
-	if sitePackagesURL != "" {
-		s.SetR2SitePackagesCDNURL(sitePackagesURL)
-	}
-	return httptest.NewServer(s.Handler())
 }
 
 func newTestServerWithBaseURL(t *testing.T, baseURL string) *httptest.Server {

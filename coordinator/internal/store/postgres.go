@@ -286,7 +286,6 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			runtime_hash TEXT NOT NULL DEFAULT '',
 			template_hashes TEXT NOT NULL DEFAULT '',
 			grpc_binary_hash TEXT NOT NULL DEFAULT '',
-			image_bridge_hash TEXT NOT NULL DEFAULT '',
 			url TEXT NOT NULL DEFAULT '',
 			changelog TEXT NOT NULL DEFAULT '',
 			active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -313,8 +312,11 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			ALTER TABLE releases ADD COLUMN IF NOT EXISTS grpc_binary_hash TEXT NOT NULL DEFAULT '';
 		EXCEPTION WHEN others THEN NULL;
 		END $$`,
+		// Drop deprecated image_bridge_hash column. Image generation is no longer
+		// a first-class capability; the hash is meaningless. The DROP is wrapped
+		// in a DO block so it's safe to re-run on databases that already lack it.
 		`DO $$ BEGIN
-			ALTER TABLE releases ADD COLUMN IF NOT EXISTS image_bridge_hash TEXT NOT NULL DEFAULT '';
+			ALTER TABLE releases DROP COLUMN IF EXISTS image_bridge_hash;
 		EXCEPTION WHEN others THEN NULL;
 		END $$`,
 

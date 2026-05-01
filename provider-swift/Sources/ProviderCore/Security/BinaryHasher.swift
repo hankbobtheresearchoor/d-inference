@@ -89,6 +89,54 @@ public func hashFilesSorted(_ paths: [String]) -> String? {
     return digest.map { String(format: "%02x", $0) }.joined()
 }
 
+// MARK: - Metallib hashing
+
+/// Locate the `mlx.metallib` file the running provider would actually load
+/// at GPU init time. Order of search:
+///
+///   1. `${MLX_METALLIB_PATH}` if set (override for tests / vendored builds).
+///   2. Sibling of the running executable (`<exe_dir>/mlx.metallib`).
+///   3. Common bundled fallbacks (`bin/mlx.metallib` next to the exe dir).
+///   4. nil if nothing matches.
+///
+/// The release pipeline drops the metallib next to `darkbloom`, so case (2)
+/// covers both production installs and `swift build` runs that follow the
+/// README's pip-install workaround.
+public func locateMetallib() -> URL? {
+    if let env = ProcessInfo.processInfo.environment["MLX_METALLIB_PATH"], !env.isEmpty {
+        let url = URL(fileURLWithPath: env)
+        if FileManager.default.fileExists(atPath: url.path) {
+            return url
+        }
+    }
+
+    guard let exePath = executablePath() else { return nil }
+    let exeDir = (exePath as NSString).deletingLastPathComponent
+    let candidates = [
+        URL(fileURLWithPath: exeDir).appendingPathComponent("mlx.metallib"),
+        URL(fileURLWithPath: exeDir)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources/mlx.metallib"),
+        URL(fileURLWithPath: exeDir)
+            .deletingLastPathComponent()
+            .appendingPathComponent("bin/mlx.metallib"),
+    ]
+    for candidate in candidates {
+        if FileManager.default.fileExists(atPath: candidate.path) {
+            return candidate
+        }
+    }
+    return nil
+}
+
+/// SHA-256 hash of the live `mlx.metallib`. Returns nil if the file isn't
+/// found (which means the binary will crash on the first MLX call -- caller
+/// should surface that prominently).
+public func metallibHash() -> String? {
+    guard let url = locateMetallib() else { return nil }
+    return hashFile(atPath: url.path)
+}
+
 // MARK: - Helpers
 
 /// Get the path to the currently running executable.

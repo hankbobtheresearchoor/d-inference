@@ -85,7 +85,11 @@ func consumerKeyFromContext(ctx context.Context) string {
 // LatestProviderVersion is the fallback version returned only when no
 // release has been registered in the store (e.g. in-memory dev setups).
 // Production reads the latest version from the releases table.
-var LatestProviderVersion = "0.3.10"
+//
+// 0.5.0 is the Swift cutover release: pure Swift CLI, no Python runtime,
+// no vllm-mlx subprocess. Providers reporting backend == "mlx-swift" skip
+// the python/runtime hash checks via registry.BackendUsesSwiftRuntime.
+var LatestProviderVersion = "0.5.0"
 
 // latestReleasedVersion returns the highest active release version from
 // the store, falling back to the hardcoded LatestProviderVersion when
@@ -163,12 +167,6 @@ type Server struct {
 	// Set from CORS_ORIGIN env var. Empty defaults to the production console domain.
 	corsOrigin string
 
-	// imageUploads stores generated images keyed by request_id.
-	// Providers upload images via HTTP POST, then send a small WebSocket
-	// completion message. The consumer handler retrieves images from here.
-	imageUploads   map[string][][]byte // request_id → list of PNG images
-	imageUploadsMu sync.Mutex
-
 	// storedProviders is a lookup table of persisted provider records, indexed
 	// by serial number and SE public key. When a provider reconnects after a
 	// coordinator restart, this table is checked to restore trust/reputation.
@@ -237,7 +235,6 @@ func NewServer(reg *registry.Registry, st store.Store, logger *slog.Logger) *Ser
 		ledger:               payments.NewLedger(st),
 		logger:               logger,
 		mux:                  http.NewServeMux(),
-		imageUploads:         make(map[string][][]byte),
 		knownRuntimeManifest: &RuntimeManifest{},
 		metrics:              NewMetrics(),
 		telemetryLimiter:     newTelemetryLimiter(),
@@ -833,15 +830,13 @@ var installScript []byte
 
 // installScriptPlaceholder is substituted with the coordinator's public URL at
 // serve time. Keep in sync with coordinator/internal/api/install.sh.
+//
+// The legacy install.sh also substituted __DARKBLOOM_R2_CDN_URL__ and
+// __DARKBLOOM_R2_SITE_PACKAGES_CDN_URL__ for the Python runtime download.
+// Post-Swift-cutover (v0.5.0+) install.sh no longer touches R2 directly --
+// model downloads run inside `darkbloom models download` against the public
+// R2 CDN -- so only the coordinator URL needs serve-time templating.
 const installScriptPlaceholder = "__DARKBLOOM_COORD_URL__"
-
-// installScriptR2Placeholder is substituted with the public R2 CDN URL for
-// release artifacts + model weights. Keep in sync with install.sh.
-const installScriptR2Placeholder = "__DARKBLOOM_R2_CDN_URL__"
-
-// installScriptR2SitePackagesPlaceholder is substituted with the R2 URL for
-// the Python site-packages tarball (historically a separate prod bucket).
-const installScriptR2SitePackagesPlaceholder = "__DARKBLOOM_R2_SITE_PACKAGES_CDN_URL__"
 
 // resolveBaseURL returns the configured baseURL, or derives one from the
 // request's Host header when baseURL is unset. TLS-terminating proxies pass
@@ -865,12 +860,6 @@ func (s *Server) routes() {
 	// R2 CDN URLs substituted per environment.
 	s.mux.HandleFunc("GET /install.sh", func(w http.ResponseWriter, r *http.Request) {
 		rendered := strings.ReplaceAll(string(installScript), installScriptPlaceholder, s.resolveBaseURL(r))
-		rendered = strings.ReplaceAll(rendered, installScriptR2Placeholder, s.r2CDNURL)
-		sitePackagesURL := s.r2SitePackagesCDNURL
-		if sitePackagesURL == "" {
-			sitePackagesURL = s.r2CDNURL
-		}
-		rendered = strings.ReplaceAll(rendered, installScriptR2SitePackagesPlaceholder, sitePackagesURL)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		io.WriteString(w, rendered)
@@ -1037,11 +1026,6 @@ func (s *Server) routes() {
 func (s *Server) registerDefaultGauges() {
 	s.metrics.RegisterGauge("providers_online", func() float64 {
 		return float64(s.registry.ProviderCount())
-	})
-	s.metrics.RegisterGauge("pending_image_uploads", func() float64 {
-		s.imageUploadsMu.Lock()
-		defer s.imageUploadsMu.Unlock()
-		return float64(len(s.imageUploads))
 	})
 }
 

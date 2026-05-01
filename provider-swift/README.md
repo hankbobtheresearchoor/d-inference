@@ -1,115 +1,115 @@
-# Swift Provider Cutover Notes
+# `provider-swift` — Swift CLI provider
 
-This package is the Swift-native provider candidate. `Package.swift` currently
-defines the `ProviderCore` library and `darkbloom` executable, requires
-Swift tools 6.1, targets macOS 15, and depends on local `../libs/mlx-swift`
-and `../libs/mlx-swift-lm`.
+CLI replacement for the legacy Rust provider. Builds two executables:
 
-## Local Gates
+| Binary | Purpose |
+|---|---|
+| `darkbloom` | Provider CLI: `serve`, `start`, `stop`, `status`, `doctor`, `models`, `login`, `logout`, `benchmark`, `update`, `verify` |
+| `darkbloom-enclave` | Stateless Secure Enclave helper: `attest`, `sign`, `info`, `wallet-address`. Installed as both `darkbloom-enclave` (canonical) and `eigeninference-enclave` (legacy symlink). |
 
-Run these before any release-script cutover:
+The migration plan is in [`.claude/swift-migration-plan.md`](../.claude/swift-migration-plan.md). This package is **CLI-only**: no SwiftUI app, no `.app` bundle, no DMG.
+
+## Build & test
 
 ```bash
-swift test --package-path provider-swift
-swift build -c release --package-path provider-swift
-provider-swift/.build/release/darkbloom --help
+swift test
+swift build -c release
+# Outputs:
+#   .build/release/darkbloom
+#   .build/release/darkbloom-enclave
 ```
 
-The CLI is not release-ready while `darkbloom serve` remains a stub. At the
-time of this pass, `Sources/darkbloom/main.swift` prints `Backend: mlx-swift`
-but exits failure for serving because coordinator event handling and inference
-dispatch are not wired into the CLI yet.
+The package depends on local submodules at `../libs/mlx-swift` and `../libs/mlx-swift-lm`. Make sure they are checked out:
 
-## Compatibility Decisions To Lock
+```bash
+cd ..
+git submodule update --init --recursive
+```
 
-- Backend identifier: use `mlx-swift` for the Swift provider cutover. Current
-  repo state is split: the Swift CLI prints `mlx-swift`, existing Swift tests
-  still use `mlx_swift_lm`, and the coordinator private-text gate checks for
-  `inprocess-mlx` in `coordinator/internal/registry/registry.go`.
-- Runtime hashes: Swift releases should omit `python_hash` and `runtime_hash`.
-  Keep `binary_hash`, `bundle_hash`, and any template/model hashes that are
-  still meaningful.
-- Runtime verification: the coordinator must become backend-aware. Existing
-  `SyncRuntimeManifest` and `verifyRuntimeHashes` logic in
-  `coordinator/internal/api/server.go` applies Python/runtime hash requirements
-  globally, so a Swift provider with no Python hashes will fail whenever old
-  active releases still contribute Python/runtime hashes. If all old releases
-  are deactivated, the manifest becomes nil and providers lose private-text
-  eligibility because registration marks `RuntimeManifestChecked=false`.
+## Running locally — metallib setup
 
-## Cutover Checklist
+`mlx-swift`'s `Cmlx` target does **not** auto-compile its Metal kernels through SwiftPM. The runtime needs an `mlx.metallib` file colocated with the binary (or inside the binary's resource bundle), or it crashes on the first MLX call with `Failed to load the default metallib`.
 
-1. Finish the Swift runtime path.
-   - `darkbloom serve` must connect to `/ws/provider`, register, handle
-     inference, cancellation, reconnects, and attestation challenges.
-   - Registration should send `backend: "mlx-swift"`, encrypted response
-     chunks, privacy capabilities, binary/model/template hashes as applicable,
-     and no `python_hash` or `runtime_hash`.
-   - Update Swift tests that still use `mlx_swift_lm` after the coordinator
-     accepts the canonical backend string.
+Until we land a SwiftPM build-tool plugin for this, the workaround is to ship the matching `mlx.metallib` from the MLX Python wheel that pins the same C++ ABI as the fork (currently `mlx==0.31.2`). For local dev, the simplest setup is:
 
-2. Update `scripts/build-bundle.sh`.
-   - Replace the Rust provider build with
-     `swift build -c release --package-path provider-swift`.
-   - Set the provider binary path to
-     `provider-swift/.build/release/darkbloom`.
-   - Remove portable Python setup, `vllm-mlx` installs, import checks, PyO3
-     build environment, `install_name_tool` libpython rewrites, and Python
-     runtime hash generation.
-   - Bundle `bin/darkbloom`; keep `bin/eigeninference-enclave` only if Phase 5
-     has not fully merged Secure Enclave support into the Swift provider.
-   - Keep signing with `scripts/entitlements.plist`, then compute
-     `binary_hash` and `bundle_hash` after signing/stapling.
-   - Update app bundle minimum OS from 14.0 to 15.0 if this script still builds
-     the app bundle.
+```bash
+python3 -m venv /tmp/mlxvenv
+/tmp/mlxvenv/bin/pip install 'mlx==0.31.2'
+cp /tmp/mlxvenv/lib/python*/site-packages/mlx/lib/mlx.metallib \
+   .build/release/mlx.metallib
 
-3. Update `.github/workflows/release.yml`.
-   - Remove Cargo/PyO3/PBS/uv/vllm-mlx setup and cache entries.
-   - Add SwiftPM cache coverage for `provider-swift/.build` and
-     `provider-swift/Package.resolved`.
-   - Build with `swift build -c release --package-path provider-swift`.
-   - Test with `swift test --package-path provider-swift`.
-   - Assemble the provider bundle from the Swift `darkbloom` binary without a
-     `python/` directory and without libpython rpath patching.
-   - Upload only the bundle and DMG unless another Swift-native artifact is
-     explicitly introduced.
-   - Register releases without `python_hash` and `runtime_hash`; keep
-     `binary_hash`, `bundle_hash`, `template_hashes`, `url`, `platform`, and
-     `changelog`.
-   - Update release notes so they no longer advertise a vllm-mlx runtime hash.
+# Then:
+.build/release/darkbloom serve --foreground
+```
 
-4. Update `scripts/install.sh` and the embedded coordinator copy.
-   - Remove the Python runtime verification/download/install step.
-   - Remove `PYTHON_BIN`, PBS fallback, site-packages fallback, and vllm-mlx
-     import checks.
-   - Replace Python-based model catalog parsing with a Swift CLI helper or a
-     shell-only parser. Prefer moving selection/download logic into `darkbloom`
-     so a fresh macOS install still has no Python prerequisite.
-   - If Secure Enclave is merged into the main binary, replace direct
-     `eigeninference-enclave info` calls with the new `darkbloom` command.
-   - Reduce the displayed step count and summary to match the no-Python flow.
+`release-swift.yml` in CI does the same thing automatically and bakes the metallib into the released bundle next to `darkbloom`.
 
-5. Update coordinator release and runtime compatibility.
-   - In `coordinator/internal/api/release_handlers.go`, require
-     `bundle_hash` because `install.sh` verifies it.
-   - In `coordinator/internal/store/interface.go`, update `Release` comments
-     and consider adding a `backend` or `runtime_kind` field if Rust and Swift
-     releases will overlap.
-   - In `coordinator/internal/api/server.go`, make runtime verification
-     backend-aware: legacy providers should keep Python/runtime hash checks,
-     while `mlx-swift` providers should pass without those fields and rely on
-     signed binary hash, template hashes, model hashes, and attestation status.
-   - In `coordinator/internal/registry/registry.go`, update
-     `providerSupportsPrivateTextLocked` to accept the canonical Swift backend
-     and to stop depending on Python-specific capability wording once the
-     replacement runtime policy is in place.
-   - Update coordinator tests that assert `inprocess-mlx` or old runtime hash
-     semantics.
+## Layout
 
-6. Production validation.
-   - Publish a dev release first and install from the dev coordinator.
-   - Run a side-by-side Rust vs Swift provider comparison on the same model and
-     machine: registration, chat streaming, cancellation, reconnect, attested
-     binary hash, model weight hash, thermal behavior, and 48-hour soak.
-   - Keep Rust release artifacts active until Swift has passed soak and the
-     coordinator can route both backends intentionally.
+```text
+Sources/
+├── ProviderCore/              shared library
+│   ├── Protocol/              wire types, Codable, raw-JSON attestation preservation
+│   ├── Hardware/              sysctl, system_profiler, system metrics
+│   ├── Crypto/                NodeKeyPair (libsodium NaCl box) + X25519 helpers
+│   ├── Coordinator/           URLSessionWebSocketTask client, reconnect, dispatch
+│   ├── Inference/             ChatCompletionRequest → mlx-swift-lm → SSE chunks
+│   ├── InferenceFoundation/   local model directory readiness checks
+│   ├── Models/                HF cache scan, weight hashing
+│   ├── Security/              SIP, anti-debug, binary hash, env scrub, attestation
+│   ├── Server/                standalone Hummingbird HTTP server
+│   ├── Scheduling/            availability windows
+│   ├── Service/               launchd integration
+│   ├── Config/                TOML config + hardware-based defaults
+│   ├── Auth/                  RFC 8628 device-code login flow
+│   ├── Update/                self-update via signed bundle
+│   ├── Benchmark/             tok/s benchmark used by `darkbloom benchmark`
+│   ├── Batching/              (Phase 4) batch queue planner — kept disabled until cutover
+│   └── ProviderLoop.swift     top-level event loop
+├── darkbloom/                  ArgumentParser CLI subcommands
+└── darkbloom-enclave-cli/      ArgumentParser SE helper
+Tests/
+└── ProviderCoreTests/         54 tests, including NaCl-box golden vectors generated by Go
+```
+
+## CLI surface
+
+```
+darkbloom serve / start / stop      lifecycle
+darkbloom status / doctor           read-only diagnostics (with update banner)
+darkbloom models list / catalog / download <id> / remove <id>
+darkbloom enroll / unenroll         MDM device-attestation profile
+darkbloom login / logout            RFC 8628 device-code account linking
+darkbloom logs [-n N] [-w]          tail provider.log
+darkbloom autoupdate enable|disable|status
+darkbloom benchmark                 tok/s vs golden numbers
+darkbloom update [--check-only]     pull a new signed release
+darkbloom start --foreground        invoked by launchd; not user-facing
+darkbloom start --local --port N    standalone OpenAI-compatible HTTP server
+                                    (no coordinator connection)
+```
+
+## Cutover checklist (post-0.5.0)
+
+Tracked in [`.claude/swift-migration-plan.md`](../.claude/swift-migration-plan.md).
+
+Done in v0.5.0:
+
+- [x] Coordinator accepts `backend == "mlx-swift"` releases (already wired via `registry.BackendUsesSwiftRuntime`; v0.5.0 also bumps the fallback `LatestProviderVersion` and adds `MetallibHash` to `store.Release`).
+- [x] `scripts/install.sh` rewritten as a pure Swift bundle installer (no Python, no vllm-mlx, no site-packages tarball). Same change to the coordinator-served `coordinator/internal/api/install.sh`.
+- [x] `darkbloom enroll` / `unenroll` / `logs` / `autoupdate` / `models download` / `models catalog` / `models remove` / `start --local` / `--check-only` for `update`.
+- [x] Telemetry pipeline wired: `TelemetryClient.shared.configure` is called in `start --foreground`, reconnect events flow from `CoordinatorClient`, `PanicHook.install` is called before telemetry setup so a crash mid-bring-up still gets captured.
+- [x] PID-file single-instance lock + `caffeinate -s -i -w <pid>` in `start --foreground` and `start --local`.
+- [x] Crypto cleanup: `CoordinatorClient` now base64-decodes the ciphertext + sender pubkey itself and yields `Data` to `ProviderLoop`, removing the previous round-trip-through-base64 dance.
+- [x] `mlx.metallib` self-hashed at startup, surfaced under `template_hashes["mlx_metallib"]` in registration + attestation responses; the release pipeline still bakes the metallib next to the binary.
+- [x] `ChatCompletionRequest` accepts `stop` (string or array) / `seed` / `tools` / `tool_choice` / `response_format` / `user`; the values round-trip through Codable (the inference engine is a no-op pass-through for tools and response_format today).
+- [x] `darkbloom doctor` and `darkbloom status` show a one-line update banner before printing state, matching the Rust provider's `check_for_update_alert` (skip with `DARKBLOOM_NO_UPDATE_CHECK=1`).
+- [x] Privacy capabilities cleaned up: `python_runtime_locked` and `dangerous_modules_blocked` now report `false` instead of lying.
+- [x] Dead code dropped: `Inference/InferenceEngine.swift` removed; `BatchScheduler` is the single inference path.
+
+Still pending:
+
+- [ ] Phase 4b: true continuous batching (deferrable past cutover; today's `BatchScheduler` does prefill-serial + decode-concurrent on a single ModelContainer).
+- [ ] Phase 0: SwiftPM build-tool plugin to produce `mlx.metallib` directly from `libs/mlx-swift/Source/Cmlx/mlx-generated/metal/`. Today's local-dev workflow uses `scripts/fetch-metallib.sh` and CI uses the wheel-extraction step in `release-swift.yml`.
+- [ ] First-class `metallib_hash` field on `protocol.RegisterMessage` and `protocol.AttestationResponseMessage` (today it rides as a key inside `template_hashes`, which the coordinator stores but does not enforce).
+- [ ] Build-time injection of `ProviderCore.version` from a git tag (today it is a hand-bumped constant; CI consumes it as-is).

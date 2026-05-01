@@ -43,7 +43,7 @@ import Testing
         binaryHash: String(repeating: "a", count: 64),
         bundleHash: String(repeating: "b", count: 64),
         templateHashes: "qwen3.5=templatehash",
-        url: "https://pub.example/releases/v0.4.0-swift/eigeninference-bundle-macos-arm64.tar.gz",
+        url: "https://pub.example/releases/v0.4.0-swift/darkbloom-bundle-macos-arm64.tar.gz",
         changelog: "Swift provider cutover test payload"
     )
 

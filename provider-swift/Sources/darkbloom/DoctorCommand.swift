@@ -14,6 +14,8 @@ struct Doctor: AsyncParsableCommand {
     var strict = false
 
     mutating func run() async throws {
+        await runUpdateBannerIfEnabled()
+
         let snapshot = try loadRuntimeSnapshot(configOptions: configOptions)
         let checks = buildDoctorChecks(snapshot: snapshot)
 
@@ -68,6 +70,23 @@ func buildDoctorChecks(snapshot: RuntimeSnapshot) -> [DoctorCheck] {
             name: "hardware",
             status: .fail,
             detail: snapshot.hardwareError?.localizedDescription ?? "hardware detection failed"
+        ))
+    }
+
+    let metal = GPUEnforcement.probeMetal()
+    if metal.isAvailable {
+        let working = metal.recommendedMaxWorkingSetSizeBytes / (1024 * 1024 * 1024)
+        let device = metal.deviceName ?? "unknown"
+        checks.append(.init(
+            name: "metal gpu",
+            status: .pass,
+            detail: "\(device), \(working) GB working set"
+        ))
+    } else {
+        checks.append(.init(
+            name: "metal gpu",
+            status: .fail,
+            detail: "Metal device not found; provider refuses to run on CPU"
         ))
     }
 

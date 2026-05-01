@@ -129,7 +129,19 @@ public actor ProviderLoop {
         // 2. Build attestation blob for registration
         let attestation = buildRegistrationAttestation()
 
-        // 3. Create coordinator client config
+        // 3. Hash the colocated mlx.metallib so the coordinator (and any
+        // user inspecting attestation) can correlate the GPU kernel set
+        // with the binary. Reported under template_hashes["mlx_metallib"]
+        // since the coordinator passes through arbitrary keys; will move to
+        // a first-class field once the protocol gets bumped.
+        let runtimeWithMetallib = augmentRuntimeHashesWithMetallib(loopConfig.runtimeHashes)
+        if let metallib = runtimeWithMetallib?.templateHashes["mlx_metallib"] {
+            logger.info("mlx.metallib hash: \(metallib.prefix(16))...")
+        } else {
+            logger.warning("mlx.metallib not found near binary -- inference will fail at first GPU call")
+        }
+
+        // 4. Create coordinator client config
         let coordinatorConfig = CoordinatorClientConfig(
             url: loopConfig.coordinatorURL,
             hardware: loopConfig.hardware,
@@ -140,7 +152,7 @@ public actor ProviderLoop {
             walletAddress: nil,
             attestation: attestation,
             authToken: loopConfig.authToken,
-            runtimeHashes: loopConfig.runtimeHashes,
+            runtimeHashes: runtimeWithMetallib,
             modelHashes: loopConfig.modelHashes,
             privacyCapabilities: privacyCapabilitiesForRegistration()
         )
@@ -169,11 +181,11 @@ public actor ProviderLoop {
                 // will not route responses for a dead connection.
                 await cancelAllInflight()
 
-            case .inferenceRequest(let requestId, let body, let responsePublicKey):
+            case .inferenceRequest(let requestId, let ciphertext, let senderPublicKey):
                 await handleInferenceRequest(
                     requestId: requestId,
-                    body: body,
-                    responsePublicKey: responsePublicKey,
+                    ciphertext: ciphertext,
+                    senderPublicKey: senderPublicKey,
                     send: send
                 )
 
@@ -219,12 +231,21 @@ public actor ProviderLoop {
     }
 
     private func privacyCapabilitiesForRegistration() -> PrivacyCapabilities {
+        // textBackendInprocess + textProxyDisabled: always true on the Swift
+        //   provider -- inference runs in-process via mlx-swift-lm, no HTTP
+        //   proxy is involved.
+        // pythonRuntimeLocked + dangerousModulesBlocked: report false. There
+        //   is no Python runtime to lock anymore. Coordinator's Swift-runtime
+        //   trust path (registry.BackendUsesSwiftRuntime) doesn't read these.
+        // hypervisorActive: false -- Hypervisor.framework Stage 2 page tables
+        //   were dropped at the migration; trust is RDMA discipline + SE
+        //   attestation.
         if let posture = securityPosture {
             return PrivacyCapabilities(
                 textBackendInprocess: true,
                 textProxyDisabled: true,
-                pythonRuntimeLocked: true,
-                dangerousModulesBlocked: true,
+                pythonRuntimeLocked: false,
+                dangerousModulesBlocked: false,
                 sipEnabled: posture.sipEnabled,
                 antiDebugEnabled: posture.antiDebugEnabled,
                 coreDumpsDisabled: posture.coreDumpsDisabled,
@@ -233,16 +254,47 @@ public actor ProviderLoop {
             )
         }
 
+        // Pre-hardening fallback (DEBUG builds, or hardening failed).
         return PrivacyCapabilities(
             textBackendInprocess: true,
             textProxyDisabled: true,
-            pythonRuntimeLocked: true,
-            dangerousModulesBlocked: true,
+            pythonRuntimeLocked: false,
+            dangerousModulesBlocked: false,
             sipEnabled: SecurityChecks.isSIPEnabled(),
             antiDebugEnabled: false,
             coreDumpsDisabled: false,
             envScrubbed: false,
-            hypervisorActive: SecurityChecks.isHypervisorActive()
+            hypervisorActive: false
+        )
+    }
+
+    // MARK: - Runtime hashes
+
+    /// Add the live mlx.metallib hash under template_hashes["mlx_metallib"]
+    /// while preserving any caller-supplied template entries. Returns nil if
+    /// the input was nil and no metallib could be located (so we don't
+    /// fabricate an empty RuntimeHashes that would suppress legitimate
+    /// nil-handling downstream).
+    private func augmentRuntimeHashesWithMetallib(
+        _ existing: RuntimeHashes?
+    ) -> RuntimeHashes? {
+        let metallib = metallibHash()
+
+        // No metallib and no caller-supplied data -- return whatever the
+        // caller passed (might be nil; that's fine).
+        if metallib == nil, existing == nil {
+            return nil
+        }
+
+        var templates = existing?.templateHashes ?? [:]
+        if let metallib {
+            templates["mlx_metallib"] = metallib
+        }
+
+        return RuntimeHashes(
+            pythonHash: existing?.pythonHash,
+            runtimeHash: existing?.runtimeHash,
+            templateHashes: templates
         )
     }
 
@@ -269,43 +321,38 @@ public actor ProviderLoop {
 
     private func handleInferenceRequest(
         requestId: String,
-        body: Data,
-        responsePublicKey: [UInt8]?,
+        ciphertext: Data,
+        senderPublicKey: Data?,
         send: SendHandle
     ) async {
         logger.info("Processing inference request: \(requestId)")
 
-        // 1. Decrypt the request body
+        // 1. Decrypt the request body. Both `ciphertext` and
+        // `senderPublicKey` are already base64-decoded by CoordinatorClient,
+        // so we hand the raw bytes straight to NodeKeyPair.decrypt.
+        guard let senderKey = senderPublicKey, senderKey.count == 32 else {
+            logger.error("[\(requestId)] missing or malformed sender public key")
+            send.send(.inferenceError(
+                requestId: requestId,
+                error: "missing or malformed ephemeral_public_key",
+                statusCode: 400
+            ))
+            return
+        }
+
         let decryptedData: Data
         do {
-            // The body arrives as a base64-encoded ciphertext string from
-            // CoordinatorClient.handleIncomingText which wraps
-            // encrypted.ciphertext.utf8 into Data. We need to reconstruct
-            // the EncryptedPayload to decrypt it properly.
-            guard let responseKey = responsePublicKey else {
-                logger.error("[\(requestId)] No response public key for encrypted request")
-                send.send(.inferenceError(requestId: requestId, error: "missing response public key", statusCode: 400))
-                return
-            }
-
-            // The body is the base64 ciphertext string. The ephemeral public key
-            // was already extracted by CoordinatorClient and passed as responsePublicKey.
-            // However, looking at CoordinatorClient.handleIncomingText more carefully:
-            // it passes Data(encrypted.ciphertext.utf8) as body and the ephemeralPublicKey
-            // decoded as responsePublicKey. The ciphertext is base64, so we need to
-            // base64-decode it, then use the ephemeral key to decrypt.
-            guard let ciphertextBase64String = String(data: body, encoding: .utf8),
-                  let ciphertextData = Data(base64Encoded: ciphertextBase64String) else {
-                logger.error("[\(requestId)] Failed to decode ciphertext from base64")
-                send.send(.inferenceError(requestId: requestId, error: "invalid ciphertext encoding", statusCode: 400))
-                return
-            }
-
-            let senderPublicKey = Data(responseKey)
-            decryptedData = try keyPair.decrypt(senderPublicKey: senderPublicKey, ciphertext: ciphertextData)
+            decryptedData = try keyPair.decrypt(
+                senderPublicKey: senderKey,
+                ciphertext: ciphertext
+            )
         } catch {
-            logger.error("[\(requestId)] Decryption failed: \(error)")
-            send.send(.inferenceError(requestId: requestId, error: "decryption failed", statusCode: 400))
+            logger.error("[\(requestId)] decryption failed: \(error)")
+            send.send(.inferenceError(
+                requestId: requestId,
+                error: "decryption failed",
+                statusCode: 400
+            ))
             return
         }
 
@@ -336,7 +383,7 @@ public actor ProviderLoop {
         let token = await cancellationRegistry.register(requestId: requestId)
 
         // 6. Capture values for the spawned task
-        let responsePublicKeyData: Data? = responsePublicKey.map { Data($0) }
+        let responsePublicKeyData: Data = senderKey
         let kp = self.keyPair
         let sched = self.scheduler
         let providerStats = self.stats
@@ -361,15 +408,13 @@ public actor ProviderLoop {
 
             let emitSSE: @Sendable (String) -> Void = { sseData in
                 var encryptedPayload: EncryptedPayload?
-                if let recipientKey = responsePublicKeyData {
-                    do {
-                        encryptedPayload = try kp.encryptPayload(
-                            recipientPublicKey: recipientKey,
-                            plaintext: Data(sseData.utf8)
-                        )
-                    } catch {
-                        log.warning("[\(requestId)] Chunk encryption failed: \(error)")
-                    }
+                do {
+                    encryptedPayload = try kp.encryptPayload(
+                        recipientPublicKey: responsePublicKeyData,
+                        plaintext: Data(sseData.utf8)
+                    )
+                } catch {
+                    log.warning("[\(requestId)] Chunk encryption failed: \(error)")
                 }
 
                 send.send(.inferenceChunk(
@@ -559,7 +604,7 @@ public actor ProviderLoop {
                 providerPublicKey: keyPair.publicKeyBase64,
                 binaryHash: binaryHash,
                 activeModelHash: activeModelHash,
-                runtimeHashes: loopConfig.runtimeHashes,
+                runtimeHashes: augmentRuntimeHashesWithMetallib(loopConfig.runtimeHashes),
                 modelHashes: loopConfig.modelHashes
             )
 

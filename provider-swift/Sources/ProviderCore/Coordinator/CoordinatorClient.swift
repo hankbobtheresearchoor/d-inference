@@ -8,7 +8,12 @@ import os
 public enum CoordinatorEvent: Sendable {
     case connected
     case disconnected
-    case inferenceRequest(requestId: String, body: Data, responsePublicKey: [UInt8]?)
+    /// `ciphertext` is the **decoded** NaCl-box ciphertext (nonce ‖ tag ‖ body),
+    /// i.e. base64 already stripped. `senderPublicKey` is the consumer's
+    /// 32-byte X25519 ephemeral public key, also decoded.
+    /// Consumers (ProviderLoop) feed both directly to NodeKeyPair.decrypt
+    /// without further base64 manipulation.
+    case inferenceRequest(requestId: String, ciphertext: Data, senderPublicKey: Data?)
     case cancel(requestId: String)
     case attestationChallenge(nonce: String, timestamp: String)
     case runtimeOutdated(mismatches: [RuntimeMismatch])
@@ -500,10 +505,36 @@ public actor CoordinatorClient {
                 return
             }
 
+            // Decode the wire form here so consumers don't have to. NaCl box
+            // wire format is `base64(nonce ‖ tag ‖ body)`; we strip base64
+            // once and pass raw bytes upstream. Same for the sender's
+            // ephemeral pubkey (32 bytes).
+            guard let cipherBytes = Data(base64Encoded: encrypted.ciphertext) else {
+                logger.error("Rejecting inference request \(requestId): ciphertext is not valid base64")
+                let errorResponse = encodeInferenceError(
+                    requestId: requestId,
+                    error: "ciphertext is not valid base64",
+                    statusCode: 400
+                )
+                try? await ws.send(.string(errorResponse))
+                return
+            }
+            let senderKeyBytes = Data(base64Encoded: encrypted.ephemeralPublicKey)
+            if senderKeyBytes == nil || senderKeyBytes?.count != 32 {
+                logger.error("Rejecting inference request \(requestId): invalid ephemeral public key")
+                let errorResponse = encodeInferenceError(
+                    requestId: requestId,
+                    error: "invalid ephemeral_public_key",
+                    statusCode: 400
+                )
+                try? await ws.send(.string(errorResponse))
+                return
+            }
+
             eventContinuation?.yield(.inferenceRequest(
                 requestId: requestId,
-                body: Data(encrypted.ciphertext.utf8),
-                responsePublicKey: decodeEphemeralKey(encrypted.ephemeralPublicKey)
+                ciphertext: cipherBytes,
+                senderPublicKey: senderKeyBytes
             ))
 
         case .cancel(let cancel):
@@ -610,19 +641,17 @@ public actor CoordinatorClient {
     }
 
     private func emitReconnectTelemetry(count: UInt64, error: Error) {
-        // Telemetry integration point -- when the Telemetry module is ported,
-        // this will emit a TelemetryEvent with source=provider, severity=warn,
-        // kind=connectivity, and the reconnect_count/last_error/ws_state fields.
+        TelemetryClient.shared.emit(
+            kind: .connectivity,
+            severity: .warn,
+            message: "coordinator reconnect",
+            fields: [
+                "reconnect_count": .int(Int(count)),
+                "last_error": .string(error.localizedDescription),
+                "coordinator_url": .string(config.url),
+            ]
+        )
         logger.warning("Reconnect telemetry: count=\(count) error=\(error.localizedDescription)")
-    }
-
-    // MARK: - Helpers
-
-    private func decodeEphemeralKey(_ base64Key: String) -> [UInt8]? {
-        guard let data = Data(base64Encoded: base64Key), data.count == 32 else {
-            return nil
-        }
-        return [UInt8](data)
     }
 }
 

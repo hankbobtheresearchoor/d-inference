@@ -353,7 +353,6 @@ type StatusCanonicalInput struct {
 	RuntimeHash       string
 	TemplateHashes    map[string]string
 	GrpcBinaryHash    string
-	ImageBridgeHash   string
 	ModelHashes       map[string]string
 }
 
@@ -410,9 +409,6 @@ func BuildStatusCanonical(in StatusCanonicalInput) ([]byte, error) {
 	}
 	if in.GrpcBinaryHash != "" {
 		m["grpc_binary_hash"] = in.GrpcBinaryHash
-	}
-	if in.ImageBridgeHash != "" {
-		m["image_bridge_hash"] = in.ImageBridgeHash
 	}
 	if len(in.ModelHashes) > 0 {
 		m["model_hashes"] = in.ModelHashes

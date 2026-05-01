@@ -19,12 +19,38 @@ struct Darkbloom: AsyncParsableCommand {
             Logout.self,
             Benchmark.self,
             Update.self,
+            Enroll.self,
+            Unenroll.self,
+            Logs.self,
+            AutoUpdate.self,
         ]
     )
 
     mutating func run() async throws {
         throw CleanExit.helpRequest(self)
     }
+}
+
+// MARK: - Update banner (best-effort, non-blocking)
+
+/// Run the update banner before any subcommand executes. Uses a hard
+/// 2-second timeout; failures are silently swallowed. Skipped when the
+/// `DARKBLOOM_NO_UPDATE_CHECK` env var is set (handy for tests + CI).
+///
+/// Subcommands invoke this via the top-level `Darkbloom` parsable type
+/// being the entry point; we hook it in `main` of each subcommand
+/// indirectly by calling at the start of any `run()` that wants it.
+public func runUpdateBannerIfEnabled() async {
+    if ProcessInfo.processInfo.environment["DARKBLOOM_NO_UPDATE_CHECK"] != nil {
+        return
+    }
+    let coordinatorURL: String
+    if let snapshot = try? loadRuntimeSnapshot(configOptions: ConfigOptions()) {
+        coordinatorURL = snapshot.config.coordinator.url
+    } else {
+        coordinatorURL = "https://api.darkbloom.dev"
+    }
+    await UpdateBanner.run(coordinatorURL: coordinatorURL)
 }
 
 // MARK: - Shared Options

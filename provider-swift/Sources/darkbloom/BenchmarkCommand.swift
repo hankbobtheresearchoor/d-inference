@@ -22,6 +22,13 @@ struct Benchmark: AsyncParsableCommand {
     var maxTokens = ModelBenchmark.defaultMaxTokens
 
     mutating func run() async throws {
+        do {
+            _ = try GPUEnforcement.requireMetal()
+        } catch {
+            printError("\(error)")
+            throw ExitCode.failure
+        }
+
         let snapshot = try loadRuntimeSnapshot(configOptions: configOptions)
 
         guard let hardware = snapshot.hardware else {
