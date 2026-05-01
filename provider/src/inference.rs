@@ -323,11 +323,17 @@ for _name in (
         Ok(())
     }
 
-    /// Initialize the vllm-mlx engine via its server module's `load_model()`.
+    /// Initialize the vllm-mlx engine with continuous batching.
     ///
-    /// This creates an AdaptiveEngine (SimpleEngine + request queuing) and
-    /// stores it in a Python builtins dict keyed by cache_key. The engine
-    /// supports `engine.chat()` and `engine.stream_chat()` with full
+    /// This creates a BatchedEngine (wrapping EngineCore + Scheduler) which
+    /// supports true continuous batching: multiple concurrent requests share
+    /// the same forward pass via iteration-level scheduling.  An asyncio
+    /// event loop is started on a background daemon thread so the engine's
+    /// `_engine_loop()` can keep processing steps while the Rust caller
+    /// thread submits requests.
+    ///
+    /// The engine is stored in a Python builtins dict keyed by cache_key.
+    /// It supports `engine.chat()` and `engine.stream_chat()` with full
     /// OpenAI-compatible features (chat templates, tool calling, structured
     /// output) without starting an HTTP server.
     fn load_vllm_mlx(&self, py: Python<'_>) -> Result<()> {
@@ -337,18 +343,57 @@ for _name in (
             r#"
 import builtins, traceback as _tb
 try:
-    from vllm_mlx.server import load_model as _load_model
-    import vllm_mlx.server as _server
-    _load_model({model})
-    _engine = _server._engine
-    if _engine is None:
-        raise RuntimeError("load_model() did not initialize the engine")
+    from vllm_mlx.engine import BatchedEngine
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    # Create scheduler config tuned for Apple Silicon providers.
+    # max_num_seqs controls how many concurrent sequences the batch
+    # scheduler can interleave.  16 is a good balance for 24-48GB
+    # machines; larger RAM can go higher.
+    _sched_cfg = SchedulerConfig(
+        max_num_seqs=16,
+        max_num_batched_tokens=8192,
+        prefill_batch_size=4,
+        completion_batch_size=16,
+    )
+
+    _engine = BatchedEngine(
+        model_name={model},
+        scheduler_config=_sched_cfg,
+        stream_interval=1,
+    )
+
+    # BatchedEngine requires a running asyncio event loop for its
+    # EngineCore._engine_loop().  We create a persistent loop on a
+    # daemon thread so it keeps stepping even while Rust is blocked
+    # on a synchronous engine.chat() / engine.stream_chat() call.
+    import asyncio, threading
+
+    _loop = asyncio.new_event_loop()
+
+    def _run_loop():
+        asyncio.set_event_loop(_loop)
+        _loop.run_forever()
+
+    _thread = threading.Thread(target=_run_loop, daemon=True)
+    _thread.start()
+
+    # Start the engine (loads model weights + kicks off _engine_loop)
+    future = asyncio.run_coroutine_threadsafe(_engine.start(), _loop)
+    future.result(timeout=600)  # block until model is loaded
+
+    # Store both engine and its event loop so generate/stream can
+    # schedule coroutines on the correct loop.
     if not hasattr(builtins, '{store}'):
         builtins.{store} = {{}}
     builtins.{store}[{cache_key}] = _engine
+    if not hasattr(builtins, '_eigeninference_vllm_loops'):
+        builtins._eigeninference_vllm_loops = {{}}
+    builtins._eigeninference_vllm_loops[{cache_key}] = _loop
+
 except Exception as _e:
     _err_detail = _tb.format_exc()
-    raise RuntimeError(f"vllm-mlx server init failed: {{_err_detail}}") from _e
+    raise RuntimeError(f"vllm-mlx batched engine init failed: {{_err_detail}}") from _e
 "#,
             store = VLLM_ENGINE_STORE,
             cache_key = cache_key,
@@ -356,7 +401,7 @@ except Exception as _e:
         );
         let ccode = CString::new(code).context("invalid code string")?;
         py.run(ccode.as_c_str(), None, None)
-            .context("failed to initialize vllm-mlx engine via server handler")?;
+            .context("failed to initialize vllm-mlx batched engine")?;
         Ok(())
     }
 
@@ -366,11 +411,19 @@ except Exception as _e:
             r#"
 import asyncio, builtins, gc
 store = getattr(builtins, '{store}', None)
+loops = getattr(builtins, '_eigeninference_vllm_loops', None)
 if isinstance(store, dict):
     engine = store.pop({cache_key}, None)
+    loop = loops.pop({cache_key}, None) if isinstance(loops, dict) else None
     if engine is not None and hasattr(engine, 'stop'):
         try:
-            asyncio.run(engine.stop())
+            if loop is not None and loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(engine.stop(), loop)
+                future.result(timeout=30)
+                # Stop the event loop after engine shutdown
+                loop.call_soon_threadsafe(loop.stop)
+            else:
+                asyncio.run(engine.stop())
         except Exception:
             pass
 gc.collect()
@@ -380,7 +433,7 @@ gc.collect()
         );
         let ccode = CString::new(code).context("invalid code string")?;
         py.run(ccode.as_c_str(), None, None)
-            .context("failed to unload vllm-mlx engine")?;
+            .context("failed to unload vllm-mlx batched engine")?;
         Ok(())
     }
 
@@ -485,7 +538,11 @@ try:
             _chat_kwargs['messages'] = _msgs
     if _stop:
         _chat_kwargs['stop'] = _stop
-    _output = asyncio.run(engine.chat(**_chat_kwargs))
+    # Schedule on the persistent event loop (not asyncio.run which
+    # creates a throwaway loop without the engine's _engine_loop).
+    _loop = builtins._eigeninference_vllm_loops[engine_key]
+    _fut = asyncio.run_coroutine_threadsafe(engine.chat(**_chat_kwargs), _loop)
+    _output = _fut.result()
     from vllm_mlx.api.models import (
         ChatCompletionResponse, ChatCompletionChoice, AssistantMessage, Usage
     )
@@ -710,9 +767,9 @@ def _select_reasoning_parser(model_id):
 _reasoning_parser = _select_reasoning_parser(_model_name)
 
 class SyncStreamIterator:
-    def __init__(self, async_gen, sp, rid, ts, mn, parser):
+    def __init__(self, async_gen, sp, rid, ts, mn, parser, loop):
         import asyncio as _aio
-        self._loop = _aio.new_event_loop()
+        self._loop = loop
         self._ait = async_gen.__aiter__()
         self._sp = sp
         self._rid = rid
@@ -737,10 +794,17 @@ class SyncStreamIterator:
         if self._done:
             raise StopIteration
         try:
-            _out = self._loop.run_until_complete(self._ait.__anext__())
+            # The persistent loop is running run_forever() on a
+            # background thread.  We cannot call run_until_complete()
+            # on a running loop, so we schedule the __anext__()
+            # coroutine and block on the Future result.
+            import asyncio as _aio, concurrent.futures as _cf
+            _fut = _aio.run_coroutine_threadsafe(
+                self._ait.__anext__(), self._loop
+            )
+            _out = _fut.result()
         except StopAsyncIteration:
             self._done = True
-            self._loop.close()
             raise StopIteration
         if hasattr(_out, 'prompt_tokens') and _out.prompt_tokens:
             self._pt = _out.prompt_tokens
@@ -786,9 +850,15 @@ class SyncStreamIterator:
             'choices': [{'index': 0, 'delta': _delta_obj, 'finish_reason': _finish or (_out.finish_reason or 'stop' if _out.finished else None)}],
         })
 
+# Create the async generator and wrap it in SyncStreamIterator for
+# synchronous token-by-token iteration.  The persistent event loop
+# (running on a daemon thread) drives the BatchedEngine's
+# _engine_loop so concurrent requests are batched together.
+_engine_loop = builtins._eigeninference_vllm_loops[engine_key]
+_async_gen = engine.stream_chat(**_chat_kwargs)
+
 _stream_iter = SyncStreamIterator(
-    engine.stream_chat(**_chat_kwargs),
-    _SPECIAL_TOKENS, _response_id, _created, _model_name, _reasoning_parser,
+    _async_gen, _SPECIAL_TOKENS, _response_id, _created, _model_name, _reasoning_parser, _engine_loop,
 )
 "#,
                 )
