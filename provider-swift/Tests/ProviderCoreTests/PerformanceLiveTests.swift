@@ -26,20 +26,20 @@
 //   Qwen3 0.6B-8bit              B=1: 265 tok/s   B=2: 694 tok/s   B=4: 1119 tok/s
 //   Gemma 4 26B-A4B-it-8bit MoE  B=1:  74 tok/s   B=2: 126 tok/s   B=4:  181 tok/s
 //
-// Our Swift numbers (decode-only, after the greedy fast-path fixes:
-// nil samplers for greedy rows, UInt32 token tensors, no logSumExp on
-// greedy, BatchKVCache.innerState(), and mlx_lm-style double-buffering):
+// Swift release-mode direct BatchGenerator numbers (decode-only, after
+// the greedy fast-path fixes: nil samplers for greedy rows, UInt32 token
+// tensors, no logSumExp on greedy, and mlx_lm-style double-buffering):
 //
-//   Qwen3 0.6B-8bit              B=1: 104 tok/s   B=2: 196 tok/s   B=4:  363 tok/s
-//   Gemma 4 26B-A4B-it-8bit MoE  B=1:  37 tok/s   B=2:  23 tok/s   B=4:   40 tok/s
+//   Qwen3 0.6B-8bit              B=1: ~400 tok/s  B=4: ~890 tok/s
+//   Gemma 4 26B-A4B-it-8bit MoE  B=1:  ~80 tok/s  B=4: ~186 tok/s
 //
-// Gap to Python: ~3x at B=1 widening to ~3-4x at B=4. The bracket test
-// confirms the gap is NOT in our BatchScheduler or BatchGenerator —
-// those wrappers add < 6% on top of the pure model loop. The dominant
-// cost is per-step kernel-launch overhead in the mlx-swift bindings;
-// mlx_lm Python amortises this with `mx.compile` on the decode step,
-// which mlx-swift-lm does not currently do. Closing the gap is a
-// separate workstream on the upstream library.
+// This is effectively at parity with mlx_lm for Gemma B=4. If a
+// production streaming test is slower, this file prints separate
+// `model-side scheduler` and public aggregate numbers so we can tell
+// model decode from text streaming / AsyncStream / detokenization costs.
+// Always compare against release-mode Swift (`swift test -c release`);
+// debug-mode Swift is several times slower and is not a valid mlx_lm
+// comparison.
 
 import Foundation
 import MLX
@@ -342,10 +342,12 @@ struct PerformanceLiveTests {
             let decodeSeconds = max(totalSeconds - prefillSeconds, 0.0001)
             let decodeTokens = max(result.totalCompletionTokens - batchSize, 0)
             let decodeTPS = Double(decodeTokens) / decodeSeconds
+            let modelSideAggregateTPS = result.modelSideTPS.reduce(0, +)
 
             FileHandle.standardError.write(Data("""
             [perf] \(config.label): B=\(batchSize) aggregate throughput  \(String(format: "%.1f", aggregateTPS)) tok/s (incl. prefill)
             [perf] \(config.label): B=\(batchSize) steady-state decode   \(String(format: "%.1f", decodeTPS)) tok/s (\(decodeTokens) tokens after prefill)
+            [perf] \(config.label): B=\(batchSize) model-side scheduler  \(String(format: "%.1f", modelSideAggregateTPS)) tok/s (before detokenization)
 
             """.utf8))
             #expect(result.ttft.allSatisfy { $0 > .zero })
@@ -506,6 +508,30 @@ struct PerformanceLiveTests {
             return Self.tokensPerSecond(produced, elapsed)
         }
 
+        let generatorBatchedTPS: [(Int, Double)] = await container.perform { ctx in
+            [2, 4].map { batchSize in
+                let gen = BatchGenerator(
+                    model: ctx.model,
+                    eosTokens: [],
+                    defaultMaxTokens: decodeTokens + 1,
+                    prefillStepSize: 2048,
+                    prefillBatchSize: batchSize,
+                    completionBatchSize: batchSize
+                )
+                _ = gen.insert(prompts: Array(repeating: promptTokens, count: batchSize))
+                _ = gen.next() // prefill / first token outside timed region
+                let start = ContinuousClock.now
+                var produced = 0
+                let target = decodeTokens * batchSize
+                while gen.hasWork, produced < target {
+                    produced += gen.next().count
+                }
+                let elapsed = ContinuousClock.now - start
+                gen.close()
+                return (batchSize, Self.tokensPerSecond(produced, elapsed))
+            }
+        }
+
         // Path 3: BatchScheduler.submit (production path). Use
         // max_tokens=decodeTokens+1 so we can drop the first token's
         // prefill cost from the steady-state measurement.
@@ -548,6 +574,8 @@ struct PerformanceLiveTests {
         [perf] \(config.label): decode (pure loop, async eval)        \(String(format: "%.1f", pureAsyncDecodeTPS)) tok/s
         [perf] \(config.label): decode (pure loop, compile)           \(String(format: "%.1f", pureCompiledDecodeTPS)) tok/s
         [perf] \(config.label): decode (BatchGenerator B=1)           \(String(format: "%.1f", generatorTPS)) tok/s
+        [perf] \(config.label): decode (BatchGenerator B=2)           \(String(format: "%.1f", generatorBatchedTPS[0].1)) tok/s
+        [perf] \(config.label): decode (BatchGenerator B=4)           \(String(format: "%.1f", generatorBatchedTPS[1].1)) tok/s
         [perf] \(config.label): decode (BatchScheduler.submit)        \(String(format: "%.1f", schedulerTPS)) tok/s
 
         """.utf8))
@@ -625,6 +653,7 @@ struct PerformanceLiveTests {
         let ttft: [Duration]
         let totalCompletionTokens: Int
         let totalElapsed: Duration
+        let modelSideTPS: [Double]
     }
 
     private func measureBatch(
@@ -636,6 +665,7 @@ struct PerformanceLiveTests {
         struct RowResult: Sendable {
             let ttft: Duration
             let completionTokens: Int
+            let modelSideTPS: Double
         }
         let rows: [RowResult] = await withTaskGroup(of: RowResult.self) { group in
             for _ in 0 ..< batchSize {
@@ -643,6 +673,7 @@ struct PerformanceLiveTests {
                     let stream = await scheduler.submit(request: request)
                     var ttft: Duration = .zero
                     var completionTokens = 0
+                    var modelSideTPS = 0.0
                     var sawFirst = false
                     for await event in stream {
                         switch event {
@@ -653,11 +684,18 @@ struct PerformanceLiveTests {
                             }
                         case .info(_, let completion, _):
                             completionTokens = completion
+                            if case .info(_, _, let tps) = event {
+                                modelSideTPS = tps
+                            }
                         case .error:
                             break
                         }
                     }
-                    return RowResult(ttft: ttft, completionTokens: completionTokens)
+                    return RowResult(
+                        ttft: ttft,
+                        completionTokens: completionTokens,
+                        modelSideTPS: modelSideTPS
+                    )
                 }
             }
             var collected: [RowResult] = []
@@ -668,7 +706,8 @@ struct PerformanceLiveTests {
         return BatchResult(
             ttft: rows.map(\.ttft),
             totalCompletionTokens: rows.reduce(0) { $0 + $1.completionTokens },
-            totalElapsed: totalElapsed
+            totalElapsed: totalElapsed,
+            modelSideTPS: rows.map(\.modelSideTPS)
         )
     }
 
