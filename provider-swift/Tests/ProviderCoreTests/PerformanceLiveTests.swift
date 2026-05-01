@@ -26,11 +26,12 @@
 //   Qwen3 0.6B-8bit              B=1: 265 tok/s   B=2: 694 tok/s   B=4: 1119 tok/s
 //   Gemma 4 26B-A4B-it-8bit MoE  B=1:  74 tok/s   B=2: 126 tok/s   B=4:  181 tok/s
 //
-// Our Swift numbers (decode-only, after the per-row-sampler fast-path
-// fix that pushes greedy rows through the vectorized argMax):
+// Our Swift numbers (decode-only, after the greedy fast-path fixes:
+// nil samplers for greedy rows, UInt32 token tensors, no logSumExp on
+// greedy, BatchKVCache.innerState(), and mlx_lm-style double-buffering):
 //
-//   Qwen3 0.6B-8bit              B=1:  88 tok/s   B=2: 181 tok/s   B=4:  351 tok/s
-//   Gemma 4 26B-A4B-it-8bit MoE  B=1:  37 tok/s   B=2:  23 tok/s   B=4:   42 tok/s
+//   Qwen3 0.6B-8bit              B=1: 104 tok/s   B=2: 196 tok/s   B=4:  363 tok/s
+//   Gemma 4 26B-A4B-it-8bit MoE  B=1:  37 tok/s   B=2:  23 tok/s   B=4:   40 tok/s
 //
 // Gap to Python: ~3x at B=1 widening to ~3-4x at B=4. The bracket test
 // confirms the gap is NOT in our BatchScheduler or BatchGenerator —
@@ -393,7 +394,7 @@ struct PerformanceLiveTests {
         // singleStreamGreedy helper do.
         let pureSyncDecodeTPS = await container.perform { ctx in
             let cache = ctx.model.newCache(parameters: nil)
-            let promptArr = MLXArray(promptTokens.map { Int32($0) })
+            let promptArr = MLXArray(promptTokens.map { UInt32($0) })
                 .reshaped([1, promptTokens.count])
 
             var logits = ctx.model.callAsFunction(promptArr, cache: cache)
@@ -419,7 +420,7 @@ struct PerformanceLiveTests {
         // the CPU, so the GPU stays saturated.
         let pureAsyncDecodeTPS = await container.perform { ctx in
             let cache = ctx.model.newCache(parameters: nil)
-            let promptArr = MLXArray(promptTokens.map { Int32($0) })
+            let promptArr = MLXArray(promptTokens.map { UInt32($0) })
                 .reshaped([1, promptTokens.count])
 
             var logits = ctx.model.callAsFunction(promptArr, cache: cache)
@@ -440,8 +441,42 @@ struct PerformanceLiveTests {
                 // Force sync of the *previous* iteration's token. By
                 // the time this returns, the next forward is already
                 // partway through.
-                _ = current.asArray(Int32.self)[0]
+                _ = current.asArray(UInt32.self)[0]
                 current = next
+            }
+            let elapsed = ContinuousClock.now - start
+            return Self.tokensPerSecond(decodeTokens, elapsed)
+        }
+
+        // Path 1c: pure loop with the decode step wrapped in
+        // mlx-swift's `compile`, matching the optimisation mlx_lm Python
+        // applies in its hot decode path.
+        let pureCompiledDecodeTPS = await container.perform { ctx in
+            let cache = ctx.model.newCache(parameters: nil)
+            let promptArr = MLXArray(promptTokens.map { UInt32($0) })
+                .reshaped([1, promptTokens.count])
+
+            var logits = ctx.model.callAsFunction(promptArr, cache: cache)
+            logits = logits[.ellipsis, -1, 0...]
+            var current = argMax(logits, axis: -1)
+            eval(current)
+
+            let compiledStep = compile { (tokens: MLXArray) -> MLXArray in
+                let inputs = tokens[0..., .newAxis]
+                let logits = ctx.model.callAsFunction(inputs, cache: cache)
+                let stepLogits = logits[.ellipsis, -1, 0...]
+                let logprobs = stepLogits - logSumExp(stepLogits, axis: -1, keepDims: true)
+                return argMax(logprobs, axis: -1)
+            }
+
+            // First call pays tracing / compile cost; do not time it.
+            current = compiledStep(current)
+            eval(current)
+
+            let start = ContinuousClock.now
+            for _ in 0 ..< decodeTokens {
+                current = compiledStep(current)
+                eval(current)
             }
             let elapsed = ContinuousClock.now - start
             return Self.tokensPerSecond(decodeTokens, elapsed)
@@ -511,6 +546,7 @@ struct PerformanceLiveTests {
         FileHandle.standardError.write(Data("""
         [perf] \(config.label): decode (pure loop, sync eval)         \(String(format: "%.1f", pureSyncDecodeTPS)) tok/s
         [perf] \(config.label): decode (pure loop, async eval)        \(String(format: "%.1f", pureAsyncDecodeTPS)) tok/s
+        [perf] \(config.label): decode (pure loop, compile)           \(String(format: "%.1f", pureCompiledDecodeTPS)) tok/s
         [perf] \(config.label): decode (BatchGenerator B=1)           \(String(format: "%.1f", generatorTPS)) tok/s
         [perf] \(config.label): decode (BatchScheduler.submit)        \(String(format: "%.1f", schedulerTPS)) tok/s
 
@@ -518,6 +554,7 @@ struct PerformanceLiveTests {
 
         #expect(pureSyncDecodeTPS > 0)
         #expect(pureAsyncDecodeTPS > 0)
+        #expect(pureCompiledDecodeTPS > 0)
         #expect(generatorTPS > 0)
         #expect(schedulerTPS > 0)
     }
