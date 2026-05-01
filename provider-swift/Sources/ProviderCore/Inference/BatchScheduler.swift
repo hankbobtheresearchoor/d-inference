@@ -154,12 +154,20 @@ public actor BatchScheduler {
         }
 
         let maxTokens = request.max_tokens ?? defaultMaxTokens
-        let sampler = makeRowSampler(
-            temperature: request.temperature ?? 0.0,
-            topP: request.top_p ?? 1.0,
-            topK: request.top_k ?? 0,
-            seed: request.seed
-        )
+        let temperature = request.temperature ?? 0.0
+        // Pass `nil` for greedy rows so GenerationBatch.step takes its
+        // vectorized fast path (one batched argMax across all rows)
+        // instead of per-row slice + sample + concat. With temperature=0
+        // the fallback sampler is also greedy, so the result is
+        // identical -- only the dispatch path changes.
+        let sampler: RowSampler? = temperature <= 0
+            ? nil
+            : makeRowSampler(
+                temperature: temperature,
+                topP: request.top_p ?? 1.0,
+                topK: request.top_k ?? 0,
+                seed: request.seed
+            )
         let assignedUids = gen.insert(
             prompts: [promptTokens],
             maxTokens: [maxTokens],

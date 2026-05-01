@@ -20,22 +20,25 @@
 // Numbers print to stderr in a `[perf]` prefix so they're easy to grep
 // out of CI logs.
 //
-// Reference points (mlx_lm 0.31.3 Python on the same hardware):
+// Reference points: mlx_lm 0.31.3 Python on the same hardware. Reproduce
+// with `scripts/mlx_lm_batch_bench.py`.
 //
-//   Qwen3 0.6B-8bit              decode ~426 tok/s
-//   Gemma 4 26B-A4B-it-8bit MoE  decode ~84 tok/s
+//   Qwen3 0.6B-8bit              B=1: 265 tok/s   B=2: 694 tok/s   B=4: 1119 tok/s
+//   Gemma 4 26B-A4B-it-8bit MoE  B=1:  74 tok/s   B=2: 126 tok/s   B=4:  181 tok/s
 //
-// Our Swift numbers (decode-only, B=1) currently land at:
+// Our Swift numbers (decode-only, after the per-row-sampler fast-path
+// fix that pushes greedy rows through the vectorized argMax):
 //
-//   Qwen3 0.6B-8bit              decode ~99 tok/s    (4.3x slower)
-//   Gemma 4 26B-A4B-it-8bit MoE  decode ~40 tok/s    (2.1x slower)
+//   Qwen3 0.6B-8bit              B=1:  88 tok/s   B=2: 181 tok/s   B=4:  351 tok/s
+//   Gemma 4 26B-A4B-it-8bit MoE  B=1:  37 tok/s   B=2:  23 tok/s   B=4:   42 tok/s
 //
-// The bracket test confirms the gap is at the MLX-Swift dispatch layer
-// (kernel launch + per-step CPU overhead), not in our BatchScheduler
-// or BatchGenerator — those wrappers add < 10% on top of the pure
-// model loop. Closing it likely requires applying `mx.compile` to the
-// decode step in the upstream mlx-swift-lm model implementations,
-// which is a separate workstream.
+// Gap to Python: ~3x at B=1 widening to ~3-4x at B=4. The bracket test
+// confirms the gap is NOT in our BatchScheduler or BatchGenerator —
+// those wrappers add < 6% on top of the pure model loop. The dominant
+// cost is per-step kernel-launch overhead in the mlx-swift bindings;
+// mlx_lm Python amortises this with `mx.compile` on the decode step,
+// which mlx-swift-lm does not currently do. Closing the gap is a
+// separate workstream on the upstream library.
 
 import Foundation
 import MLX
