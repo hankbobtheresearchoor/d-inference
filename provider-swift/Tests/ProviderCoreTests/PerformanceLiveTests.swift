@@ -2,20 +2,19 @@
 //
 // Goal: produce reproducible TTFT (time-to-first-token) and throughput
 // numbers that mirror what a coordinator-driven request actually pays
-// for in production. Four scenarios:
+// for in production. Four scenarios, each implemented as a parameterised
+// helper and run against two models:
 //
 //   A) Warm + plaintext  -- pure inference TTFT (baseline)
 //   B) Cold (model load) -- load_time + warm_TTFT
 //   C) Warm + encrypted  -- encrypt + decrypt + warm_TTFT (full E2E)
 //   D) Warm + batched    -- 1, 2, 4 concurrent requests, per-row TTFT
 //
-// All measurements use Qwen3 0.6B-8bit so the suite runs in a few
-// seconds. Numbers are printed to stdout in a human-readable table;
-// tests assert lower-bound liveness (TTFT > 0, completes within a
-// generous budget) but don't pin absolute latencies, since those vary
-// by hardware.
+//   Qwen3 0.6B-8bit             -- smoke-tier (DARKBLOOM_LIVE_MLX_TESTS=1)
+//   Gemma 4 26B-A4B-it-8bit MoE -- production-tier (DARKBLOOM_LIVE_MLX_GEMMA=1)
 //
-// Gated by DARKBLOOM_LIVE_MLX_TESTS=1.
+// Numbers print to stderr in a `[perf]` prefix so they're easy to grep
+// out of CI logs.
 
 import Foundation
 import MLX
@@ -27,57 +26,120 @@ import Testing
 @Suite("performance: end-to-end TTFT", .serialized)
 struct PerformanceLiveTests {
 
-    // MARK: - Shared setup
+    // MARK: - Configuration
+
+    /// Static configuration for one performance scenario. Captures the
+    /// model ID, the wired-memory budget MLX should target, and the
+    /// number of warm-iteration samples to collect (Gemma uses fewer
+    /// iterations because each load is ~30 s of disk I/O).
+    private struct ModelConfig: Sendable {
+        let label: String
+        let modelID: String
+        let wiredMemoryGB: Int
+        let warmIterations: Int
+        let coldIterations: Int
+        let batchSizes: [Int]
+        let maxTokens: Int
+    }
+
+    private static let qwen = ModelConfig(
+        label: "Qwen3 0.6B-8bit",
+        modelID: "mlx-community/Qwen3-0.6B-8bit",
+        wiredMemoryGB: 8,
+        warmIterations: 3,
+        coldIterations: 2,
+        batchSizes: [1, 2, 4],
+        maxTokens: 16
+    )
+
+    private static let gemma = ModelConfig(
+        label: "Gemma 4 26B-A4B-it-8bit (MoE)",
+        modelID: "mlx-community/gemma-4-26b-a4b-it-8bit",
+        wiredMemoryGB: 64,
+        warmIterations: 2,
+        coldIterations: 1,
+        batchSizes: [1, 2, 4],
+        maxTokens: 8
+    )
 
     /// Small, ASCII-only prompt -- avoids non-Latin tokenizer detok costs
     /// dominating the warm TTFT measurement.
     private let promptText = "Reply with the single word 'hi'."
-    private let modelID = LiveInferenceFixtures.tinyModelID
 
-    private var sampleRequest: ChatCompletionRequest {
+    private func sampleRequest(for config: ModelConfig) -> ChatCompletionRequest {
         ChatCompletionRequest(
-            model: modelID,
+            model: config.modelID,
             messages: [ChatMessage(role: "user", content: promptText)],
             temperature: 0.0,
-            max_tokens: 16
+            max_tokens: config.maxTokens
         )
     }
 
-    // MARK: - A) Warm baseline
+    private static var liveEnabled: Bool { LiveInferenceFixtures.liveTestsEnabled }
+    private static var gemmaEnabled: Bool { LiveInferenceFixtures.gemmaTestsEnabled }
 
-    @Test(
-        "warm TTFT baseline (no encryption, no load)",
-        .enabled(if: LiveInferenceFixtures.liveTestsEnabled)
-    )
-    func warmTTFTBaseline() async throws {
-        let loaded = try await loadOrSkip()
+    // ====================================================================
+    // MARK: - Qwen3 0.6B (smoke tier; DARKBLOOM_LIVE_MLX_TESTS=1)
+    // ====================================================================
+
+    @Test("warm TTFT baseline (Qwen3 0.6B)", .enabled(if: liveEnabled))
+    func qwenWarmTTFT() async throws { try await runWarmTTFT(Self.qwen) }
+
+    @Test("cold TTFT (Qwen3 0.6B)", .enabled(if: liveEnabled))
+    func qwenColdTTFT() async throws { try await runColdTTFT(Self.qwen) }
+
+    @Test("encrypted TTFT (Qwen3 0.6B)", .enabled(if: liveEnabled))
+    func qwenEncryptedTTFT() async throws { try await runEncryptedTTFT(Self.qwen) }
+
+    @Test("batched TTFT + throughput (Qwen3 0.6B)", .enabled(if: liveEnabled))
+    func qwenBatchedTTFT() async throws { try await runBatchedTTFT(Self.qwen) }
+
+    // ====================================================================
+    // MARK: - Gemma 4 26B-A4B-it-8bit MoE (production tier;
+    //         DARKBLOOM_LIVE_MLX_TESTS=1 + DARKBLOOM_LIVE_MLX_GEMMA=1)
+    // ====================================================================
+
+    @Test("warm TTFT baseline (Gemma 26B MoE)", .enabled(if: gemmaEnabled))
+    func gemmaWarmTTFT() async throws { try await runWarmTTFT(Self.gemma) }
+
+    @Test("cold TTFT (Gemma 26B MoE)", .enabled(if: gemmaEnabled))
+    func gemmaColdTTFT() async throws { try await runColdTTFT(Self.gemma) }
+
+    @Test("encrypted TTFT (Gemma 26B MoE)", .enabled(if: gemmaEnabled))
+    func gemmaEncryptedTTFT() async throws { try await runEncryptedTTFT(Self.gemma) }
+
+    @Test("batched TTFT + throughput (Gemma 26B MoE)", .enabled(if: gemmaEnabled))
+    func gemmaBatchedTTFT() async throws { try await runBatchedTTFT(Self.gemma) }
+
+    // ====================================================================
+    // MARK: - Scenario implementations (parameterised by ModelConfig)
+    // ====================================================================
+
+    /// A) Warm baseline -- pure inference TTFT, no encryption, model already loaded.
+    private func runWarmTTFT(_ config: ModelConfig) async throws {
+        let loaded = try await loadOrSkip(config)
         let scheduler = loaded.scheduler
         defer { Task { await scheduler.unloadModel() } }
 
         // Warm-up pass: the very first generation pays JIT/Metal setup
         // costs that have nothing to do with the steady-state TTFT.
-        _ = await timeFirstToken(scheduler: scheduler, request: sampleRequest)
+        _ = await timeFirstToken(scheduler: scheduler, request: sampleRequest(for: config))
 
         var samples: [Duration] = []
-        for _ in 0 ..< 3 {
-            let ttft = await timeFirstToken(scheduler: scheduler, request: sampleRequest)
-            samples.append(ttft)
+        for _ in 0 ..< config.warmIterations {
+            samples.append(
+                await timeFirstToken(scheduler: scheduler, request: sampleRequest(for: config))
+            )
         }
-        let median = samples.sorted()[samples.count / 2]
-        Self.report(name: "warm TTFT baseline", samples: samples, median: median)
-        #expect(median > .zero)
+        Self.printRow("\(config.label): warm TTFT", samples: samples, median: median(samples))
+        #expect(median(samples) > .zero)
     }
 
-    // MARK: - B) Cold: model load + first token
-
-    @Test(
-        "cold TTFT (model load + first token)",
-        .enabled(if: LiveInferenceFixtures.liveTestsEnabled)
-    )
-    func coldTTFT() async throws {
-        try ensureModelOrSkip()
-
-        guard let modelDir = ModelScanner.resolveLocalPath(modelID: modelID) else {
+    /// B) Cold -- fresh ModelContainer per iteration so weights are
+    /// re-paged from disk. Reports load-only and load+first-token.
+    private func runColdTTFT(_ config: ModelConfig) async throws {
+        try ensureModelOrSkip(config)
+        guard let modelDir = ModelScanner.resolveLocalPath(modelID: config.modelID) else {
             Issue.record("model not in cache")
             return
         }
@@ -85,11 +147,8 @@ struct PerformanceLiveTests {
         var loadSamples: [Duration] = []
         var totalSamples: [Duration] = []
 
-        for _ in 0 ..< 2 {
-            // Fresh container + scheduler each iteration so the model
-            // weights are re-paged from disk -- this is the real
-            // cold-start path.
-            LiveInferenceFixtures.applyMemoryBudget()
+        for _ in 0 ..< config.coldIterations {
+            applyMemoryBudget(gigabytes: config.wiredMemoryGB)
             let totalStart = ContinuousClock.now
 
             let loadStart = ContinuousClock.now
@@ -99,37 +158,29 @@ struct PerformanceLiveTests {
             )
             let scheduler = BatchScheduler(
                 maxConcurrentRequests: 4,
-                pendingTimeout: .seconds(60),
+                pendingTimeout: .seconds(120),
                 defaultMaxTokens: 64
             )
-            await scheduler.loadModel(container: container, modelId: modelID)
+            await scheduler.loadModel(container: container, modelId: config.modelID)
             let loadElapsed = ContinuousClock.now - loadStart
 
-            let ttft = await timeFirstToken(scheduler: scheduler, request: sampleRequest)
+            _ = await timeFirstToken(scheduler: scheduler, request: sampleRequest(for: config))
             let totalElapsed = ContinuousClock.now - totalStart
 
             loadSamples.append(loadElapsed)
             totalSamples.append(totalElapsed)
             await scheduler.unloadModel()
-            _ = ttft  // included in totalElapsed
         }
 
-        let medianLoad = loadSamples.sorted()[loadSamples.count / 2]
-        let medianTotal = totalSamples.sorted()[totalSamples.count / 2]
-        Self.printRow("cold load time", samples: loadSamples, median: medianLoad)
-        Self.printRow("cold load + first token", samples: totalSamples, median: medianTotal)
-        #expect(medianLoad > .zero)
-        #expect(medianTotal > medianLoad)
+        Self.printRow("\(config.label): cold load",         samples: loadSamples,  median: median(loadSamples))
+        Self.printRow("\(config.label): cold load + first", samples: totalSamples, median: median(totalSamples))
+        #expect(median(loadSamples) > .zero)
+        #expect(median(totalSamples) > median(loadSamples))
     }
 
-    // MARK: - C) End-to-end with NaCl-box encryption
-
-    @Test(
-        "encrypted TTFT (encrypt + decrypt + first token, full E2E)",
-        .enabled(if: LiveInferenceFixtures.liveTestsEnabled)
-    )
-    func encryptedTTFT() async throws {
-        let loaded = try await loadOrSkip()
+    /// C) Encrypted -- full E2E pipeline including NaCl box round-trip.
+    private func runEncryptedTTFT(_ config: ModelConfig) async throws {
+        let loaded = try await loadOrSkip(config)
         let scheduler = loaded.scheduler
         defer { Task { await scheduler.unloadModel() } }
 
@@ -139,15 +190,15 @@ struct PerformanceLiveTests {
         let consumerPubKeyData = Data(base64Encoded: consumerKeys.publicKeyBase64)!
 
         // Warm-up.
-        _ = await timeFirstToken(scheduler: scheduler, request: sampleRequest)
+        _ = await timeFirstToken(scheduler: scheduler, request: sampleRequest(for: config))
 
         var encryptSamples: [Duration] = []
         var decryptSamples: [Duration] = []
         var ttftSamples: [Duration] = []
         var e2eFirstTokenSamples: [Duration] = []
 
-        for _ in 0 ..< 3 {
-            let payload = try JSONEncoder().encode(sampleRequest)
+        for _ in 0 ..< config.warmIterations {
+            let payload = try JSONEncoder().encode(sampleRequest(for: config))
 
             let encStart = ContinuousClock.now
             let ciphertext = try consumerKeys.encrypt(
@@ -174,50 +225,45 @@ struct PerformanceLiveTests {
             e2eFirstTokenSamples.append(encElapsed + decElapsed + ttft)
         }
 
-        Self.printRow("encrypt (consumer side)",          samples: encryptSamples,        median: median(encryptSamples))
-        Self.printRow("decrypt (provider side)",          samples: decryptSamples,        median: median(decryptSamples))
-        Self.printRow("inference TTFT (warm)",            samples: ttftSamples,           median: median(ttftSamples))
-        Self.printRow("E2E first-token (enc+dec+TTFT)",   samples: e2eFirstTokenSamples,  median: median(e2eFirstTokenSamples))
+        Self.printRow("\(config.label): encrypt",                  samples: encryptSamples,        median: median(encryptSamples))
+        Self.printRow("\(config.label): decrypt",                  samples: decryptSamples,        median: median(decryptSamples))
+        Self.printRow("\(config.label): warm TTFT",                samples: ttftSamples,           median: median(ttftSamples))
+        Self.printRow("\(config.label): E2E first-token",          samples: e2eFirstTokenSamples,  median: median(e2eFirstTokenSamples))
         #expect(median(encryptSamples) > .zero)
         #expect(median(decryptSamples) > .zero)
     }
 
-    // MARK: - D) Batched concurrent submissions
-
-    @Test(
-        "batched TTFT + throughput at B=1, B=2, B=4 (continuous batching)",
-        .enabled(if: LiveInferenceFixtures.liveTestsEnabled)
-    )
-    func batchedTTFT() async throws {
+    /// D) Batched -- B=1, B=2, B=4 concurrent submissions on a single
+    /// shared scheduler. Reports per-row TTFT and aggregate throughput
+    /// (the headline continuous-batching metric).
+    private func runBatchedTTFT(_ config: ModelConfig) async throws {
         let loaded = try await LiveInferenceFixtures.loadScheduler(
-            modelID: modelID,
+            modelID: config.modelID,
             maxConcurrentRequests: 4
         )
         let scheduler = loaded.scheduler
         defer { Task { await scheduler.unloadModel() } }
 
         // Warm-up.
-        _ = await timeFirstToken(scheduler: scheduler, request: sampleRequest)
+        _ = await timeFirstToken(scheduler: scheduler, request: sampleRequest(for: config))
 
-        for batchSize in [1, 2, 4] {
+        for batchSize in config.batchSizes {
             let result = await measureBatch(
                 scheduler: scheduler,
                 batchSize: batchSize,
-                request: sampleRequest
+                request: sampleRequest(for: config)
             )
             Self.printRow(
-                "B=\(batchSize) per-request TTFT",
+                "\(config.label): B=\(batchSize) per-row TTFT",
                 samples: result.ttft,
                 median: median(result.ttft)
             )
-            // Aggregate throughput: total tokens generated across all rows
-            // divided by wall-clock from first submit to last completion.
             let totalSeconds = Double(result.totalElapsed.components.seconds)
                 + Double(result.totalElapsed.components.attoseconds) / 1e18
             let aggregateTPS = totalSeconds > 0
                 ? Double(result.totalCompletionTokens) / totalSeconds : 0
             FileHandle.standardError.write(Data(
-                "[perf] B=\(batchSize) aggregate throughput                 \(String(format: "%.1f", aggregateTPS)) tok/s (across all \(batchSize) rows)\n".utf8
+                "[perf] \(config.label): B=\(batchSize) aggregate throughput  \(String(format: "%.1f", aggregateTPS)) tok/s (\(result.totalCompletionTokens) tokens / \(String(format: "%.2f", totalSeconds))s, \(batchSize) rows)\n".utf8
             ))
             #expect(result.ttft.allSatisfy { $0 > .zero })
         }
@@ -225,34 +271,38 @@ struct PerformanceLiveTests {
 
     // MARK: - Helpers
 
-    private func loadOrSkip() async throws -> (
+    private func loadOrSkip(_ config: ModelConfig) async throws -> (
         scheduler: BatchScheduler,
         container: ModelContainer,
         modelDirectory: URL
     ) {
+        applyMemoryBudget(gigabytes: config.wiredMemoryGB)
         do {
-            return try await LiveInferenceFixtures.loadScheduler(modelID: modelID)
+            return try await LiveInferenceFixtures.loadScheduler(modelID: config.modelID)
         } catch let skip as LiveFixtureSkip {
             Issue.record("skipped: \(skip.description)")
             throw skip
         }
     }
 
-    private func ensureModelOrSkip() throws {
+    private func ensureModelOrSkip(_ config: ModelConfig) throws {
         guard LiveInferenceFixtures.ensureMetallibColocated() != nil else {
             Issue.record("metallib not found; run scripts/fetch-metallib.sh debug")
             return
         }
-        guard ModelScanner.resolveLocalPath(modelID: modelID) != nil else {
-            Issue.record("model '\(modelID)' not in cache")
+        guard ModelScanner.resolveLocalPath(modelID: config.modelID) != nil else {
+            Issue.record("model '\(config.modelID)' not in cache")
             return
         }
     }
 
-    /// Submit `request` to `scheduler`, measure the wall-clock time from
-    /// submit() to the first `.chunk` event. Drains the rest of the
-    /// stream so the scheduler's row count returns to zero before the
-    /// next iteration.
+    private func applyMemoryBudget(gigabytes: Int) {
+        MLX.GPU.set(memoryLimit: gigabytes * 1024 * 1024 * 1024)
+    }
+
+    /// Submit `request` to `scheduler`, measure wall-clock from
+    /// submit() to the first `.chunk`, then drain the rest so the
+    /// scheduler's row count returns to zero before the next iteration.
     private func timeFirstToken(
         scheduler: BatchScheduler,
         request: ChatCompletionRequest
@@ -275,14 +325,12 @@ struct PerformanceLiveTests {
         return ttft
     }
 
-    /// Per-row TTFT and aggregate throughput from a batched submission.
     private struct BatchResult: Sendable {
         let ttft: [Duration]
         let totalCompletionTokens: Int
         let totalElapsed: Duration
     }
 
-    /// Submit `batchSize` identical requests at once.
     private func measureBatch(
         scheduler: BatchScheduler,
         batchSize: Int,
@@ -335,27 +383,23 @@ struct PerformanceLiveTests {
 
     // MARK: - Reporting
 
-    private static func report(name: String, samples: [Duration], median: Duration) {
-        printRow(name, samples: samples, median: median)
-    }
-
     private static func printRow(_ name: String, samples: [Duration], median: Duration) {
-        // `%s` would expect a C string; pad the Swift String manually.
-        let label = name.padding(toLength: 44, withPad: " ", startingAt: 0)
+        let label = name.padding(toLength: 56, withPad: " ", startingAt: 0)
         let cells = samples.map { format($0) }.joined(separator: ", ")
         let line = "[perf] \(label)  median=\(format(median))  samples=[\(cells)]"
         FileHandle.standardError.write(Data((line + "\n").utf8))
     }
 
     private static func format(_ duration: Duration) -> String {
-        // Convert to milliseconds with one decimal place.
         let nanos = Double(duration.components.attoseconds) / 1e9
             + Double(duration.components.seconds) * 1e9
         let ms = nanos / 1_000_000.0
         if ms < 10 {
             return String(format: "%.2f ms", ms)
         }
-        return String(format: "%.1f ms", ms)
+        if ms < 1000 {
+            return String(format: "%.1f ms", ms)
+        }
+        return String(format: "%.2f s", ms / 1000.0)
     }
 }
-
