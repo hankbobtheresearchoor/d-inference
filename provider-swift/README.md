@@ -7,7 +7,7 @@ CLI replacement for the legacy Rust provider. Builds two executables:
 | `darkbloom` | Provider CLI: `serve`, `start`, `stop`, `status`, `doctor`, `models`, `login`, `logout`, `benchmark`, `update`, `verify` |
 | `darkbloom-enclave` | Stateless Secure Enclave helper: `attest`, `sign`, `info`, `wallet-address`. Installed as both `darkbloom-enclave` (canonical) and `eigeninference-enclave` (legacy symlink). |
 
-The migration plan is in [`.claude/swift-migration-plan.md`](../.claude/swift-migration-plan.md). This package is **CLI-only**: no SwiftUI app, no `.app` bundle, no DMG.
+This package is **CLI-only**: no SwiftUI app, no `.app` bundle, no DMG.
 
 ## Build & test
 
@@ -90,8 +90,6 @@ darkbloom start --local --port N    standalone OpenAI-compatible HTTP server
 ```
 
 ## Cutover checklist (post-0.5.0)
-
-Tracked in [`.claude/swift-migration-plan.md`](../.claude/swift-migration-plan.md).
 
 Done in v0.5.0:
 

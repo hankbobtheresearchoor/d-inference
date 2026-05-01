@@ -21,7 +21,7 @@ Apple Silicon GPU (Metal)
 ```
 
 > The legacy Rust provider (`provider/`) is still in production but will be
-> retired at the Swift cutover. See `.claude/swift-migration-plan.md`.
+> retired at the Swift cutover.
 
 ## Components
 
@@ -32,7 +32,7 @@ Apple Silicon GPU (Metal)
 The currently-shipping provider. Embeds the Python interpreter via PyO3 to run
 in-process MLX inference (`mlx-lm` / `vllm-mlx`). Same hardening posture as the
 Swift port. Replaced module-for-module by `provider-swift/` once the cutover
-lands; see `.claude/swift-migration-plan.md`.
+lands.
 
 ### Coordinator (`coordinator/`)
 

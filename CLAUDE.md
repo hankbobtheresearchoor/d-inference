@@ -108,7 +108,7 @@ swift build -c release
 ```
 
 The Swift package depends on `../libs/mlx-swift` and `../libs/mlx-swift-lm`
-(both submodules). The cutover plan is in [.claude/swift-migration-plan.md](.claude/swift-migration-plan.md).
+(both submodules).
 
 ### Console UI (Next.js 16)
 ```bash

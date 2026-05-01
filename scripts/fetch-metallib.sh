@@ -2,9 +2,9 @@
 # fetch-metallib.sh -- pull the matching mlx.metallib for local Swift builds.
 #
 # mlx-swift's Cmlx target does NOT auto-compile its Metal kernels through
-# SwiftPM today (see .claude/swift-migration-plan.md Phase 0). Until we land
-# a SwiftPM build-tool plugin, the local dev workflow is to copy the
-# .metallib from a matching `mlx==0.31.x` Python wheel.
+# SwiftPM today. Until we land a SwiftPM build-tool plugin, the local dev
+# workflow is to copy the .metallib from a matching `mlx==0.31.x` Python
+# wheel.
 #
 # The release CI does the same trick automatically (release-swift.yml step
 # "Fetch matching mlx.metallib").
