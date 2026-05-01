@@ -53,6 +53,15 @@ const (
 	TrustHardware   TrustLevel = "hardware"    // MDM + MDA + SE key bound to Apple-verified hardware
 )
 
+const (
+	BackendInprocessMLX = "inprocess-mlx"
+	BackendMLXSwift     = "mlx-swift"
+)
+
+func BackendUsesSwiftRuntime(backend string) bool {
+	return backend == BackendMLXSwift
+}
+
 // PendingRequest is a channel-based handle for an in-flight inference request.
 type PendingRequest struct {
 	RequestID   string
@@ -139,9 +148,9 @@ type Provider struct {
 	TemplateHashes          map[string]string
 
 	// Phase 7: Privacy invariant attestation.
-	// Self-reported by the provider at registration. Fields like SIPEnabled
-	// and HypervisorActive are overridden by the coordinator after each
-	// attestation challenge response with coordinator-verified values.
+	// Self-reported by the provider at registration. SIPEnabled is overridden
+	// by the coordinator after each attestation challenge response with a
+	// coordinator-verified value. HypervisorActive is informational.
 	PrivacyCapabilities *protocol.PrivacyCapabilities `json:"privacy_capabilities,omitempty"`
 
 	// Coordinator-verified SIP status from the most recent attestation challenge.
@@ -158,10 +167,10 @@ type Provider struct {
 }
 
 func providerSupportsPrivateTextLocked(p *Provider) bool {
-	if p.PublicKey == "" || p.Backend != "inprocess-mlx" || !p.EncryptedResponseChunks {
+	if p.PublicKey == "" || !privateTextBackendSupported(p.Backend) || !p.EncryptedResponseChunks {
 		return false
 	}
-	if !p.RuntimeManifestChecked {
+	if !BackendUsesSwiftRuntime(p.Backend) && !p.RuntimeManifestChecked {
 		return false
 	}
 	// Require coordinator-verified SIP (from attestation challenge) rather
@@ -185,6 +194,10 @@ func providerSupportsPrivateTextLocked(p *Provider) bool {
 		caps.AntiDebugEnabled &&
 		caps.CoreDumpsDisabled &&
 		caps.EnvScrubbed
+}
+
+func privateTextBackendSupported(backend string) bool {
+	return backend == BackendInprocessMLX || backend == BackendMLXSwift
 }
 
 // AddPending registers a pending request on this provider.

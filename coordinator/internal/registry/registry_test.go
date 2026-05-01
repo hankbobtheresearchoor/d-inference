@@ -133,6 +133,23 @@ func TestProviderWithoutManifestCheckExcludedFromTextRouting(t *testing.T) {
 	}
 }
 
+func TestSwiftProviderDoesNotRequirePythonRuntimeManifest(t *testing.T) {
+	reg := New(testLogger())
+	msg := testRegisterMessage()
+	msg.Backend = BackendMLXSwift
+	p := reg.Register("p-swift", nil, msg)
+	p.TrustLevel = TrustHardware
+	p.LastChallengeVerified = time.Now()
+	p.ChallengeVerifiedSIP = true
+	p.RuntimeVerified = true
+	p.RuntimeManifestChecked = false
+
+	found := reg.FindProvider("mlx-community/Qwen3.5-9B-Instruct-4bit")
+	if found == nil {
+		t.Fatal("swift provider should be routable without Python/vllm runtime manifest")
+	}
+}
+
 func TestProviderWithoutChallengeVerifiedSIPExcluded(t *testing.T) {
 	reg := New(testLogger())
 	msg := testRegisterMessage()

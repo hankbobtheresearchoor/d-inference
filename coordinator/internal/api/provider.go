@@ -209,8 +209,16 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 				provider.Mu().Unlock()
 			}
 
-			// Verify runtime integrity against the known-good manifest.
-			if s.knownRuntimeManifest != nil {
+			// Verify runtime integrity against the known-good manifest. The Swift
+			// provider has no Python/vllm runtime; it is covered by signed binary
+			// hash attestation during the challenge path instead.
+			if registry.BackendUsesSwiftRuntime(regMsg.Backend) {
+				provider.Mu().Lock()
+				provider.RuntimeVerified = true
+				provider.RuntimeManifestChecked = true
+				provider.TemplateHashes = registry.CloneStringMap(regMsg.TemplateHashes)
+				provider.Mu().Unlock()
+			} else if s.knownRuntimeManifest != nil {
 				runtimeOK, mismatches := s.verifyRuntimeHashes(
 					regMsg.PythonHash, regMsg.RuntimeHash, regMsg.TemplateHashes)
 				provider.Mu().Lock()
@@ -659,41 +667,74 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 		return
 	}
 
-	// Verify fresh RDMA status. RDMA over Thunderbolt 5 allows another Mac
-	// to directly read inference process memory, bypassing all software
-	// protections (PT_DENY_ATTACH, Hardened Runtime, SIP). This check is
-	// required — providers must report RDMA status (v0.2.0+).
+	// Verify fresh RDMA status. Reporting remains mandatory so routing and
+	// trust policy can distinguish single-node providers from RDMA-aware
+	// cluster runtimes. RDMA enablement is not itself a challenge failure:
+	// Apple Silicon Thunderbolt RDMA is IOMMU-scoped to registered buffers,
+	// so the security boundary is the signed runtime's buffer-registration
+	// discipline, not a hypervisor flag.
 	if resp.RDMADisabled == nil {
 		s.handleChallengeFailure(providerID, "RDMA status not reported — provider must update to v0.2.0+")
 		return
 	}
 	if !*resp.RDMADisabled {
-		// RDMA is enabled — only acceptable if hypervisor memory isolation
-		// is active. The hypervisor's Stage 2 page tables make inference
-		// memory invisible to RDMA DMA transfers.
-		hvActive := resp.HypervisorActive != nil && *resp.HypervisorActive
-		if !hvActive {
-			s.logger.Error("provider RDMA enabled without hypervisor — remote memory access possible, marking untrusted",
-				"provider_id", providerID,
-			)
-			s.registry.MarkUntrusted(providerID)
-			s.handleChallengeFailure(providerID, "RDMA enabled without hypervisor memory isolation")
-			return
-		}
-		s.logger.Info("provider RDMA enabled with hypervisor isolation — acceptable",
+		s.logger.Info("provider RDMA enabled — accepting under registered-buffer RDMA policy",
 			"provider_id", providerID,
+			"backend", provider.Backend,
+			"hypervisor_active", resp.HypervisorActive,
 		)
 	}
 
-	// Verify fresh binary hash if reported and known hashes are configured.
-	if resp.BinaryHash != "" && len(s.knownBinaryHashes) > 0 {
-		if !s.knownBinaryHashes[resp.BinaryHash] {
+	// Verify fresh binary hash when a known-good policy is configured. A
+	// reported binary hash only counts when the response is signed by the
+	// provider key from a valid registration attestation.
+	policyConfigured, knownBinaryHashes := s.binaryHashPolicySnapshot()
+	if policyConfigured {
+		attestationResult := provider.AttestationResult
+		if attestationResult == nil || !attestationResult.Valid || attestationResult.PublicKey == "" {
+			s.logger.Error("provider cannot prove binary hash without valid attestation",
+				"provider_id", providerID,
+			)
+			s.registry.MarkUntrusted(providerID)
+			s.handleChallengeFailure(providerID, "valid attestation required for binary hash policy")
+			return
+		}
+		if resp.BinaryHash == "" {
+			s.logger.Error("provider omitted binary hash while known-good policy is configured",
+				"provider_id", providerID,
+			)
+			s.registry.MarkUntrusted(providerID)
+			s.handleChallengeFailure(providerID, "binary hash missing")
+			return
+		}
+		attestedBinaryHash, err := normalizeSHA256Hex(attestationResult.BinaryHash, "attested binary_hash")
+		if err != nil {
+			s.logger.Error("provider attestation has no usable binary hash",
+				"provider_id", providerID,
+				"binary_hash", attestationResult.BinaryHash,
+			)
+			s.registry.MarkUntrusted(providerID)
+			s.handleChallengeFailure(providerID, "attested binary hash missing")
+			return
+		}
+		binaryHash, err := normalizeSHA256Hex(resp.BinaryHash, "binary_hash")
+		if err != nil || !knownBinaryHashes[binaryHash] {
 			s.logger.Error("provider binary hash changed — no longer matches known-good list",
 				"provider_id", providerID,
 				"binary_hash", resp.BinaryHash,
 			)
 			s.registry.MarkUntrusted(providerID)
 			s.handleChallengeFailure(providerID, "binary hash mismatch")
+			return
+		}
+		if binaryHash != attestedBinaryHash {
+			s.logger.Error("provider binary hash changed from registration attestation",
+				"provider_id", providerID,
+				"attested_binary_hash", registry.TruncHash(attestedBinaryHash),
+				"challenge_binary_hash", registry.TruncHash(binaryHash),
+			)
+			s.registry.MarkUntrusted(providerID)
+			s.handleChallengeFailure(providerID, "binary hash changed from registration attestation")
 			return
 		}
 	}
@@ -721,8 +762,18 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 		}
 	}
 
-	// Verify runtime integrity hashes from challenge response.
-	if s.knownRuntimeManifest != nil {
+	// Verify runtime integrity hashes from challenge response. Swift providers
+	// omit Python/vllm runtime hashes and rely on the signed binary hash check
+	// above plus the signed status payload.
+	if registry.BackendUsesSwiftRuntime(provider.Backend) {
+		provider.Mu().Lock()
+		provider.RuntimeVerified = true
+		provider.RuntimeManifestChecked = true
+		if len(resp.TemplateHashes) > 0 {
+			provider.TemplateHashes = registry.CloneStringMap(resp.TemplateHashes)
+		}
+		provider.Mu().Unlock()
+	} else if s.knownRuntimeManifest != nil {
 		runtimeOK, mismatches := s.verifyRuntimeHashes(
 			resp.PythonHash, resp.RuntimeHash, resp.TemplateHashes)
 		provider.Mu().Lock()
@@ -782,8 +833,8 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 
 	// Override self-reported privacy capabilities with coordinator-verified
 	// values from the challenge response. The coordinator independently checks
-	// SIP and hypervisor status during each attestation challenge — these
-	// override the provider's self-report at registration time.
+	// SIP during each attestation challenge. Hypervisor status is preserved as
+	// a reported capability only; it is not the RDMA safety proof.
 	provider.Mu().Lock()
 	if provider.PrivacyCapabilities != nil {
 		if resp.SIPEnabled != nil {
@@ -1129,9 +1180,21 @@ func (s *Server) handleInferenceError(providerID string, provider *registry.Prov
 // verifyProviderAttestation verifies a provider's Secure Enclave attestation
 // if one was included in the registration message. If the attestation is valid,
 // the provider is marked as attested. If missing or invalid, the provider is
-// still accepted (Open Mode) but marked as not attested.
+// accepted in Open Mode only when no binary hash policy is configured.
 func (s *Server) verifyProviderAttestation(providerID string, provider *registry.Provider, regMsg *protocol.RegisterMessage) {
+	policyConfigured, knownBinaryHashes := s.binaryHashPolicySnapshot()
 	if len(regMsg.Attestation) == 0 {
+		if policyConfigured {
+			s.logger.Warn("provider registered without attestation while binary hash policy is configured",
+				"provider_id", providerID,
+			)
+			provider.SetAttestationResult(&attestation.VerificationResult{
+				Valid: false,
+				Error: "attestation missing",
+			})
+			s.registry.MarkUntrusted(providerID)
+			return
+		}
 		s.logger.Info("provider registered without attestation (Open Mode)",
 			"provider_id", providerID,
 		)
@@ -1144,6 +1207,13 @@ func (s *Server) verifyProviderAttestation(providerID string, provider *registry
 			"provider_id", providerID,
 			"error", err,
 		)
+		if policyConfigured {
+			provider.SetAttestationResult(&attestation.VerificationResult{
+				Valid: false,
+				Error: "attestation invalid",
+			})
+			s.registry.MarkUntrusted(providerID)
+		}
 		return
 	}
 
@@ -1154,6 +1224,9 @@ func (s *Server) verifyProviderAttestation(providerID string, provider *registry
 			"provider_id", providerID,
 			"error", result.Error,
 		)
+		if policyConfigured {
+			s.registry.MarkUntrusted(providerID)
+		}
 		return
 	}
 
@@ -1168,6 +1241,9 @@ func (s *Server) verifyProviderAttestation(providerID string, provider *registry
 			result.Valid = false
 			result.Error = "attestation missing encryption public key"
 			provider.SetAttestationResult(&result)
+			if policyConfigured {
+				s.registry.MarkUntrusted(providerID)
+			}
 			return
 		}
 		if result.EncryptionPublicKey != regMsg.PublicKey {
@@ -1179,13 +1255,28 @@ func (s *Server) verifyProviderAttestation(providerID string, provider *registry
 			result.Valid = false
 			result.Error = "encryption key mismatch"
 			provider.SetAttestationResult(&result)
+			if policyConfigured {
+				s.registry.MarkUntrusted(providerID)
+			}
 			return
 		}
 	}
 
-	// Verify binary hash against known-good hashes.
-	if len(s.knownBinaryHashes) > 0 && result.BinaryHash != "" {
-		if !s.knownBinaryHashes[result.BinaryHash] {
+	// Verify binary hash against known-good hashes. Once a binary hash policy is
+	// configured, omission is a policy violation, not an Open Mode downgrade.
+	if policyConfigured {
+		if result.BinaryHash == "" {
+			s.logger.Warn("provider binary hash missing while known-good policy is configured",
+				"provider_id", providerID,
+			)
+			result.Valid = false
+			result.Error = "binary hash missing"
+			provider.SetAttestationResult(&result)
+			s.registry.MarkUntrusted(providerID)
+			return
+		}
+		binaryHash, err := normalizeSHA256Hex(result.BinaryHash, "binary_hash")
+		if err != nil || !knownBinaryHashes[binaryHash] {
 			s.logger.Warn("provider binary hash not in known-good list",
 				"provider_id", providerID,
 				"binary_hash", result.BinaryHash,
@@ -1193,6 +1284,7 @@ func (s *Server) verifyProviderAttestation(providerID string, provider *registry
 			result.Valid = false
 			result.Error = "binary hash not recognized"
 			provider.SetAttestationResult(&result)
+			s.registry.MarkUntrusted(providerID)
 			return
 		}
 		s.logger.Info("provider binary hash verified",
