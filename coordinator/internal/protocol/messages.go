@@ -36,12 +36,22 @@ const (
 	TypeInferenceComplete      = "inference_complete"
 	TypeInferenceError         = "inference_error"
 	TypeAttestationResponse    = "attestation_response"
+	TypeLoadModelStatus        = "load_model_status"
 
 	// Coordinator → Provider.
 	TypeInferenceRequest     = "inference_request"
 	TypeCancel               = "cancel"
 	TypeAttestationChallenge = "attestation_challenge"
 	TypeRuntimeStatus        = "runtime_status"
+	TypeLoadModel            = "load_model"
+)
+
+// LoadModelStatus is the lifecycle state reported by a provider in response
+// to a LoadModelMessage.
+const (
+	LoadModelStatusStarted   = "started"
+	LoadModelStatusSucceeded = "succeeded"
+	LoadModelStatusFailed    = "failed"
 )
 
 // ---------------------------------------------------------------------------
@@ -249,6 +259,31 @@ type EncryptedPayload struct {
 type CancelMessage struct {
 	Type      string `json:"type"`
 	RequestID string `json:"request_id"`
+}
+
+// LoadModelMessage instructs a provider to eagerly load (and pin in
+// GPU memory) a model that the coordinator anticipates demand for.
+// Providers receive it on the existing WebSocket connection (no new
+// inbound port required) and reply asynchronously with a
+// LoadModelStatusMessage when the load completes or fails.
+//
+// This is currently sent only to providers running the Swift runtime
+// (`backend == "mlx-swift"`); the legacy Rust provider does not handle
+// it and the coordinator filters accordingly.
+type LoadModelMessage struct {
+	Type    string `json:"type"`
+	ModelID string `json:"model_id"`
+}
+
+// LoadModelStatusMessage is the provider's reply to a LoadModelMessage.
+// Status is one of LoadModelStatusStarted, LoadModelStatusSucceeded,
+// LoadModelStatusFailed. On failure, Error carries a human-readable
+// reason (e.g. "model not in local cache", "GPU OOM").
+type LoadModelStatusMessage struct {
+	Type    string `json:"type"`
+	ModelID string `json:"model_id"`
+	Status  string `json:"status"`
+	Error   string `json:"error,omitempty"`
 }
 
 // AttestationChallengeMessage is sent by the coordinator to challenge a provider

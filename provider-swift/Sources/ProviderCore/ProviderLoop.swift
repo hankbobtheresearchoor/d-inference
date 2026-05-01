@@ -95,6 +95,16 @@ public actor ProviderLoop {
     /// Cached binary hash for attestation responses.
     private var binaryHash: String?
 
+    /// Timestamp of the last inference-related activity (request submitted
+    /// or finished). The idle monitor compares this to `now` and unloads
+    /// the model if no work has happened in `idleTimeoutMins`.
+    private var lastInferenceAt: ContinuousClock.Instant = .now
+
+    /// Background task that periodically checks idle state and unloads
+    /// the model when the timeout has elapsed. nil when disabled
+    /// (`idleTimeoutMins == 0`) or before `run()` starts it.
+    private var idleMonitorTask: Task<Void, Never>?
+
     private let logger = ProviderLogger(subsystem: "dev.darkbloom.provider", category: "loop")
 
     // MARK: - Initialization
@@ -167,6 +177,12 @@ public actor ProviderLoop {
         let (events, sendFn) = await coordinator.start()
         let send = SendHandle(sendFn)
 
+        // Start the idle-timeout monitor before processing events so that
+        // a rogue model-load (e.g. during `attestation_challenge` priming)
+        // followed by a long disconnect is still subject to the unload
+        // timer.
+        startIdleMonitor()
+
         logger.info("Coordinator client started, entering event loop")
 
         // 5. Process events
@@ -204,10 +220,15 @@ public actor ProviderLoop {
                 for m in mismatches {
                     logger.warning("  \(m.component): expected=\(m.expected), got=\(m.got)")
                 }
+
+            case .loadModel(let modelId):
+                handleLoadModelRequest(modelId: modelId, send: send)
             }
         }
 
         logger.info("Event stream ended, shutting down")
+        idleMonitorTask?.cancel()
+        idleMonitorTask = nil
         await coordinator.shutdown()
         await cancelAllInflight()
     }
@@ -513,6 +534,121 @@ public actor ProviderLoop {
         }
 
         inflightTasks[requestId] = task
+        lastInferenceAt = .now
+    }
+
+    // MARK: - Coordinator-driven preload
+
+    /// Handle a `load_model` request from the coordinator. The provider
+    /// kicks off the load asynchronously (so the WebSocket reader stays
+    /// responsive) and emits `load_model_status` outbound messages
+    /// reporting `started` immediately and `succeeded`/`failed` when the
+    /// load completes.
+    ///
+    /// If the model is already loaded, we short-circuit with
+    /// `succeeded` -- the coordinator can use this as an idempotent
+    /// "ensure warm" call.
+    private func handleLoadModelRequest(modelId: String, send: SendHandle) {
+        if state.currentModel == modelId {
+            logger.info("Preload for \(modelId): already loaded, replying succeeded")
+            send.send(.loadModelStatus(
+                modelId: modelId,
+                status: .succeeded,
+                error: nil
+            ))
+            return
+        }
+
+        send.send(.loadModelStatus(
+            modelId: modelId,
+            status: .started,
+            error: nil
+        ))
+
+        let me = self
+        Task {
+            do {
+                try await me.ensureModelLoaded(modelId: modelId)
+                send.send(.loadModelStatus(
+                    modelId: modelId,
+                    status: .succeeded,
+                    error: nil
+                ))
+            } catch {
+                let message = error.localizedDescription
+                await me.logPreloadFailure(modelId: modelId, error: message)
+                send.send(.loadModelStatus(
+                    modelId: modelId,
+                    status: .failed,
+                    error: message
+                ))
+            }
+        }
+    }
+
+    private func logPreloadFailure(modelId: String, error: String) {
+        logger.error("Preload for \(modelId) failed: \(error)")
+    }
+
+    // MARK: - Idle timeout
+
+    /// Start the background idle-monitor task. Polls every minute; if
+    /// `idleTimeoutMins` minutes have elapsed since the last inference
+    /// activity AND no requests are in flight, the loaded model is
+    /// unloaded to free GPU memory. The next inference request lazy-
+    /// reloads it.
+    ///
+    /// `idleTimeoutMins == 0` disables the monitor entirely (model stays
+    /// resident forever).
+    private func startIdleMonitor() {
+        idleMonitorTask?.cancel()
+        let timeoutMinutes = loopConfig.config.backend.idleTimeoutMins
+        guard timeoutMinutes > 0 else {
+            logger.info("Idle-timeout disabled (idle_timeout_mins=0)")
+            return
+        }
+
+        let timeout = Duration.seconds(Int64(timeoutMinutes) * 60)
+        let pollInterval = Duration.seconds(60)
+        let me = self
+        idleMonitorTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: pollInterval)
+                if Task.isCancelled { break }
+                await me.tickIdleMonitor(timeout: timeout)
+            }
+        }
+        logger.info("Idle monitor started (timeout: \(timeoutMinutes) min)")
+    }
+
+    /// Single tick: unload the model if it's been idle longer than `timeout`.
+    /// Runs on the actor so reads of `inflightTasks` and `state.currentModel`
+    /// are coherent with request submission.
+    private func tickIdleMonitor(timeout: Duration) async {
+        guard let modelId = state.currentModel else { return }
+        let elapsed = ContinuousClock.now - lastInferenceAt
+        guard IdleTimeoutPolicy.shouldUnload(
+            elapsed: elapsed,
+            timeout: timeout,
+            hasInflight: !inflightTasks.isEmpty,
+            hasLoadedModel: true
+        ) else { return }
+
+        logger.info("Idle timeout exceeded (\(formatDuration(elapsed)) since last activity); unloading \(modelId)")
+        await scheduler.unloadModel()
+        state.currentModel = nil
+        state.warmModels = []
+        state.currentModelHash = nil
+    }
+
+    private func formatDuration(_ duration: Duration) -> String {
+        let seconds = duration.components.seconds
+        if seconds < 60 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m" }
+        let hours = minutes / 60
+        let remMinutes = minutes % 60
+        return remMinutes == 0 ? "\(hours)h" : "\(hours)h\(remMinutes)m"
     }
 
     // MARK: - Model Loading
@@ -577,6 +713,7 @@ public actor ProviderLoop {
 
     private func removeInflightTask(requestId: String) {
         inflightTasks.removeValue(forKey: requestId)
+        lastInferenceAt = .now
     }
 
     // MARK: - Attestation Challenge

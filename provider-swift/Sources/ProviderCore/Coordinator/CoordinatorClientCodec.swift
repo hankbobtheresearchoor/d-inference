@@ -102,6 +102,13 @@ public enum CoordinatorClientCodec {
                 templateHashes: payload.templateHashes,
                 modelHashes: payload.modelHashes
             ))
+
+        case .loadModelStatus(let modelId, let status, let error):
+            return .loadModelStatus(ProviderMessage.LoadModelStatus(
+                modelId: modelId,
+                status: status,
+                error: error
+            ))
         }
     }
 

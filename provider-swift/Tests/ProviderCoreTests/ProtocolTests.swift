@@ -112,6 +112,54 @@ import Testing
     }
 }
 
+@Test func loadModelMessagesRoundTripWithCoordinator() throws {
+    // Coordinator → provider preload request
+    let goLoadRequest = #"{"type":"load_model","model_id":"mlx-community/Qwen3-0.6B-8bit"}"#
+    let decoded = try ProviderProtocolCodec.decodeCoordinatorMessage(from: goLoadRequest)
+    guard case .loadModel(let load) = decoded else {
+        throw TestFailure.unexpectedMessage
+    }
+    #expect(load.modelId == "mlx-community/Qwen3-0.6B-8bit")
+
+    // Provider → coordinator status replies (covers all three lifecycle states)
+    let replies: [ProviderMessage] = [
+        .loadModelStatus(ProviderMessage.LoadModelStatus(
+            modelId: "mlx-community/Qwen3-0.6B-8bit",
+            status: .started
+        )),
+        .loadModelStatus(ProviderMessage.LoadModelStatus(
+            modelId: "mlx-community/Qwen3-0.6B-8bit",
+            status: .succeeded
+        )),
+        .loadModelStatus(ProviderMessage.LoadModelStatus(
+            modelId: "mlx-community/Qwen3-0.6B-8bit",
+            status: .failed,
+            error: "model not in local cache"
+        )),
+    ]
+
+    for reply in replies {
+        let encoded = try ProviderProtocolCodec.encodeProviderMessage(reply)
+        let object = try jsonObject(encoded)
+        #expect(object["type"] as? String == "load_model_status")
+        #expect(object["model_id"] as? String == "mlx-community/Qwen3-0.6B-8bit")
+
+        let roundTripped = try ProviderProtocolCodec.decodeProviderMessage(from: encoded)
+        #expect(roundTripped == reply)
+    }
+
+    // Failed status must surface the error string on the wire.
+    let failed: ProviderMessage = .loadModelStatus(ProviderMessage.LoadModelStatus(
+        modelId: "model-x",
+        status: .failed,
+        error: "GPU OOM"
+    ))
+    let failedData = try ProviderProtocolCodec.encodeProviderMessage(failed)
+    let failedObj = try jsonObject(failedData)
+    #expect(failedObj["status"] as? String == "failed")
+    #expect(failedObj["error"] as? String == "GPU OOM")
+}
+
 @Test func coordinatorMessagesDecodeAndEncodeWithSnakeCaseKeys() throws {
     let encryptedRequest = #"{"type":"inference_request","request_id":"go-enc-req-1","body":null,"encrypted_body":{"ephemeral_public_key":"ZXBoZW1lcmFs","ciphertext":"Y2lwaGVy"}}"#
     let request = try ProviderProtocolCodec.decodeCoordinatorMessage(from: encryptedRequest)

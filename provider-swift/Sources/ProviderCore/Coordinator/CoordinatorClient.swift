@@ -17,6 +17,10 @@ public enum CoordinatorEvent: Sendable {
     case cancel(requestId: String)
     case attestationChallenge(nonce: String, timestamp: String)
     case runtimeOutdated(mismatches: [RuntimeMismatch])
+    /// Coordinator-driven preload. Provider should eagerly load the model
+    /// (off-thread) and reply with a `loadModelStatus` outbound message
+    /// when the load completes or fails.
+    case loadModel(modelId: String)
 }
 
 // MARK: - Shared State
@@ -216,6 +220,7 @@ public enum OutboundMessage: Sendable {
     case inferenceComplete(requestId: String, usage: UsageInfo, seSignature: String?, responseHash: String?)
     case inferenceError(requestId: String, error: String, statusCode: UInt16)
     case attestationResponse(AttestationResponsePayload)
+    case loadModelStatus(modelId: String, status: ProviderMessage.LoadModelStatus.Status, error: String?)
 }
 
 public struct AttestationResponsePayload: Sendable {
@@ -559,6 +564,10 @@ public actor CoordinatorClient {
                 }
                 eventContinuation?.yield(.runtimeOutdated(mismatches: status.mismatches))
             }
+
+        case .loadModel(let load):
+            logger.info("Received coordinator-driven preload for: \(load.modelId)")
+            eventContinuation?.yield(.loadModel(modelId: load.modelId))
         }
     }
 

@@ -10,6 +10,7 @@ public enum ProviderMessage: Sendable, Equatable {
     case inferenceComplete(InferenceComplete)
     case inferenceError(InferenceError)
     case attestationResponse(AttestationResponse)
+    case loadModelStatus(LoadModelStatus)
 
     public struct Register: Sendable, Equatable {
         public var hardware: HardwareInfo
@@ -131,6 +132,27 @@ public enum ProviderMessage: Sendable, Equatable {
         }
     }
 
+    /// Reply to a `CoordinatorMessage.loadModel`. `status` is one of
+    /// "started", "succeeded", or "failed". On failure, `error` carries
+    /// a human-readable reason.
+    public struct LoadModelStatus: Sendable, Equatable {
+        public enum Status: String, Sendable, Equatable {
+            case started
+            case succeeded
+            case failed
+        }
+
+        public var modelId: String
+        public var status: Status
+        public var error: String?
+
+        public init(modelId: String, status: Status, error: String? = nil) {
+            self.modelId = modelId
+            self.status = status
+            self.error = error
+        }
+    }
+
     public struct AttestationResponse: Sendable, Equatable {
         public var nonce: String
         public var signature: String
@@ -192,6 +214,7 @@ extension ProviderMessage: Codable {
         case inferenceComplete = "inference_complete"
         case inferenceError = "inference_error"
         case attestationResponse = "attestation_response"
+        case loadModelStatus = "load_model_status"
     }
 
     enum CodingKeys: String, CodingKey {
@@ -238,6 +261,8 @@ extension ProviderMessage: Codable {
         case binaryHash = "binary_hash"
         case activeModelHash = "active_model_hash"
         case modelHashes = "model_hashes"
+        // LoadModelStatus
+        case modelId = "model_id"
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -322,6 +347,12 @@ extension ProviderMessage: Codable {
             if !a.modelHashes.isEmpty {
                 try container.encode(a.modelHashes, forKey: .modelHashes)
             }
+
+        case .loadModelStatus(let l):
+            try container.encode(TypeValue.loadModelStatus, forKey: .type)
+            try container.encode(l.modelId, forKey: .modelId)
+            try container.encode(l.status.rawValue, forKey: .status)
+            try container.encodeIfPresent(l.error, forKey: .error)
         }
     }
 
@@ -403,6 +434,21 @@ extension ProviderMessage: Codable {
                 templateHashes: try container.decodeIfPresent([String: String].self, forKey: .templateHashes) ?? [:],
                 modelHashes: try container.decodeIfPresent([String: String].self, forKey: .modelHashes) ?? [:]
             ))
+
+        case .loadModelStatus:
+            let raw = try container.decode(String.self, forKey: .status)
+            guard let status = LoadModelStatus.Status(rawValue: raw) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .status,
+                    in: container,
+                    debugDescription: "unknown load_model_status value: \(raw)"
+                )
+            }
+            self = .loadModelStatus(LoadModelStatus(
+                modelId: try container.decode(String.self, forKey: .modelId),
+                status: status,
+                error: try container.decodeIfPresent(String.self, forKey: .error)
+            ))
         }
     }
 }
@@ -414,6 +460,7 @@ public enum CoordinatorMessage: Sendable, Equatable {
     case cancel(Cancel)
     case attestationChallenge(AttestationChallenge)
     case runtimeStatus(RuntimeStatus)
+    case loadModel(LoadModel)
 
     public struct InferenceRequest: Sendable, Equatable {
         public var requestId: String
@@ -449,6 +496,15 @@ public enum CoordinatorMessage: Sendable, Equatable {
             self.mismatches = mismatches
         }
     }
+
+    /// Coordinator-driven model preload. Provider should eagerly load the
+    /// named model (no inference attached) so subsequent requests find it
+    /// already warm. Reply asynchronously with a `loadModelStatus`
+    /// `ProviderMessage` when the load completes or fails.
+    public struct LoadModel: Sendable, Equatable {
+        public var modelId: String
+        public init(modelId: String) { self.modelId = modelId }
+    }
 }
 
 // MARK: - CoordinatorMessage Codable
@@ -459,6 +515,7 @@ extension CoordinatorMessage: Codable {
         case cancel
         case attestationChallenge = "attestation_challenge"
         case runtimeStatus = "runtime_status"
+        case loadModel = "load_model"
     }
 
     enum CodingKeys: String, CodingKey {
@@ -468,6 +525,7 @@ extension CoordinatorMessage: Codable {
         case encryptedBody = "encrypted_body"
         case nonce, timestamp
         case verified, mismatches
+        case modelId = "model_id"
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -495,6 +553,10 @@ extension CoordinatorMessage: Codable {
             if !s.mismatches.isEmpty {
                 try container.encode(s.mismatches, forKey: .mismatches)
             }
+
+        case .loadModel(let l):
+            try container.encode(TypeValue.loadModel, forKey: .type)
+            try container.encode(l.modelId, forKey: .modelId)
         }
     }
 
@@ -525,6 +587,11 @@ extension CoordinatorMessage: Codable {
             self = .runtimeStatus(RuntimeStatus(
                 verified: try container.decode(Bool.self, forKey: .verified),
                 mismatches: try container.decodeIfPresent([RuntimeMismatch].self, forKey: .mismatches) ?? []
+            ))
+
+        case .loadModel:
+            self = .loadModel(LoadModel(
+                modelId: try container.decode(String.self, forKey: .modelId)
             ))
         }
     }
