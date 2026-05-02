@@ -1,0 +1,23 @@
+{
+  "repo": "Layr-Labs/d-inference",
+  "repo_url": "git@github.com:Layr-Labs/d-inference.git",
+  "ref": "refs/heads/master",
+  "allowed_actors": [],
+  "require_signed_commit": true,
+  "deploy_path_prefixes": [
+    "nomad/jobs/",
+    "deploy/nomad/",
+    ".hermes/deployments/bin/"
+  ],
+  "job_globs": [
+    "nomad/jobs/*.nomad",
+    "nomad/jobs/**/*.nomad",
+    "deploy/nomad/*.nomad",
+    "deploy/nomad/**/*.nomad"
+  ],
+  "approval_ttl_seconds": 1800,
+  "nomad_addr": "http://127.0.0.1:4646",
+  "nomad_token_file": "~/.hermes/secrets/nomad.token",
+  "state_dir": "~/.hermes/deployments/d-inference/state",
+  "work_dir": "~/.hermes/deployments/d-inference/work"
+}
