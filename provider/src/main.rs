@@ -6578,6 +6578,16 @@ fn install_swift_update_bundle(
 
 /// Check for updates and install if available. Returns Ok(true) if an update was installed.
 async fn auto_update_check(coordinator_base_url: &str) -> Result<bool> {
+    let eigeninference_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot find home directory"))?
+        .join(".darkbloom");
+    auto_update_check_with_install_dir(coordinator_base_url, &eigeninference_dir).await
+}
+
+async fn auto_update_check_with_install_dir(
+    coordinator_base_url: &str,
+    eigeninference_dir: &std::path::Path,
+) -> Result<bool> {
     let current_version = env!("CARGO_PKG_VERSION");
     let version_url = format!("{coordinator_base_url}/api/version");
 
@@ -6626,9 +6636,6 @@ async fn auto_update_check(coordinator_base_url: &str) -> Result<bool> {
     let tmp_path = "/tmp/darkbloom-auto-update.tar.gz";
     std::fs::write(tmp_path, &bytes)?;
 
-    let eigeninference_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot find home directory"))?
-        .join(".darkbloom");
     let bin_dir = eigeninference_dir.join("bin");
     let darkbloom_backup = backup_installed_binary(&bin_dir.join("darkbloom"))?;
     let enclave_backup = backup_installed_binary(&bin_dir.join("eigeninference-enclave"))?;
@@ -7033,6 +7040,11 @@ mod tests {
     fn backend_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn auto_update_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     fn write_test_command(script: &str) -> std::path::PathBuf {
@@ -7735,6 +7747,100 @@ mod tests {
         assert!(bin_dir.join("eigeninference-enclave").exists());
     }
 
+    struct SwiftBundleFixture {
+        tar_bytes: Vec<u8>,
+        bundle_hash: String,
+        binary_hash: String,
+        metallib_hash: String,
+    }
+
+    fn make_swift_bundle_tarball(root: &std::path::Path) -> SwiftBundleFixture {
+        let bundle_root = root.join("swift-bundle");
+        let bin_dir = bundle_root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let darkbloom = bin_dir.join("darkbloom");
+        let enclave = bin_dir.join("darkbloom-enclave");
+        let metallib = bin_dir.join("mlx.metallib");
+        std::fs::write(&darkbloom, b"new swift binary").unwrap();
+        std::fs::write(&enclave, b"new swift enclave").unwrap();
+        std::fs::write(&metallib, b"new metallib kernels").unwrap();
+
+        let binary_hash = security::hash_file(&darkbloom).unwrap();
+        let metallib_hash = security::hash_file(&metallib).unwrap();
+        let tar_path = root.join("swift-bundle.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args([
+                "czf",
+                &tar_path.to_string_lossy(),
+                "-C",
+                &bundle_root.to_string_lossy(),
+                ".",
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "failed to create test Swift bundle tarball"
+        );
+
+        let tar_bytes = std::fs::read(&tar_path).unwrap();
+        let bundle_hash = security::sha256_hex(&tar_bytes);
+        SwiftBundleFixture {
+            tar_bytes,
+            bundle_hash,
+            binary_hash,
+            metallib_hash,
+        }
+    }
+
+    async fn serve_swift_update(
+        mut version_info: serde_json::Value,
+        bundle_bytes: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        version_info["download_url"] =
+            serde_json::Value::String(format!("http://127.0.0.1:{port}/swift-bundle.tar.gz"));
+        let body = serde_json::to_vec(&version_info).unwrap();
+
+        let handle = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+
+                let mut buf = vec![0u8; 4096];
+                let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                let (status, content_type, response_body): (&str, &str, &[u8]) = match path {
+                    "/api/version" => ("200 OK", "application/json", &body),
+                    "/swift-bundle.tar.gz" => {
+                        ("200 OK", "application/gzip", bundle_bytes.as_slice())
+                    }
+                    _ => ("404 Not Found", "text/plain", b"not found"),
+                };
+
+                let headers = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, headers.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response_body).await;
+            }
+        });
+
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
     /// Verify auto_update_check returns Ok(false) when coordinator reports same version.
     #[tokio::test]
     async fn test_auto_update_check_already_up_to_date() {
@@ -7774,5 +7880,127 @@ mod tests {
     async fn test_auto_update_check_unreachable() {
         let result = auto_update_check("http://127.0.0.1:1").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_auto_update_check_migrates_rust_install_to_swift_bundle_end_to_end() {
+        let _guard = auto_update_test_lock().lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path().join(".darkbloom");
+        let bin_dir = install_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        std::fs::write(bin_dir.join("darkbloom"), b"old rust binary").unwrap();
+        std::fs::write(bin_dir.join("eigeninference-enclave"), b"old rust enclave").unwrap();
+
+        let python_bin = install_dir.join("python/bin");
+        std::fs::create_dir_all(&python_bin).unwrap();
+        let broken_python = python_bin.join("python3.12");
+        std::fs::write(&broken_python, b"#!/bin/sh\nexit 99\n").unwrap();
+        let mut perms = std::fs::metadata(&broken_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&broken_python, perms).unwrap();
+
+        let fixture = make_swift_bundle_tarball(tmp.path());
+        let version_info = serde_json::json!({
+            "version": "9999.0.0",
+            "backend": "mlx-swift",
+            "download_url": "",
+            "bundle_hash": fixture.bundle_hash,
+            "binary_hash": fixture.binary_hash,
+            "metallib_hash": fixture.metallib_hash,
+            "changelog": "test"
+        });
+        let (base_url, server) = serve_swift_update(version_info, fixture.tar_bytes).await;
+
+        let updated = auto_update_check_with_install_dir(&base_url, &install_dir)
+            .await
+            .unwrap();
+
+        assert!(updated, "Swift update should install");
+        assert_eq!(
+            std::fs::read(bin_dir.join("darkbloom")).unwrap(),
+            b"new swift binary"
+        );
+        assert_eq!(
+            std::fs::read(bin_dir.join("darkbloom-enclave")).unwrap(),
+            b"new swift enclave"
+        );
+        assert_eq!(
+            std::fs::read(bin_dir.join("mlx.metallib")).unwrap(),
+            b"new metallib kernels"
+        );
+
+        #[cfg(unix)]
+        {
+            let legacy_link = bin_dir.join("eigeninference-enclave");
+            assert!(
+                std::fs::symlink_metadata(&legacy_link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "legacy enclave helper path should become a symlink"
+            );
+            assert_eq!(
+                std::fs::read_link(legacy_link).unwrap(),
+                bin_dir.join("darkbloom-enclave")
+            );
+        }
+
+        assert!(!bin_dir.join("darkbloom.auto-update-backup").exists());
+        assert!(
+            !bin_dir
+                .join("eigeninference-enclave.auto-update-backup")
+                .exists()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_auto_update_check_rolls_back_swift_bundle_on_metallib_hash_mismatch() {
+        let _guard = auto_update_test_lock().lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path().join(".darkbloom");
+        let bin_dir = install_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        std::fs::write(bin_dir.join("darkbloom"), b"old rust binary").unwrap();
+        std::fs::write(bin_dir.join("eigeninference-enclave"), b"old rust enclave").unwrap();
+
+        let fixture = make_swift_bundle_tarball(tmp.path());
+        let version_info = serde_json::json!({
+            "version": "9999.0.0",
+            "backend": "mlx-swift",
+            "download_url": "",
+            "bundle_hash": fixture.bundle_hash,
+            "binary_hash": fixture.binary_hash,
+            "metallib_hash": "0".repeat(64),
+            "changelog": "test"
+        });
+        let (base_url, server) = serve_swift_update(version_info, fixture.tar_bytes).await;
+
+        let result = auto_update_check_with_install_dir(&base_url, &install_dir).await;
+
+        assert!(
+            result.is_err(),
+            "metallib mismatch must abort Swift migration"
+        );
+        assert_eq!(
+            std::fs::read(bin_dir.join("darkbloom")).unwrap(),
+            b"old rust binary"
+        );
+        assert_eq!(
+            std::fs::read(bin_dir.join("eigeninference-enclave")).unwrap(),
+            b"old rust enclave"
+        );
+        assert!(!bin_dir.join("darkbloom-enclave").exists());
+        assert!(!bin_dir.join("mlx.metallib").exists());
+        assert!(!bin_dir.join("darkbloom.auto-update-backup").exists());
+        assert!(
+            !bin_dir
+                .join("eigeninference-enclave.auto-update-backup")
+                .exists()
+        );
+        server.await.unwrap();
     }
 }
