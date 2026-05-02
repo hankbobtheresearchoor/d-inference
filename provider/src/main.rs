@@ -6106,6 +6106,7 @@ async fn cmd_update(coordinator: String, force: bool) -> Result<()> {
 
     let info: serde_json::Value = resp.json().await?;
     let latest = info["version"].as_str().unwrap_or("unknown");
+    let swift_release = is_swift_release(&info);
     let download_url = info["download_url"].as_str().unwrap_or("");
 
     println!("done");
@@ -6183,37 +6184,42 @@ async fn cmd_update(coordinator: String, force: bool) -> Result<()> {
         anyhow::bail!("tar extraction failed");
     }
 
-    // Move binaries to bin dir
-    let _ = std::fs::rename(
-        eigeninference_dir.join("darkbloom"),
-        bin_dir.join("darkbloom"),
-    );
-    let _ = std::fs::rename(
-        eigeninference_dir.join("eigeninference-enclave"),
-        bin_dir.join("eigeninference-enclave"),
-    );
-
-    // Make executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for name in &["darkbloom", "eigeninference-enclave"] {
-            let path = bin_dir.join(name);
-            if path.exists() {
-                let mut perms = std::fs::metadata(&path)?.permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&path, perms)?;
-            }
-        }
-    }
-
-    std::fs::remove_file(tmp_path).ok();
-
     let coordinator_http = base_url
         .replace("wss://", "https://")
         .replace("ws://", "http://")
         .replace("/ws/provider", "");
-    verify_installed_update_runtime(&eigeninference_dir, &coordinator_http, true)?;
+
+    if swift_release {
+        install_swift_update_bundle(&eigeninference_dir, &info, true)?;
+    } else {
+        // Move binaries to bin dir
+        let _ = std::fs::rename(
+            eigeninference_dir.join("darkbloom"),
+            bin_dir.join("darkbloom"),
+        );
+        let _ = std::fs::rename(
+            eigeninference_dir.join("eigeninference-enclave"),
+            bin_dir.join("eigeninference-enclave"),
+        );
+
+        // Make executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in &["darkbloom", "eigeninference-enclave"] {
+                let path = bin_dir.join(name);
+                if path.exists() {
+                    let mut perms = std::fs::metadata(&path)?.permissions();
+                    perms.set_mode(0o755);
+                    std::fs::set_permissions(&path, perms)?;
+                }
+            }
+        }
+
+        verify_installed_update_runtime(&eigeninference_dir, &coordinator_http, true)?;
+    }
+
+    std::fs::remove_file(tmp_path).ok();
 
     // Verify manifest if included in bundle
     let manifest_path = eigeninference_dir.join("manifest.json");
@@ -6467,6 +6473,109 @@ fn remove_binary_backup(backup_path: Option<&std::path::Path>) {
     }
 }
 
+fn restore_or_remove_installed_path(
+    path: &std::path::Path,
+    backup_path: Option<&std::path::Path>,
+) -> Result<()> {
+    if let Some(backup_path) = backup_path {
+        restore_installed_binary(path, Some(backup_path))
+    } else {
+        std::fs::remove_file(path).ok();
+        Ok(())
+    }
+}
+
+fn release_string<'a>(info: &'a serde_json::Value, key: &str) -> &'a str {
+    info[key].as_str().unwrap_or("")
+}
+
+fn is_swift_release(info: &serde_json::Value) -> bool {
+    release_string(info, "backend") == "mlx-swift"
+        || !release_string(info, "metallib_hash").is_empty()
+}
+
+fn verify_update_file_hash(
+    path: &std::path::Path,
+    expected: &str,
+    label: &str,
+    stdout: bool,
+) -> Result<()> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let actual = security::hash_file(path)
+        .ok_or_else(|| anyhow::anyhow!("{label} missing after Swift update: {}", path.display()))?;
+    if actual != expected {
+        anyhow::bail!("{label} hash mismatch — expected {expected}, got {actual}");
+    }
+    emit_update_status(stdout, &format!("  {label} hash verified ✓"));
+    Ok(())
+}
+
+fn install_swift_update_bundle(
+    eigeninference_dir: &std::path::Path,
+    info: &serde_json::Value,
+    stdout: bool,
+) -> Result<()> {
+    let bin_dir = eigeninference_dir.join("bin");
+    std::fs::create_dir_all(&bin_dir)?;
+
+    // Swift bundles are staged as bin/{darkbloom,darkbloom-enclave,mlx.metallib}.
+    // Accept root-level files too so bridge updates can consume early bundles.
+    for name in &["darkbloom", "darkbloom-enclave", "mlx.metallib"] {
+        let root_path = eigeninference_dir.join(name);
+        if root_path.exists() {
+            let _ = std::fs::rename(root_path, bin_dir.join(name));
+        }
+    }
+    let legacy_root_helper = eigeninference_dir.join("eigeninference-enclave");
+    if legacy_root_helper.exists() && !bin_dir.join("darkbloom-enclave").exists() {
+        let _ = std::fs::rename(legacy_root_helper, bin_dir.join("darkbloom-enclave"));
+    }
+
+    let darkbloom = bin_dir.join("darkbloom");
+    let enclave = bin_dir.join("darkbloom-enclave");
+    let metallib = bin_dir.join("mlx.metallib");
+    if !darkbloom.exists() {
+        anyhow::bail!("Swift update bundle missing bin/darkbloom");
+    }
+    if !enclave.exists() {
+        anyhow::bail!("Swift update bundle missing bin/darkbloom-enclave");
+    }
+    if !metallib.exists() {
+        anyhow::bail!("Swift update bundle missing bin/mlx.metallib");
+    }
+
+    let binary_hash = release_string(info, "binary_hash");
+    let metallib_hash = release_string(info, "metallib_hash");
+    if binary_hash.is_empty() {
+        anyhow::bail!("Swift update metadata missing binary_hash");
+    }
+    if metallib_hash.is_empty() {
+        anyhow::bail!("Swift update metadata missing metallib_hash");
+    }
+    verify_update_file_hash(&darkbloom, binary_hash, "darkbloom", stdout)?;
+    verify_update_file_hash(&metallib, metallib_hash, "mlx.metallib", stdout)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for path in [&darkbloom, &enclave] {
+            let mut perms = std::fs::metadata(path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms)?;
+        }
+
+        let legacy_link = bin_dir.join("eigeninference-enclave");
+        std::fs::remove_file(&legacy_link).ok();
+        symlink(&enclave, &legacy_link)
+            .with_context(|| format!("failed to create {}", legacy_link.display()))?;
+    }
+
+    emit_update_status(stdout, "  Swift runtime bundle verified ✓");
+    Ok(())
+}
+
 /// Check for updates and install if available. Returns Ok(true) if an update was installed.
 async fn auto_update_check(coordinator_base_url: &str) -> Result<bool> {
     let current_version = env!("CARGO_PKG_VERSION");
@@ -6483,6 +6592,7 @@ async fn auto_update_check(coordinator_base_url: &str) -> Result<bool> {
 
     let info: serde_json::Value = resp.json().await?;
     let latest = info["version"].as_str().unwrap_or("unknown");
+    let swift_release = is_swift_release(&info);
 
     if !is_newer_version(current_version, latest) {
         return Ok(false);
@@ -6522,6 +6632,8 @@ async fn auto_update_check(coordinator_base_url: &str) -> Result<bool> {
     let bin_dir = eigeninference_dir.join("bin");
     let darkbloom_backup = backup_installed_binary(&bin_dir.join("darkbloom"))?;
     let enclave_backup = backup_installed_binary(&bin_dir.join("eigeninference-enclave"))?;
+    let swift_enclave_backup = backup_installed_binary(&bin_dir.join("darkbloom-enclave"))?;
+    let metallib_backup = backup_installed_binary(&bin_dir.join("mlx.metallib"))?;
 
     let status = std::process::Command::new("tar")
         .args(["xzf", tmp_path, "-C", &eigeninference_dir.to_string_lossy()])
@@ -6530,48 +6642,64 @@ async fn auto_update_check(coordinator_base_url: &str) -> Result<bool> {
         anyhow::bail!("tar extraction failed");
     }
 
-    // Move binaries to bin dir
-    let _ = std::fs::rename(
-        eigeninference_dir.join("darkbloom"),
-        bin_dir.join("darkbloom"),
-    );
-    let _ = std::fs::rename(
-        eigeninference_dir.join("eigeninference-enclave"),
-        bin_dir.join("eigeninference-enclave"),
-    );
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for name in &["darkbloom", "eigeninference-enclave"] {
-            let path = bin_dir.join(name);
-            if path.exists() {
-                let mut perms = std::fs::metadata(&path)?.permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&path, perms)?;
-            }
-        }
-    }
-
-    std::fs::remove_file(tmp_path).ok();
     let coordinator_http = coordinator_base_url
         .replace("wss://", "https://")
         .replace("ws://", "http://")
         .replace("/ws/provider", "");
-    if let Err(err) = verify_installed_update_runtime(&eigeninference_dir, &coordinator_http, false)
-    {
-        tracing::error!(
-            "Auto-update runtime verification failed after installing {latest}: {err}. Restoring previous binaries"
+
+    let install_result = if swift_release {
+        install_swift_update_bundle(&eigeninference_dir, &info, false)
+    } else {
+        // Move binaries to bin dir
+        let _ = std::fs::rename(
+            eigeninference_dir.join("darkbloom"),
+            bin_dir.join("darkbloom"),
         );
-        restore_installed_binary(&bin_dir.join("darkbloom"), darkbloom_backup.as_deref())?;
-        restore_installed_binary(
+        let _ = std::fs::rename(
+            eigeninference_dir.join("eigeninference-enclave"),
+            bin_dir.join("eigeninference-enclave"),
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in &["darkbloom", "eigeninference-enclave"] {
+                let path = bin_dir.join(name);
+                if path.exists() {
+                    let mut perms = std::fs::metadata(&path)?.permissions();
+                    perms.set_mode(0o755);
+                    std::fs::set_permissions(&path, perms)?;
+                }
+            }
+        }
+
+        verify_installed_update_runtime(&eigeninference_dir, &coordinator_http, false)
+    };
+
+    std::fs::remove_file(tmp_path).ok();
+    if let Err(err) = install_result {
+        tracing::error!(
+            "Auto-update verification failed after installing {latest}: {err}. Restoring previous binaries"
+        );
+        restore_or_remove_installed_path(&bin_dir.join("darkbloom"), darkbloom_backup.as_deref())?;
+        restore_or_remove_installed_path(
             &bin_dir.join("eigeninference-enclave"),
             enclave_backup.as_deref(),
         )?;
-        anyhow::bail!("auto-update runtime verification failed: {err}");
+        restore_or_remove_installed_path(
+            &bin_dir.join("darkbloom-enclave"),
+            swift_enclave_backup.as_deref(),
+        )?;
+        restore_or_remove_installed_path(
+            &bin_dir.join("mlx.metallib"),
+            metallib_backup.as_deref(),
+        )?;
+        anyhow::bail!("auto-update verification failed: {err}");
     }
     remove_binary_backup(darkbloom_backup.as_deref());
     remove_binary_backup(enclave_backup.as_deref());
+    remove_binary_backup(swift_enclave_backup.as_deref());
+    remove_binary_backup(metallib_backup.as_deref());
     tracing::info!("Update installed: {current_version} → {latest}");
     Ok(true)
 }
@@ -7566,6 +7694,45 @@ mod tests {
         assert!(!is_newer_version("0.0.2", "0.0.1"));
         assert!(is_newer_version("0.9.9", "0.10.0"));
         assert!(is_newer_version("0.3.5", "0.3.10"));
+    }
+
+    #[test]
+    fn test_is_swift_release_detects_backend_or_metallib_hash() {
+        let by_backend = serde_json::json!({"backend": "mlx-swift"});
+        assert!(is_swift_release(&by_backend));
+
+        let by_metallib = serde_json::json!({"metallib_hash": "abc"});
+        assert!(is_swift_release(&by_metallib));
+
+        let legacy = serde_json::json!({"backend": "vllm-mlx"});
+        assert!(!is_swift_release(&legacy));
+    }
+
+    #[test]
+    fn test_install_swift_update_bundle_accepts_bin_layout_and_verifies_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let bin_dir = install_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let darkbloom = bin_dir.join("darkbloom");
+        let enclave = bin_dir.join("darkbloom-enclave");
+        let metallib = bin_dir.join("mlx.metallib");
+        std::fs::write(&darkbloom, b"swift binary").unwrap();
+        std::fs::write(&enclave, b"swift enclave").unwrap();
+        std::fs::write(&metallib, b"metal kernels").unwrap();
+
+        let info = serde_json::json!({
+            "backend": "mlx-swift",
+            "binary_hash": security::hash_file(&darkbloom).unwrap(),
+            "metallib_hash": security::hash_file(&metallib).unwrap()
+        });
+
+        install_swift_update_bundle(install_dir, &info, false).unwrap();
+        assert!(darkbloom.exists());
+        assert!(enclave.exists());
+        assert!(metallib.exists());
+        assert!(bin_dir.join("eigeninference-enclave").exists());
     }
 
     /// Verify auto_update_check returns Ok(false) when coordinator reports same version.
