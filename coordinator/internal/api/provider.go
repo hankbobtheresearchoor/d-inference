@@ -282,7 +282,7 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 
 		case protocol.TypeInferenceAccepted:
 			acceptMsg := msg.Payload.(*protocol.InferenceAcceptedMessage)
-			s.handleInferenceAccepted(providerID, provider, acceptMsg)
+			s.handleInferenceAccepted(provider, acceptMsg)
 
 		case protocol.TypeInferenceResponseChunk:
 			chunkMsg := msg.Payload.(*protocol.InferenceResponseChunkMessage)
@@ -965,7 +965,7 @@ func (e *textChunkViolationError) Error() string {
 	return e.reason
 }
 
-func (s *Server) handleInferenceAccepted(providerID string, provider *registry.Provider, msg *protocol.InferenceAcceptedMessage) {
+func (s *Server) handleInferenceAccepted(provider *registry.Provider, msg *protocol.InferenceAcceptedMessage) {
 	if provider == nil {
 		return
 	}

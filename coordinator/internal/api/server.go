@@ -320,13 +320,13 @@ func (s *Server) emit(ctx context.Context, severity protocol.TelemetrySeverity, 
 }
 
 // emitRequest is like emit but preserves a request_id for correlation.
-func (s *Server) emitRequest(ctx context.Context, severity protocol.TelemetrySeverity, kind protocol.TelemetryKind, requestID, message string, fields map[string]any) {
+func (s *Server) emitRequest(ctx context.Context, severity protocol.TelemetrySeverity, requestID, message string, fields map[string]any) {
 	if s.emitter == nil {
 		return
 	}
 	s.emitter.Emit(ctx, telemetry.Event{
 		Severity:  severity,
-		Kind:      kind,
+		Kind:      protocol.KindInferenceError,
 		Message:   message,
 		Fields:    fields,
 		RequestID: requestID,
@@ -773,7 +773,7 @@ func (s *Server) verifyRuntimeHashes(pythonHash, runtimeHash string, templateHas
 func (s *Server) handleRuntimeManifest(w http.ResponseWriter, r *http.Request) {
 	const cacheKey = "runtime_manifest:v1"
 	if cached, ok := s.readCache.Get(cacheKey); ok {
-		writeCachedJSON(w, http.StatusOK, cached)
+		writeCachedJSON(w, cached)
 		return
 	}
 	var resp map[string]any
@@ -793,7 +793,7 @@ func (s *Server) handleRuntimeManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.readCache.Set(cacheKey, body, time.Minute)
-	writeCachedJSON(w, http.StatusOK, body)
+	writeCachedJSON(w, body)
 }
 
 // HandleMDMWebhook processes a MicroMDM webhook callback.
