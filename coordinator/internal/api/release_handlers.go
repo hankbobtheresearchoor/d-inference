@@ -448,7 +448,7 @@ func (s *Server) handleLatestRelease(w http.ResponseWriter, r *http.Request) {
 
 	cacheKey := "latest_release:v1:" + platform
 	if cached, ok := s.readCache.Get(cacheKey); ok {
-		writeCachedJSON(w, http.StatusOK, cached)
+		writeCachedJSON(w, cached)
 		return
 	}
 
@@ -464,7 +464,7 @@ func (s *Server) handleLatestRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.readCache.Set(cacheKey, body, time.Minute)
-	writeCachedJSON(w, http.StatusOK, body)
+	writeCachedJSON(w, body)
 }
 
 // handleAdminListReleases handles GET /v1/admin/releases.
