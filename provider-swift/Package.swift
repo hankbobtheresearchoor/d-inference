@@ -22,6 +22,12 @@ let package = Package(
         // checkpoints (see PR #296). Sticking on 0.1.x makes Qwen 3.5
         // models fail to load with `.unsupportedTokenizer("TokenizersBackend")`.
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
+        // EventSource 1.4.x uses a Swift 6.1 traits manifest that enables an
+        // AsyncHTTPClient/NIO dependency path in release builds. Xcode 26.4's
+        // native SwiftPM builder then drops required transitive C module maps
+        // while compiling EventSource. swift-huggingface only needs the core
+        // EventSource library here, so pin to the simpler 1.3.0 manifest.
+        .package(url: "https://github.com/mattt/EventSource.git", exact: "1.3.0"),
         .package(url: "https://github.com/jedisct1/swift-sodium.git", from: "0.9.1"),
         .package(url: "https://github.com/LebJe/TOMLKit.git", from: "0.6.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.22.0"),
@@ -43,7 +49,6 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
-                .product(name: "MLXVLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "Transformers", package: "swift-transformers"),
                 .product(name: "Sodium", package: "swift-sodium"),

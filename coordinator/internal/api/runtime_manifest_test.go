@@ -3,6 +3,7 @@ package api
 import (
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,76 @@ func runtimeManifestTestServer(t *testing.T) (*Server, *store.MemoryStore) {
 	reg := registry.New(logger)
 	srv := NewServer(reg, st, logger)
 	return srv, st
+}
+
+func TestSyncRuntimeManifestIncludesSwiftMetallibHash(t *testing.T) {
+	srv, st := runtimeManifestTestServer(t)
+	metallibHash := strings.Repeat("a", 64)
+
+	if err := st.SetRelease(&store.Release{
+		Version:      "0.5.0",
+		Platform:     "macos-arm64",
+		Backend:      "mlx-swift",
+		BinaryHash:   strings.Repeat("b", 64),
+		BundleHash:   strings.Repeat("c", 64),
+		MetallibHash: metallibHash,
+		URL:          "https://example.com/swift.tar.gz",
+		Active:       true,
+	}); err != nil {
+		t.Fatalf("SetRelease(swift): %v", err)
+	}
+
+	srv.SyncRuntimeManifest()
+
+	if srv.knownRuntimeManifest == nil {
+		t.Fatal("knownRuntimeManifest = nil")
+	}
+	if got := srv.knownRuntimeManifest.TemplateHashes["mlx_metallib"]; got != metallibHash {
+		t.Fatalf("mlx_metallib hash = %q, want %q", got, metallibHash)
+	}
+}
+
+func TestVerifyRuntimeHashesForSwiftRequiresMetallibButNotLegacyRuntime(t *testing.T) {
+	srv, _ := runtimeManifestTestServer(t)
+	metallibHash := strings.Repeat("a", 64)
+	srv.SetRuntimeManifest(&RuntimeManifest{
+		PythonHashes:   map[string]bool{"legacy-python": true},
+		RuntimeHashes:  map[string]bool{"legacy-runtime": true},
+		TemplateHashes: map[string]string{"qwen3.5": "legacy-template", "mlx_metallib": metallibHash},
+	})
+
+	ok, mismatches := srv.verifyRuntimeHashesForBackend("mlx-swift", "", "", map[string]string{
+		"mlx_metallib": metallibHash,
+	})
+	if !ok {
+		t.Fatalf("swift runtime verification failed with matching metallib: %#v", mismatches)
+	}
+
+	ok, mismatches = srv.verifyRuntimeHashesForBackend("mlx-swift", "", "", map[string]string{
+		"mlx_metallib": strings.Repeat("b", 64),
+	})
+	if ok {
+		t.Fatal("swift runtime verification should fail on metallib mismatch")
+	}
+	if len(mismatches) != 1 || mismatches[0].Component != "template:mlx_metallib" {
+		t.Fatalf("mismatches = %#v, want one mlx_metallib mismatch", mismatches)
+	}
+}
+
+func TestVerifyRuntimeHashesForLegacyIgnoresSwiftMetallib(t *testing.T) {
+	srv, _ := runtimeManifestTestServer(t)
+	srv.SetRuntimeManifest(&RuntimeManifest{
+		PythonHashes:   map[string]bool{"legacy-python": true},
+		RuntimeHashes:  map[string]bool{"legacy-runtime": true},
+		TemplateHashes: map[string]string{"qwen3.5": "legacy-template", "mlx_metallib": strings.Repeat("a", 64)},
+	})
+
+	ok, mismatches := srv.verifyRuntimeHashesForBackend("vllm-mlx", "legacy-python", "legacy-runtime", map[string]string{
+		"qwen3.5": "legacy-template",
+	})
+	if !ok {
+		t.Fatalf("legacy runtime verification failed due to swift metallib: %#v", mismatches)
+	}
 }
 
 func TestSyncRuntimeManifestUsesLatestReleaseOnly(t *testing.T) {

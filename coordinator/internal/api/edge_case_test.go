@@ -707,7 +707,8 @@ func TestEdge_ReleaseRegisterNoAuth(t *testing.T) {
 	srv, _ := testServer(t)
 	srv.SetReleaseKey("secret-release-key")
 
-	body := `{"version":"1.0.0","platform":"macos-arm64","binary_hash":"abc","bundle_hash":"def","url":"http://example.com/bundle.tar.gz"}`
+	body := fmt.Sprintf(`{"version":"1.0.0","platform":"macos-arm64","binary_hash":%q,"bundle_hash":%q,"url":"http://example.com/bundle.tar.gz"}`,
+		strings.Repeat("a", 64), strings.Repeat("b", 64))
 	req := httptest.NewRequest(http.MethodPost, "/v1/releases", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w, req)
@@ -721,7 +722,8 @@ func TestEdge_ReleaseRegisterWrongKey(t *testing.T) {
 	srv, _ := testServer(t)
 	srv.SetReleaseKey("correct-key")
 
-	body := `{"version":"1.0.0","platform":"macos-arm64","binary_hash":"abc","bundle_hash":"def","url":"http://example.com/bundle.tar.gz"}`
+	body := fmt.Sprintf(`{"version":"1.0.0","platform":"macos-arm64","binary_hash":%q,"bundle_hash":%q,"url":"http://example.com/bundle.tar.gz"}`,
+		strings.Repeat("a", 64), strings.Repeat("b", 64))
 	req := httptest.NewRequest(http.MethodPost, "/v1/releases", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer wrong-key")
 	w := httptest.NewRecorder()
@@ -740,11 +742,13 @@ func TestEdge_ReleaseRegisterMissingFields(t *testing.T) {
 		name string
 		body string
 	}{
-		{"missing_version", `{"platform":"macos-arm64","binary_hash":"abc","bundle_hash":"def","url":"http://example.com/b.tar.gz"}`},
+		{"missing_version", fmt.Sprintf(`{"platform":"macos-arm64","binary_hash":%q,"bundle_hash":%q,"url":"http://example.com/b.tar.gz"}`, strings.Repeat("a", 64), strings.Repeat("b", 64))},
 		// platform defaults to "macos-arm64" when omitted, so omit a truly required field instead
-		{"empty_version", `{"version":"","platform":"macos-arm64","binary_hash":"abc","bundle_hash":"def","url":"http://example.com/b.tar.gz"}`},
+		{"empty_version", fmt.Sprintf(`{"version":"","platform":"macos-arm64","binary_hash":%q,"bundle_hash":%q,"url":"http://example.com/b.tar.gz"}`, strings.Repeat("a", 64), strings.Repeat("b", 64))},
 		{"missing_hash", `{"version":"1.0.0","platform":"macos-arm64","url":"http://example.com/b.tar.gz"}`},
-		{"missing_url", `{"version":"1.0.0","platform":"macos-arm64","binary_hash":"abc","bundle_hash":"def"}`},
+		{"missing_url", fmt.Sprintf(`{"version":"1.0.0","platform":"macos-arm64","binary_hash":%q,"bundle_hash":%q}`, strings.Repeat("a", 64), strings.Repeat("b", 64))},
+		{"invalid_hash", `{"version":"1.0.0","platform":"macos-arm64","binary_hash":"abc","bundle_hash":"def","url":"http://example.com/b.tar.gz"}`},
+		{"missing_swift_metallib", fmt.Sprintf(`{"version":"1.0.0","platform":"macos-arm64","backend":"mlx-swift","binary_hash":%q,"bundle_hash":%q,"url":"http://example.com/b.tar.gz"}`, strings.Repeat("a", 64), strings.Repeat("b", 64))},
 	}
 
 	for _, tc := range cases {
@@ -766,7 +770,8 @@ func TestEdge_ReleaseRegisterAndRetrieve(t *testing.T) {
 	srv.SetReleaseKey("release-key")
 
 	// Register a release
-	body := `{"version":"1.0.0","platform":"macos-arm64","binary_hash":"abc123","bundle_hash":"def456","url":"http://example.com/bundle.tar.gz","changelog":"First release"}`
+	body := fmt.Sprintf(`{"version":"1.0.0","platform":"macos-arm64","backend":"mlx-swift","binary_hash":%q,"bundle_hash":%q,"metallib_hash":%q,"url":"http://example.com/bundle.tar.gz","changelog":"First release"}`,
+		strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64))
 	req := httptest.NewRequest(http.MethodPost, "/v1/releases", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer release-key")
 	w := httptest.NewRecorder()

@@ -36,7 +36,13 @@ struct Update: AsyncParsableCommand {
             case .updateAvailable(let current, let latest):
                 print("Update available: v\(current) -> v\(latest.version)")
                 print("Download URL: \(latest.url)")
-                print("SHA-256: \(latest.sha256)")
+                print("Bundle SHA-256: \(latest.bundleHash)")
+                if let binaryHash = latest.binaryHash {
+                    print("Binary SHA-256: \(binaryHash)")
+                }
+                if let metallibHash = latest.metallibHash {
+                    print("mlx.metallib SHA-256: \(metallibHash)")
+                }
                 print("")
                 print("Run 'darkbloom update' to install.")
 

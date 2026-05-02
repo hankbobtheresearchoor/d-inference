@@ -201,7 +201,8 @@ enum LiveInferenceFixtures {
     ///   metallib isn't available.
     static func loadScheduler(
         modelID: String,
-        maxConcurrentRequests: Int = 4
+        maxConcurrentRequests: Int = 4,
+        memoryBudgetBytes: Int? = nil
     ) async throws -> (scheduler: BatchScheduler, container: ModelContainer, modelDirectory: URL) {
         guard ensureMetallibColocated() != nil else {
             throw LiveFixtureSkip.missingMetallib
@@ -215,7 +216,7 @@ enum LiveInferenceFixtures {
             throw LiveFixtureSkip.modelNotInCache(id)
         }
 
-        applyMemoryBudget()
+        applyMemoryBudget(maxBytes: memoryBudgetBytes ?? 12 * 1024 * 1024 * 1024)
 
         let container = try await LLMModelFactory.shared.loadContainer(
             from: directory,

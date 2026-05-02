@@ -280,8 +280,10 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS releases (
 			version TEXT NOT NULL,
 			platform TEXT NOT NULL,
+			backend TEXT NOT NULL DEFAULT '',
 			binary_hash TEXT NOT NULL DEFAULT '',
 			bundle_hash TEXT NOT NULL DEFAULT '',
+			metallib_hash TEXT NOT NULL DEFAULT '',
 			python_hash TEXT NOT NULL DEFAULT '',
 			runtime_hash TEXT NOT NULL DEFAULT '',
 			template_hashes TEXT NOT NULL DEFAULT '',
@@ -292,6 +294,14 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			PRIMARY KEY (version, platform)
 		)`,
+		`DO $$ BEGIN
+			ALTER TABLE releases ADD COLUMN IF NOT EXISTS backend TEXT NOT NULL DEFAULT '';
+		EXCEPTION WHEN others THEN NULL;
+		END $$`,
+		`DO $$ BEGIN
+			ALTER TABLE releases ADD COLUMN IF NOT EXISTS metallib_hash TEXT NOT NULL DEFAULT '';
+		EXCEPTION WHEN others THEN NULL;
+		END $$`,
 		`DO $$ BEGIN
 			ALTER TABLE releases ADD COLUMN IF NOT EXISTS changelog TEXT NOT NULL DEFAULT '';
 		EXCEPTION WHEN others THEN NULL;
@@ -1671,12 +1681,12 @@ func (s *PostgresStore) SetRelease(release *Release) error {
 	defer cancel()
 
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO releases (version, platform, binary_hash, bundle_hash, python_hash, runtime_hash, template_hashes, url, changelog, active, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, NOW())
+		`INSERT INTO releases (version, platform, backend, binary_hash, bundle_hash, metallib_hash, python_hash, runtime_hash, template_hashes, url, changelog, active, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE, NOW())
 		 ON CONFLICT (version, platform) DO UPDATE SET
-		   binary_hash = $3, bundle_hash = $4, python_hash = $5, runtime_hash = $6, template_hashes = $7, url = $8, changelog = $9, active = TRUE`,
-		release.Version, release.Platform, release.BinaryHash, release.BundleHash,
-		release.PythonHash, release.RuntimeHash, release.TemplateHashes,
+		   backend = $3, binary_hash = $4, bundle_hash = $5, metallib_hash = $6, python_hash = $7, runtime_hash = $8, template_hashes = $9, url = $10, changelog = $11, active = TRUE`,
+		release.Version, release.Platform, release.Backend, release.BinaryHash, release.BundleHash,
+		release.MetallibHash, release.PythonHash, release.RuntimeHash, release.TemplateHashes,
 		release.URL, release.Changelog,
 	)
 	if err != nil {
@@ -1690,7 +1700,7 @@ func (s *PostgresStore) ListReleases() []Release {
 	defer cancel()
 
 	rows, err := s.pool.Query(ctx,
-		`SELECT version, platform, binary_hash, bundle_hash,
+		`SELECT version, platform, COALESCE(backend, ''), binary_hash, bundle_hash, COALESCE(metallib_hash, ''),
 		        COALESCE(python_hash, ''), COALESCE(runtime_hash, ''), COALESCE(template_hashes, ''),
 		        url, changelog, active, created_at
 		 FROM releases ORDER BY created_at DESC`,
@@ -1703,7 +1713,7 @@ func (s *PostgresStore) ListReleases() []Release {
 	var releases []Release
 	for rows.Next() {
 		var r Release
-		if err := rows.Scan(&r.Version, &r.Platform, &r.BinaryHash, &r.BundleHash,
+		if err := rows.Scan(&r.Version, &r.Platform, &r.Backend, &r.BinaryHash, &r.BundleHash, &r.MetallibHash,
 			&r.PythonHash, &r.RuntimeHash, &r.TemplateHashes,
 			&r.URL, &r.Changelog, &r.Active, &r.CreatedAt); err != nil {
 			continue
@@ -1718,7 +1728,7 @@ func (s *PostgresStore) GetLatestRelease(platform string) *Release {
 	defer cancel()
 
 	rows, err := s.pool.Query(ctx,
-		`SELECT version, platform, binary_hash, bundle_hash,
+		`SELECT version, platform, COALESCE(backend, ''), binary_hash, bundle_hash, COALESCE(metallib_hash, ''),
 		        COALESCE(python_hash, ''), COALESCE(runtime_hash, ''), COALESCE(template_hashes, ''),
 		        url, changelog, active, created_at
 		 FROM releases WHERE platform = $1 AND active = TRUE`, platform,
@@ -1731,7 +1741,7 @@ func (s *PostgresStore) GetLatestRelease(platform string) *Release {
 	var latest *Release
 	for rows.Next() {
 		var r Release
-		if err := rows.Scan(&r.Version, &r.Platform, &r.BinaryHash, &r.BundleHash,
+		if err := rows.Scan(&r.Version, &r.Platform, &r.Backend, &r.BinaryHash, &r.BundleHash, &r.MetallibHash,
 			&r.PythonHash, &r.RuntimeHash, &r.TemplateHashes,
 			&r.URL, &r.Changelog, &r.Active, &r.CreatedAt); err != nil {
 			return nil

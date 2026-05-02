@@ -608,6 +608,19 @@ func (s *Server) SyncRuntimeManifest() {
 				}
 			}
 		}
+		if r.MetallibHash != "" {
+			normalized, err := normalizeSHA256Hex(r.MetallibHash, "release.metallib_hash")
+			if err != nil {
+				s.logger.Warn("invalid release metallib hash ignored",
+					"version", r.Version,
+					"platform", r.Platform,
+					"error", err,
+				)
+			} else {
+				manifest.TemplateHashes["mlx_metallib"] = normalized
+				hasAny = true
+			}
+		}
 	}
 
 	if hasAny {
@@ -638,9 +651,6 @@ func (s *Server) revalidateConnectedProvidersAgainstRuntimePolicy() {
 		version := provider.Version
 		backend := provider.Backend
 		switch {
-		case registry.BackendUsesSwiftRuntime(backend):
-			provider.RuntimeVerified = true
-			provider.RuntimeManifestChecked = true
 		case s.knownRuntimeManifest == nil:
 			provider.RuntimeVerified = false
 			provider.RuntimeManifestChecked = false
@@ -650,7 +660,8 @@ func (s *Server) revalidateConnectedProvidersAgainstRuntimePolicy() {
 			provider.RuntimeVerified = false
 			provider.RuntimeManifestChecked = false
 		default:
-			runtimeOK, _ := s.verifyRuntimeHashes(
+			runtimeOK, _ := s.verifyRuntimeHashesForBackend(
+				backend,
 				pythonHash,
 				runtimeHash,
 				templateHashes,
@@ -721,8 +732,58 @@ func (s *Server) verifyRuntimeHashes(pythonHash, runtimeHash string, templateHas
 	if s.knownRuntimeManifest == nil {
 		return true, nil
 	}
+	return s.verifyRuntimeHashesAgainstManifest(s.knownRuntimeManifest, pythonHash, runtimeHash, templateHashes)
+}
+
+func (s *Server) verifyRuntimeHashesForBackend(backend, pythonHash, runtimeHash string, templateHashes map[string]string) (bool, []protocol.RuntimeMismatch) {
+	if s.knownRuntimeManifest == nil {
+		return true, nil
+	}
 
 	manifest := s.knownRuntimeManifest
+	scoped := &RuntimeManifest{
+		PythonHashes:   map[string]bool{},
+		RuntimeHashes:  map[string]bool{},
+		TemplateHashes: map[string]string{},
+	}
+	scopedReportedTemplates := make(map[string]string)
+
+	if registry.BackendUsesSwiftRuntime(backend) {
+		if expected := manifest.TemplateHashes["mlx_metallib"]; expected != "" {
+			scoped.TemplateHashes["mlx_metallib"] = expected
+		}
+		if got := templateHashes["mlx_metallib"]; got != "" {
+			scopedReportedTemplates["mlx_metallib"] = got
+		}
+	} else {
+		for hash := range manifest.PythonHashes {
+			scoped.PythonHashes[hash] = true
+		}
+		for hash := range manifest.RuntimeHashes {
+			scoped.RuntimeHashes[hash] = true
+		}
+		for name, hash := range manifest.TemplateHashes {
+			if name == "mlx_metallib" {
+				continue
+			}
+			scoped.TemplateHashes[name] = hash
+		}
+		for name, got := range templateHashes {
+			if name == "mlx_metallib" {
+				continue
+			}
+			scopedReportedTemplates[name] = got
+		}
+	}
+
+	return s.verifyRuntimeHashesAgainstManifest(scoped, pythonHash, runtimeHash, scopedReportedTemplates)
+}
+
+func (s *Server) verifyRuntimeHashesAgainstManifest(manifest *RuntimeManifest, pythonHash, runtimeHash string, templateHashes map[string]string) (bool, []protocol.RuntimeMismatch) {
+	if manifest == nil {
+		return true, nil
+	}
+
 	var mismatches []protocol.RuntimeMismatch
 
 	requireOneOf := func(component, got string, accepted map[string]bool) {

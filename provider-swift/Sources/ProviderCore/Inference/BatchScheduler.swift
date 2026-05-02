@@ -56,6 +56,16 @@ public actor BatchScheduler {
 
     private var active: [Int: ActiveRequest] = [:]
     private var requestIdToUid: [String: Int] = [:]
+    private var pending: [PendingRequest] = []
+    private var cancelledUIDs = Set<Int>()
+    private var generationEpoch: UInt64 = 0
+    private var engineBusy = false
+
+    /// Once every active row has received its first token, run several decode
+    /// steps per actor/model hop. A single hop per token starves Gemma-class
+    /// models because the CPU actor round trip is larger than one GPU step.
+    private let decodeBurstSteps = 32
+
 
     public init(
         maxConcurrentRequests: Int = 4,
@@ -83,9 +93,8 @@ public actor BatchScheduler {
             return
         }
 
-        cancelAll()
-        self.modelContainer = container
-        self.modelId = modelId
+        await stopCurrentEngine()
+        let loadEpoch = generationEpoch
 
         let snapshot: LoadSnapshot = await container.perform { ctx in
             let bytes = ctx.model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
@@ -100,6 +109,10 @@ public actor BatchScheduler {
                 model: ctx.model
             )
         }
+        guard loadEpoch == generationEpoch else { return }
+
+        self.modelContainer = container
+        self.modelId = modelId
         self.modelWeightBytes = snapshot.bytes
         self.tokenizer = snapshot.tokenizer
         self.generator = BatchGenerator(
@@ -112,16 +125,8 @@ public actor BatchScheduler {
         startWorker()
     }
 
-    public func unloadModel() {
-        cancelAll()
-        workerTask?.cancel()
-        workerTask = nil
-        generator?.close()
-        generator = nil
-        modelContainer = nil
-        modelId = ""
-        modelWeightBytes = 0
-        tokenizer = nil
+    public func unloadModel() async {
+        await stopCurrentEngine()
     }
 
     // MARK: - Submit / cancel
@@ -133,7 +138,7 @@ public actor BatchScheduler {
         let id = requestId ?? "req-\(UUID().uuidString.prefix(12))"
         let (stream, continuation) = AsyncStream<GenerationEvent>.makeStream()
 
-        guard let gen = generator, let tk = tokenizer else {
+        guard generator != nil, let tk = tokenizer else {
             continuation.yield(.error("No model loaded"))
             continuation.finish()
             return stream
@@ -168,26 +173,15 @@ public actor BatchScheduler {
                 topK: request.top_k ?? 0,
                 seed: request.seed
             )
-        let assignedUids = gen.insert(
-            prompts: [promptTokens],
-            maxTokens: [maxTokens],
-            samplers: [sampler]
-        )
-        guard let uid = assignedUids.first else {
-            continuation.yield(.error("BatchGenerator rejected the prompt"))
-            continuation.finish()
-            return stream
-        }
-
-        active[uid] = ActiveRequest(
+        pending.append(PendingRequest(
             requestId: id,
             continuation: continuation,
+            promptTokens: promptTokens,
             detokenizer: NaiveStreamingDetokenizer(tokenizer: tk.inner),
-            promptTokens: promptTokens.count,
-            completionTokens: 0,
+            maxTokens: maxTokens,
+            sampler: sampler,
             submittedAt: .now
-        )
-        requestIdToUid[id] = uid
+        ))
 
         let scheduler = self
         continuation.onTermination = { @Sendable termination in
@@ -200,8 +194,14 @@ public actor BatchScheduler {
     }
 
     public func cancel(requestId: String) {
-        guard let uid = requestIdToUid[requestId] else { return }
-        finishRequest(uid: uid, error: "Request cancelled")
+        if let uid = requestIdToUid[requestId] {
+            finishRequest(uid: uid, error: "Request cancelled")
+            return
+        }
+        guard let index = pending.firstIndex(where: { $0.requestId == requestId }) else { return }
+        let entry = pending.remove(at: index)
+        entry.continuation.yield(.error("Request cancelled"))
+        entry.continuation.finish()
     }
 
     public func cancelAll() {
@@ -209,6 +209,11 @@ public actor BatchScheduler {
         for uid in uids {
             finishRequest(uid: uid, error: "Scheduler shutting down")
         }
+        for entry in pending {
+            entry.continuation.yield(.error("Scheduler shutting down"))
+            entry.continuation.finish()
+        }
+        pending.removeAll()
     }
 
     // MARK: - Capacity
@@ -216,8 +221,8 @@ public actor BatchScheduler {
     public func capacity() -> SchedulerCapacity {
         SchedulerCapacity(
             model: modelId,
-            activeRequests: active.count,
-            pendingRequests: 0,
+            activeRequests: active.count + cancelledUIDs.count,
+            pendingRequests: pending.count,
             maxConcurrent: maxConcurrentRequests,
             gpuMemoryActiveBytes: gpuMemory(.active),
             gpuMemoryPeakBytes: gpuMemory(.peak),
@@ -263,28 +268,154 @@ public actor BatchScheduler {
 
     private func stepEngine() async -> Bool {
         guard let gen = generator, let container = modelContainer else { return false }
+        let epoch = generationEpoch
+        expireTimedOutPending()
+        applyCancelledRequests(to: gen)
+        admitPendingRequests(into: gen)
         if !gen.hasWork { return false }
 
+        let burstSteps = shouldPrioritizeFirstToken ? 1 : decodeBurstSteps
+        engineBusy = true
         let responses: [GenerationBatchResponse] = await container.perform { _ in
-            gen.next()
+            var all: [GenerationBatchResponse] = []
+            all.reserveCapacity(max(1, gen.activeCount) * burstSteps)
+            for _ in 0 ..< burstSteps {
+                if !gen.hasWork { break }
+                all.append(contentsOf: gen.next())
+            }
+            return all
         }
-        for r in responses {
-            dispatchResponse(r)
+        engineBusy = false
+        guard epoch == generationEpoch, generator === gen else {
+            return false
         }
+        applyCancelledRequests(to: gen)
+        dispatchResponses(responses, producedAt: .now)
         return true
     }
 
-    private func dispatchResponse(_ response: GenerationBatchResponse) {
-        guard var entry = active[response.uid] else { return }
+    private var shouldPrioritizeFirstToken: Bool {
+        active.values.contains { $0.completionTokens == 0 }
+    }
 
-        entry.detokenizer.append(token: response.token)
-        entry.completionTokens += 1
-        if let chunk = entry.detokenizer.next() {
+    private func admitPendingRequests(into gen: BatchGenerator) {
+        guard !pending.isEmpty else { return }
+        let freeSlots = max(0, maxConcurrentRequests - active.count)
+        guard freeSlots > 0 else { return }
+
+        let batch = Array(pending.prefix(freeSlots))
+        pending.removeFirst(batch.count)
+
+        let assignedUids = gen.insert(
+            prompts: batch.map(\.promptTokens),
+            maxTokens: batch.map(\.maxTokens),
+            samplers: batch.map(\.sampler)
+        )
+
+        for (uid, entry) in zip(assignedUids, batch) {
+            active[uid] = ActiveRequest(
+                requestId: entry.requestId,
+                continuation: entry.continuation,
+                detokenizer: entry.detokenizer,
+                promptTokens: entry.promptTokens.count,
+                completionTokens: 0,
+                firstTokenAt: nil,
+                lastTokenAt: nil,
+                submittedAt: entry.submittedAt
+            )
+            requestIdToUid[entry.requestId] = uid
+        }
+
+        if assignedUids.count < batch.count {
+            for entry in batch.dropFirst(assignedUids.count) {
+                entry.continuation.yield(.error("BatchGenerator rejected the prompt"))
+                entry.continuation.finish()
+            }
+        }
+    }
+
+    private func expireTimedOutPending(now: ContinuousClock.Instant = .now) {
+        guard !pending.isEmpty else { return }
+
+        var stillPending: [PendingRequest] = []
+        stillPending.reserveCapacity(pending.count)
+        for entry in pending {
+            if now - entry.submittedAt >= pendingTimeout {
+                entry.continuation.yield(.error("Request timed out waiting for capacity"))
+                entry.continuation.finish()
+            } else {
+                stillPending.append(entry)
+            }
+        }
+        pending = stillPending
+    }
+
+    private func applyCancelledRequests(to gen: BatchGenerator) {
+        guard !cancelledUIDs.isEmpty else { return }
+        for uid in cancelledUIDs {
+            gen.cancel(uid: uid)
+        }
+        cancelledUIDs.removeAll()
+    }
+
+    private func stopCurrentEngine() async {
+        cancelAll()
+        generationEpoch &+= 1
+        workerTask?.cancel()
+        workerTask = nil
+        generator = nil
+        modelContainer = nil
+        tokenizer = nil
+        modelWeightBytes = 0
+        modelId = ""
+
+        while engineBusy {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        cancelledUIDs.removeAll()
+    }
+
+    private func dispatchResponses(
+        _ responses: [GenerationBatchResponse],
+        producedAt: ContinuousClock.Instant
+    ) {
+        var byUID: [Int: [GenerationBatchResponse]] = [:]
+        byUID.reserveCapacity(responses.count)
+        for response in responses {
+            byUID[response.uid, default: []].append(response)
+        }
+
+        for uid in responses.map(\.uid) where byUID[uid] != nil {
+            let rowResponses = byUID.removeValue(forKey: uid)!
+            dispatchRowResponses(rowResponses, producedAt: producedAt)
+        }
+    }
+
+    private func dispatchRowResponses(
+        _ responses: [GenerationBatchResponse],
+        producedAt: ContinuousClock.Instant
+    ) {
+        guard let first = responses.first, var entry = active[first.uid] else { return }
+
+        var finalResponse: GenerationBatchResponse?
+        for response in responses {
+            entry.detokenizer.append(token: response.token)
+            entry.completionTokens += 1
+            if entry.firstTokenAt == nil {
+                entry.firstTokenAt = producedAt
+            }
+            entry.lastTokenAt = producedAt
+            if response.finishReason != nil {
+                finalResponse = response
+            }
+        }
+
+        if let chunk = entry.detokenizer.next(), !chunk.isEmpty {
             entry.continuation.yield(.chunk(chunk))
         }
-        active[response.uid] = entry
+        active[first.uid] = entry
 
-        if response.finishReason != nil {
+        if finalResponse != nil {
             // One final flush. `NaiveStreamingDetokenizer.next()` returns
             // the substring added since the last call; once the segment is
             // fully consumed it returns "" (not nil), so calling it in a
@@ -293,11 +424,22 @@ public actor BatchScheduler {
                 entry.continuation.yield(.chunk(tail))
             }
 
-            let elapsed = ContinuousClock.now - entry.submittedAt
-            let elapsedSeconds = Double(elapsed.components.seconds)
-                + Double(elapsed.components.attoseconds) / 1e18
-            let tps = elapsedSeconds > 0
-                ? Double(entry.completionTokens) / elapsedSeconds : 0
+            let tps: Double
+            if let firstTokenAt = entry.firstTokenAt, let lastTokenAt = entry.lastTokenAt,
+                entry.completionTokens > 1
+            {
+                let decodeElapsed = lastTokenAt - firstTokenAt
+                let elapsedSeconds = Double(decodeElapsed.components.seconds)
+                    + Double(decodeElapsed.components.attoseconds) / 1e18
+                tps = elapsedSeconds > 0
+                    ? Double(entry.completionTokens - 1) / elapsedSeconds : 0
+            } else {
+                let elapsed = ContinuousClock.now - entry.submittedAt
+                let elapsedSeconds = Double(elapsed.components.seconds)
+                    + Double(elapsed.components.attoseconds) / 1e18
+                tps = elapsedSeconds > 0
+                    ? Double(entry.completionTokens) / elapsedSeconds : 0
+            }
 
             entry.continuation.yield(.info(
                 promptTokens: entry.promptTokens,
@@ -305,13 +447,14 @@ public actor BatchScheduler {
                 tokensPerSecond: tps
             ))
             entry.continuation.finish()
-            active.removeValue(forKey: response.uid)
+            active.removeValue(forKey: first.uid)
             requestIdToUid.removeValue(forKey: entry.requestId)
         }
     }
 
     private func finishRequest(uid: Int, error: String) {
         guard let entry = active.removeValue(forKey: uid) else { return }
+        cancelledUIDs.insert(uid)
         requestIdToUid.removeValue(forKey: entry.requestId)
         entry.continuation.yield(.error(error))
         entry.continuation.finish()
@@ -340,6 +483,18 @@ private struct ActiveRequest {
     var detokenizer: NaiveStreamingDetokenizer
     var promptTokens: Int
     var completionTokens: Int
+    var firstTokenAt: ContinuousClock.Instant?
+    var lastTokenAt: ContinuousClock.Instant?
+    let submittedAt: ContinuousClock.Instant
+}
+
+private struct PendingRequest {
+    let requestId: String
+    let continuation: AsyncStream<GenerationEvent>.Continuation
+    let promptTokens: [Int]
+    var detokenizer: NaiveStreamingDetokenizer
+    let maxTokens: Int
+    let sampler: RowSampler?
     let submittedAt: ContinuousClock.Instant
 }
 

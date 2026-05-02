@@ -19,6 +19,7 @@ struct Darkbloom: AsyncParsableCommand {
             Logout.self,
             Benchmark.self,
             Update.self,
+            Verify.self,
             Enroll.self,
             Unenroll.self,
             Logs.self,
@@ -57,7 +58,7 @@ public func runUpdateBannerIfEnabled() async {
 
 struct ConfigOptions: ParsableArguments {
     @Option(name: [.customShort("c"), .long], help: "Path to provider TOML config.")
-    var config: String?
+    var config: String? = nil
 }
 
 // MARK: - Runtime Snapshot

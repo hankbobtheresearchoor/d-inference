@@ -170,7 +170,7 @@ func providerSupportsPrivateTextLocked(p *Provider) bool {
 	if p.PublicKey == "" || !privateTextBackendSupported(p.Backend) || !p.EncryptedResponseChunks {
 		return false
 	}
-	if !BackendUsesSwiftRuntime(p.Backend) && !p.RuntimeManifestChecked {
+	if !p.RuntimeManifestChecked {
 		return false
 	}
 	// Require coordinator-verified SIP (from attestation challenge) rather

@@ -155,6 +155,10 @@ struct Start: AsyncParsableCommand {
         let runtimeHashes = (try? RuntimeHashReporter().report().coordinatorRuntimeHashes)
         let authToken = AuthTokenStore.load()
 
+        if config.provider.autoUpdate {
+            try await runStartupAutoUpdate(coordinatorURL: coordinatorURL)
+        }
+
         // ----- Process-level lifecycle: PID lock + caffeinate. -----
         try ProcessLifecycle.acquireSingleInstanceLock()
         ProcessLifecycle.preventSystemSleep()
@@ -183,10 +187,17 @@ struct Start: AsyncParsableCommand {
             ]
         )
 
+        let schedule = config.schedule.flatMap { Schedule.from(config: $0) }
+
         print("darkbloom \(ProviderCore.version)")
         print("Backend: mlx-swift")
         print("Config: \(describeConfigPath(snapshot))")
         print("Coordinator: \(coordinatorURL)")
+        if let schedule {
+            print("Schedule: \(schedule.describe())")
+        } else {
+            print("Schedule: always available")
+        }
         print("Advertised models: \(models.count)")
         for m in models {
             print("  \(m.id) (\(String(format: "%.1f", m.estimatedMemoryGb)) GB)")
@@ -202,9 +213,13 @@ struct Start: AsyncParsableCommand {
             modelHashes: modelHashes
         )
 
-        let loop = try ProviderLoop(config: loopConfig)
         do {
-            try await loop.run()
+            if let schedule {
+                try await runScheduled(loopConfig: loopConfig, schedule: schedule)
+            } else {
+                let loop = try ProviderLoop(config: loopConfig)
+                try await loop.run()
+            }
         } catch {
             TelemetryClient.shared.emit(
                 kind: .log,
@@ -215,6 +230,77 @@ struct Start: AsyncParsableCommand {
         }
 
         await TelemetryClient.shared.shutdown()
+    }
+
+    private func runStartupAutoUpdate(coordinatorURL: String) async throws {
+        if ProcessInfo.processInfo.environment["DARKBLOOM_NO_UPDATE_CHECK"] != nil {
+            return
+        }
+        print("Checking for provider update...")
+        let updater = SelfUpdater(coordinatorBaseURL: coordinatorURL)
+        switch await updater.update() {
+        case .alreadyUpToDate:
+            return
+        case .updated(let from, let to):
+            print("Updated provider: v\(from) -> v\(to). Restarting into new binary...")
+            try ProcessLifecycle.execCurrentProcess()
+        case .downloadFailed(let reason):
+            printError("auto-update skipped: \(reason)")
+        case .hashMismatch(let expected, let got):
+            printError("auto-update skipped: bundle hash mismatch (expected \(expected), got \(got))")
+        case .replaceFailed(let reason):
+            printError("auto-update skipped: \(reason)")
+        }
+    }
+
+    private enum ScheduledLoopResult {
+        case loopEnded
+        case windowClosed
+    }
+
+    private func runScheduled(
+        loopConfig: ProviderLoopConfig,
+        schedule: Schedule
+    ) async throws {
+        while !Task.isCancelled {
+            if !schedule.isActiveNow() {
+                let wait = schedule.durationUntilNextActive()
+                print("Outside availability schedule; next window opens in \(formatDuration(wait)).")
+                try await Task.sleep(nanoseconds: sleepNanoseconds(for: wait))
+                continue
+            }
+
+            let activeFor = schedule.durationUntilInactive() ?? 3600
+            print("Availability window active for \(formatDuration(activeFor)).")
+
+            let loop = try ProviderLoop(config: loopConfig)
+            try await withThrowingTaskGroup(of: ScheduledLoopResult.self) { group in
+                group.addTask {
+                    try await loop.run()
+                    return .loopEnded
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: sleepNanoseconds(for: activeFor))
+                    return .windowClosed
+                }
+
+                guard let result = try await group.next() else { return }
+                group.cancelAll()
+
+                switch result {
+                case .loopEnded:
+                    return
+                case .windowClosed:
+                    print("Availability window closed; disconnecting until the next scheduled window.")
+                    return
+                }
+            }
+        }
+    }
+
+    private func sleepNanoseconds(for interval: TimeInterval) -> UInt64 {
+        let seconds = max(1.0, min(interval, Double(UInt64.max) / 1_000_000_000))
+        return UInt64(seconds * 1_000_000_000)
     }
 
     // MARK: - Daemon (interactive picker → launchd)

@@ -200,7 +200,7 @@ public struct ModelDownloader: Sendable {
 
         // 2. tokenizer files. Best-effort.
         for name in ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "tokenizer.model", "chat_template.jinja"] {
-            try? await downloadFile(
+            _ = try? await downloadFile(
                 from: "\(base)/\(name)",
                 to: cacheDir.appendingPathComponent(name),
                 label: name,
@@ -241,15 +241,7 @@ public struct ModelDownloader: Sendable {
             }
         }
 
-        // Write the `refs/main` pointer that ModelScanner relies on.
-        let modelDir = Self.cacheModelDirectory(for: model.id)
-        let refsDir = modelDir.appendingPathComponent("refs")
-        try FileManager.default.createDirectory(at: refsDir, withIntermediateDirectories: true)
-        try "local".write(
-            to: refsDir.appendingPathComponent("main"),
-            atomically: true,
-            encoding: .utf8
-        )
+        try writeMainRef(for: model.id)
     }
 
     /// Remove a downloaded model from the cache. Returns true if anything was
@@ -291,6 +283,22 @@ public struct ModelDownloader: Sendable {
         return unique.sorted()
     }
 
+    internal func downloadFileForTesting(
+        from urlString: String,
+        to destination: URL,
+        label: String = "test.bin",
+        onProgress: (@Sendable (ProgressEvent) -> Void)? = nil,
+        required: Bool = true
+    ) async throws -> Bool {
+        try await downloadFile(
+            from: urlString,
+            to: destination,
+            label: label,
+            onProgress: onProgress,
+            required: required
+        )
+    }
+
     private func urlExists(_ urlString: String) async throws -> Bool {
         guard let url = URL(string: urlString) else { return false }
         var req = URLRequest(url: url)
@@ -304,42 +312,123 @@ public struct ModelDownloader: Sendable {
         }
     }
 
+    @discardableResult
     private func downloadFile(
         from urlString: String,
         to destination: URL,
         label: String,
         onProgress: (@Sendable (ProgressEvent) -> Void)?,
         required: Bool
-    ) async throws {
+    ) async throws -> Bool {
         guard let url = URL(string: urlString) else {
             if required { throw ModelCatalogError.downloadFailed("invalid URL: \(urlString)") }
-            return
+            return false
         }
 
-        let (tmpURL, response): (URL, URLResponse)
-        do {
-            (tmpURL, response) = try await urlSession.download(from: url)
-        } catch {
-            if required {
-                throw ModelCatalogError.downloadFailed("\(label): \(error.localizedDescription)")
+        let fm = FileManager.default
+        try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let partial = destination.appendingPathExtension("part")
+
+        var lastError: Error?
+        for attempt in 1...3 {
+            var existingBytes = fileSize(partial)
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 60
+            if existingBytes > 0 {
+                request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range")
             }
-            return
-        }
 
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            try? FileManager.default.removeItem(at: tmpURL)
-            if required {
-                throw ModelCatalogError.downloadFailed("\(label): HTTP \(http.statusCode)")
+            do {
+                let (bytes, response) = try await urlSession.bytes(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw ModelCatalogError.downloadFailed("\(label): unexpected response type")
+                }
+
+                if http.statusCode == 404 || http.statusCode == 403 {
+                    if required {
+                        throw ModelCatalogError.downloadFailed("\(label): HTTP \(http.statusCode)")
+                    }
+                    return false
+                }
+                guard (200..<300).contains(http.statusCode) else {
+                    throw ModelCatalogError.downloadFailed("\(label): HTTP \(http.statusCode)")
+                }
+
+                let appending = existingBytes > 0 && http.statusCode == 206
+                if existingBytes > 0 && !appending {
+                    try? fm.removeItem(at: partial)
+                    existingBytes = 0
+                }
+                if !fm.fileExists(atPath: partial.path) {
+                    fm.createFile(atPath: partial.path, contents: nil)
+                }
+
+                guard let handle = try? FileHandle(forWritingTo: partial) else {
+                    throw ModelCatalogError.downloadFailed("\(label): could not open destination")
+                }
+                defer { try? handle.close() }
+                if appending {
+                    try handle.seekToEnd()
+                } else {
+                    try handle.truncate(atOffset: 0)
+                }
+
+                let expectedLength = http.expectedContentLength >= 0 ? http.expectedContentLength : -1
+                let total = expectedLength >= 0 ? existingBytes + expectedLength : nil
+                var downloaded = existingBytes
+                var buffer = Data()
+                buffer.reserveCapacity(1_048_576)
+                var nextProgress = downloaded + 64 * 1_048_576
+
+                for try await byte in bytes {
+                    buffer.append(byte)
+                    if buffer.count >= 1_048_576 {
+                        try handle.write(contentsOf: buffer)
+                        downloaded += Int64(buffer.count)
+                        buffer.removeAll(keepingCapacity: true)
+                        if downloaded >= nextProgress {
+                            onProgress?(ProgressEvent(file: label, bytesDownloaded: downloaded, bytesTotal: total))
+                            nextProgress = downloaded + 64 * 1_048_576
+                        }
+                    }
+                }
+                if !buffer.isEmpty {
+                    try handle.write(contentsOf: buffer)
+                    downloaded += Int64(buffer.count)
+                }
+                try? fm.removeItem(at: destination)
+                try fm.moveItem(at: partial, to: destination)
+                onProgress?(ProgressEvent(file: label, bytesDownloaded: downloaded, bytesTotal: total ?? downloaded))
+                return true
+            } catch {
+                lastError = error
+                if attempt < 3 {
+                    try await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)
+                    continue
+                }
             }
-            return
         }
 
-        try? FileManager.default.removeItem(at: destination)
-        try FileManager.default.moveItem(at: tmpURL, to: destination)
-
-        if let onProgress {
-            let bytes = (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? Int64) ?? 0
-            onProgress(ProgressEvent(file: label, bytesDownloaded: bytes, bytesTotal: bytes))
+        if required {
+            throw ModelCatalogError.downloadFailed("\(label): \(lastError?.localizedDescription ?? "unknown error")")
         }
+        return false
     }
+
+    private func writeMainRef(for modelID: String) throws {
+        let modelDir = Self.cacheModelDirectory(for: modelID)
+        let refsDir = modelDir.appendingPathComponent("refs")
+        try FileManager.default.createDirectory(at: refsDir, withIntermediateDirectories: true)
+        try "local".write(
+            to: refsDir.appendingPathComponent("main"),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
+    private func fileSize(_ url: URL) -> Int64 {
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+    }
+
 }

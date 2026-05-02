@@ -195,10 +195,11 @@ jobs:
         working-directory: provider-swift
         run: |
           set -euo pipefail
-          swift build -c release \
-            --product darkbloom \
-            --product darkbloom-enclave
+          swift build -c release --product darkbloom
+          swift build -c release --product darkbloom-enclave
           BIN_DIR=$(swift build -c release --show-bin-path)
+          test -x "$BIN_DIR/$CLI_NAME"
+          test -x "$BIN_DIR/$ENCLAVE_NAME"
           echo "BIN_DIR=$BIN_DIR" >> "$GITHUB_ENV"
           ls -la "$BIN_DIR" | head -50
 
@@ -218,12 +219,11 @@ jobs:
           MLX_METALLIB_SOURCE: ${{ steps.metallib.outputs.metallib }}
         run: |
           set -euo pipefail
-          # Live coordinator integration tests require Hummingbird fixtures
-          # we don't ship in CI yet; keep them off until the mock-coordinator
-          # harness lands. Live MLX inference tests run with the env var
-          # above; the Gemma case is internally gated by a second flag.
-          swift test -c release \
-            --skip CoordinatorIntegrationTests
+          # Run the full Swift provider suite, including the mock-coordinator
+          # integration tests that pin release/update and provider protocol
+          # behavior. Live MLX inference tests run with the env var above; the
+          # Gemma case is internally gated by a second flag.
+          swift test -c release
 
       # ----------------------------------------------------------------------
       # Stage the bundle: bin/darkbloom, bin/darkbloom-enclave, bin/mlx.metallib
@@ -260,6 +260,10 @@ jobs:
           # Two artifact shapes: zip for notarization, tar.gz for distribution.
           ditto -c -k --keepParent "$STAGE" /tmp/darkbloom-notarize.zip
           tar czf /tmp/darkbloom-bundle-macos-arm64.tar.gz -C "$STAGE" .
+          tar tzf /tmp/darkbloom-bundle-macos-arm64.tar.gz | sort | tee /tmp/darkbloom-bundle-files.txt
+          grep -qx './bin/darkbloom' /tmp/darkbloom-bundle-files.txt
+          grep -qx './bin/darkbloom-enclave' /tmp/darkbloom-bundle-files.txt
+          grep -qx './bin/mlx.metallib' /tmp/darkbloom-bundle-files.txt
           echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
           ls -lh /tmp/darkbloom-bundle-macos-arm64.tar.gz
 
@@ -282,6 +286,10 @@ jobs:
           xcrun stapler staple "${{ steps.bundle.outputs.stage }}/bin/$ENCLAVE_NAME" || true
 
           tar czf /tmp/darkbloom-bundle-macos-arm64.tar.gz -C "${{ steps.bundle.outputs.stage }}" .
+          tar tzf /tmp/darkbloom-bundle-macos-arm64.tar.gz | sort | tee /tmp/darkbloom-bundle-files.txt
+          grep -qx './bin/darkbloom' /tmp/darkbloom-bundle-files.txt
+          grep -qx './bin/darkbloom-enclave' /tmp/darkbloom-bundle-files.txt
+          grep -qx './bin/mlx.metallib' /tmp/darkbloom-bundle-files.txt
 
           BINARY_HASH=$(shasum -a 256 "${{ steps.bundle.outputs.stage }}/bin/$CLI_NAME" | cut -d' ' -f1)
           BUNDLE_HASH=$(shasum -a 256 /tmp/darkbloom-bundle-macos-arm64.tar.gz | cut -d' ' -f1)

@@ -142,8 +142,8 @@ public actor ProviderLoop {
         // 3. Hash the colocated mlx.metallib so the coordinator (and any
         // user inspecting attestation) can correlate the GPU kernel set
         // with the binary. Reported under template_hashes["mlx_metallib"]
-        // since the coordinator passes through arbitrary keys; will move to
-        // a first-class field once the protocol gets bumped.
+        // so legacy providers and Swift providers can keep one protocol
+        // shape while the coordinator applies backend-specific enforcement.
         let runtimeWithMetallib = augmentRuntimeHashesWithMetallib(loopConfig.runtimeHashes)
         if let metallib = runtimeWithMetallib?.templateHashes["mlx_metallib"] {
             logger.info("mlx.metallib hash: \(metallib.prefix(16))...")
@@ -185,45 +185,51 @@ public actor ProviderLoop {
 
         logger.info("Coordinator client started, entering event loop")
 
-        // 5. Process events
-        for await event in events {
-            switch event {
-            case .connected:
-                logger.info("Connected to coordinator")
+        // 5. Process events. Cancellation is used by schedule enforcement
+        // and service shutdown; explicitly close the WebSocket so the stream
+        // unblocks instead of waiting for the next coordinator event.
+        await withTaskCancellationHandler {
+            for await event in events {
+                switch event {
+                case .connected:
+                    logger.info("Connected to coordinator")
 
-            case .disconnected:
-                logger.warning("Disconnected from coordinator")
-                // Cancel all in-flight requests on disconnect -- the coordinator
-                // will not route responses for a dead connection.
-                await cancelAllInflight()
+                case .disconnected:
+                    logger.warning("Disconnected from coordinator")
+                    // Cancel all in-flight requests on disconnect -- the coordinator
+                    // will not route responses for a dead connection.
+                    await cancelAllInflight()
 
-            case .inferenceRequest(let requestId, let ciphertext, let senderPublicKey):
-                await handleInferenceRequest(
-                    requestId: requestId,
-                    ciphertext: ciphertext,
-                    senderPublicKey: senderPublicKey,
-                    send: send
-                )
+                case .inferenceRequest(let requestId, let ciphertext, let senderPublicKey):
+                    await handleInferenceRequest(
+                        requestId: requestId,
+                        ciphertext: ciphertext,
+                        senderPublicKey: senderPublicKey,
+                        send: send
+                    )
 
-            case .cancel(let requestId):
-                await handleCancellation(requestId: requestId)
+                case .cancel(let requestId):
+                    await handleCancellation(requestId: requestId)
 
-            case .attestationChallenge(let nonce, let timestamp):
-                await handleAttestationChallenge(
-                    nonce: nonce,
-                    timestamp: timestamp,
-                    send: send
-                )
+                case .attestationChallenge(let nonce, let timestamp):
+                    await handleAttestationChallenge(
+                        nonce: nonce,
+                        timestamp: timestamp,
+                        send: send
+                    )
 
-            case .runtimeOutdated(let mismatches):
-                logger.warning("Runtime outdated: \(mismatches.count) mismatch(es)")
-                for m in mismatches {
-                    logger.warning("  \(m.component): expected=\(m.expected), got=\(m.got)")
+                case .runtimeOutdated(let mismatches):
+                    logger.warning("Runtime outdated: \(mismatches.count) mismatch(es)")
+                    for m in mismatches {
+                        logger.warning("  \(m.component): expected=\(m.expected), got=\(m.got)")
+                    }
+
+                case .loadModel(let modelId):
+                    handleLoadModelRequest(modelId: modelId, send: send)
                 }
-
-            case .loadModel(let modelId):
-                handleLoadModelRequest(modelId: modelId, send: send)
             }
+        } onCancel: {
+            Task { await coordinator.shutdown() }
         }
 
         logger.info("Event stream ended, shutting down")

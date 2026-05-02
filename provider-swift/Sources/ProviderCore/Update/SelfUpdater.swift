@@ -6,13 +6,28 @@ public struct ReleaseInfo: Sendable {
     public let version: String
     public let platform: String
     public let url: String
-    public let sha256: String
+    public let bundleHash: String
+    public let binaryHash: String?
+    public let metallibHash: String?
 
-    public init(version: String, platform: String, url: String, sha256: String) {
+    public init(
+        version: String,
+        platform: String,
+        url: String,
+        bundleHash: String,
+        binaryHash: String? = nil,
+        metallibHash: String? = nil
+    ) {
         self.version = version
         self.platform = platform
         self.url = url
-        self.sha256 = sha256
+        self.bundleHash = bundleHash
+        self.binaryHash = binaryHash
+        self.metallibHash = metallibHash
+    }
+
+    public var sha256: String {
+        bundleHash
     }
 }
 
@@ -87,7 +102,7 @@ public struct SelfUpdater: Sendable {
             else {
                 return .checkFailed(reason: "missing required fields in release response")
             }
-            guard let sha256 = (json["bundle_hash"] as? String)
+            guard let bundleHash = (json["bundle_hash"] as? String)
                     ?? (json["sha256"] as? String)
                     ?? (json["binary_hash"] as? String)
             else {
@@ -98,7 +113,9 @@ public struct SelfUpdater: Sendable {
                 version: version,
                 platform: platform,
                 url: downloadURL,
-                sha256: sha256
+                bundleHash: bundleHash,
+                binaryHash: json["binary_hash"] as? String,
+                metallibHash: json["metallib_hash"] as? String
             )
 
             if isNewer(latest: version, current: currentVersion) {
@@ -113,7 +130,7 @@ public struct SelfUpdater: Sendable {
 
     // MARK: - Download and Verify
 
-    /// Download the release binary and verify its SHA-256 hash.
+    /// Download the release bundle and verify its SHA-256 hash.
     public func downloadAndVerify(release: ReleaseInfo) async -> Result<URL, UpdateError> {
         guard let downloadURL = URL(string: release.url) else {
             return .failure(.invalidURL(release.url))
@@ -133,9 +150,9 @@ public struct SelfUpdater: Sendable {
             let digest = SHA256.hash(data: fileData)
             let computedHash = digest.map { String(format: "%02x", $0) }.joined()
 
-            guard computedHash == release.sha256.lowercased() else {
+            guard computedHash == release.bundleHash.lowercased() else {
                 try? FileManager.default.removeItem(at: tempFileURL)
-                return .failure(.hashMismatch(expected: release.sha256, got: computedHash))
+                return .failure(.hashMismatch(expected: release.bundleHash, got: computedHash))
             }
 
             return .success(tempFileURL)
@@ -144,51 +161,132 @@ public struct SelfUpdater: Sendable {
         }
     }
 
-    // MARK: - Replace Binary
+    // MARK: - Install Bundle
 
-    /// Replace the running binary with the downloaded one via atomic rename.
+    /// Install a verified release bundle next to the running executable.
     ///
-    /// This is a best-effort operation. On macOS, replacing a running binary
-    /// requires the process to restart afterward.
-    public func replaceBinary(with downloadedFile: URL) -> Result<Void, UpdateError> {
+    /// Release artifacts are tarballs containing `bin/darkbloom`,
+    /// `bin/darkbloom-enclave`, and `bin/mlx.metallib`. Older local bundles
+    /// with root-level files are accepted for developer testing.
+    public func installBundle(from downloadedFile: URL, release: ReleaseInfo) -> Result<Void, UpdateError> {
         guard let executablePath = Bundle.main.executablePath else {
             return .failure(.replaceFailed("could not determine current executable path"))
         }
 
-        let currentBinary = URL(fileURLWithPath: executablePath)
-        let backupPath = currentBinary.appendingPathExtension("bak")
+        let installDir = URL(fileURLWithPath: executablePath).deletingLastPathComponent()
+        return installBundle(
+            from: downloadedFile,
+            release: release,
+            installDir: installDir,
+            verifyCodeSignatures: true
+        )
+    }
 
+    internal func installBundleForTesting(
+        from downloadedFile: URL,
+        release: ReleaseInfo,
+        installDir: URL
+    ) -> Result<Void, UpdateError> {
+        installBundle(
+            from: downloadedFile,
+            release: release,
+            installDir: installDir,
+            verifyCodeSignatures: false
+        )
+    }
+
+    private func installBundle(
+        from downloadedFile: URL,
+        release: ReleaseInfo,
+        installDir: URL,
+        verifyCodeSignatures: Bool
+    ) -> Result<Void, UpdateError> {
         let fm = FileManager.default
+        let extractionRoot = fm.temporaryDirectory
+            .appendingPathComponent("darkbloom-update-\(UUID().uuidString)", isDirectory: true)
+        let backupRoot = fm.temporaryDirectory
+            .appendingPathComponent("darkbloom-backup-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fm.removeItem(at: extractionRoot)
+            try? fm.removeItem(at: backupRoot)
+        }
 
         do {
-            // Remove old backup if it exists
-            if fm.fileExists(atPath: backupPath.path) {
-                try fm.removeItem(at: backupPath)
-            }
+            try fm.createDirectory(at: extractionRoot, withIntermediateDirectories: true)
+            try runProcess("/usr/bin/tar", arguments: ["xzf", downloadedFile.path, "-C", extractionRoot.path])
 
-            // Back up current binary
-            try fm.moveItem(at: currentBinary, to: backupPath)
-
-            // Move new binary into place
-            try fm.moveItem(at: downloadedFile, to: currentBinary)
-
-            // Make executable
-            try fm.setAttributes(
-                [.posixPermissions: 0o755],
-                ofItemAtPath: currentBinary.path
+            let darkbloom = try requiredBundleFile(
+                names: ["bin/darkbloom", "darkbloom"],
+                root: extractionRoot
+            )
+            let enclave = try requiredBundleFile(
+                names: ["bin/darkbloom-enclave", "darkbloom-enclave", "bin/eigeninference-enclave", "eigeninference-enclave"],
+                root: extractionRoot
+            )
+            let metallib = try requiredBundleFile(
+                names: ["bin/mlx.metallib", "mlx.metallib"],
+                root: extractionRoot
             )
 
-            // Clean up backup
-            try? fm.removeItem(at: backupPath)
+            if let binaryHash = release.binaryHash {
+                try verifyHash(file: darkbloom, expected: binaryHash, label: "darkbloom")
+            }
+            if let metallibHash = release.metallibHash {
+                try verifyHash(file: metallib, expected: metallibHash, label: "mlx.metallib")
+            }
+            if verifyCodeSignatures {
+                try verifyCodeSignature(file: darkbloom, label: "darkbloom")
+                try verifyCodeSignature(file: enclave, label: "darkbloom-enclave")
+            }
+
+            try fm.createDirectory(at: installDir, withIntermediateDirectories: true)
+            try fm.createDirectory(at: backupRoot, withIntermediateDirectories: true)
+            let targets = [
+                ("darkbloom", darkbloom, 0o755),
+                ("darkbloom-enclave", enclave, 0o755),
+                ("mlx.metallib", metallib, 0o644),
+            ] as [(String, URL, Int)]
+
+            var installed: [URL] = []
+            var backups: [URL: URL] = [:]
+            do {
+                for (name, source, mode) in targets {
+                    let destination = installDir.appendingPathComponent(name)
+                    let backup = backupRoot.appendingPathComponent(name)
+                    if fm.fileExists(atPath: destination.path) {
+                        try fm.copyItem(at: destination, to: backup)
+                        backups[destination] = backup
+                        try fm.removeItem(at: destination)
+                    }
+                    try fm.copyItem(at: source, to: destination)
+                    try fm.setAttributes([.posixPermissions: mode], ofItemAtPath: destination.path)
+                    installed.append(destination)
+                }
+
+                let legacyLink = installDir.appendingPathComponent("eigeninference-enclave")
+                let legacyBackup = backupRoot.appendingPathComponent("eigeninference-enclave")
+                if itemExistsIncludingSymlink(legacyLink) {
+                    try fm.copyItem(at: legacyLink, to: legacyBackup)
+                    backups[legacyLink] = legacyBackup
+                    try fm.removeItem(at: legacyLink)
+                }
+                try fm.createSymbolicLink(atPath: legacyLink.path, withDestinationPath: "darkbloom-enclave")
+                installed.append(legacyLink)
+            } catch {
+                let destinations = Set(installed + Array(backups.keys))
+                for destination in destinations {
+                    try? fm.removeItem(at: destination)
+                    if let backup = backups[destination], itemExistsIncludingSymlink(backup) {
+                        try? fm.copyItem(at: backup, to: destination)
+                    }
+                }
+                throw error
+            }
 
             return .success(())
+        } catch let error as UpdateError {
+            return .failure(error)
         } catch {
-            // Try to restore backup
-            if fm.fileExists(atPath: backupPath.path),
-               !fm.fileExists(atPath: currentBinary.path)
-            {
-                try? fm.moveItem(at: backupPath, to: currentBinary)
-            }
             return .failure(.replaceFailed(error.localizedDescription))
         }
     }
@@ -223,7 +321,7 @@ public struct SelfUpdater: Sendable {
                 }
 
             case .success(let tempFile):
-                let replaceResult = replaceBinary(with: tempFile)
+                let replaceResult = installBundle(from: tempFile, release: release)
                 switch replaceResult {
                 case .success:
                     return .updated(from: current, to: release.version)
@@ -266,6 +364,63 @@ public struct SelfUpdater: Sendable {
 
     private func isNewer(latest: String, current: String) -> Bool {
         Self.isNewer(latest: latest, current: current)
+    }
+
+    private func requiredBundleFile(names: [String], root: URL) throws -> URL {
+        let fm = FileManager.default
+        for name in names {
+            let candidate = root.appendingPathComponent(name)
+            if fm.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        throw UpdateError.replaceFailed("release bundle missing \(names[0])")
+    }
+
+    private func itemExistsIncludingSymlink(_ url: URL) -> Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: url.path)
+            || (try? fm.destinationOfSymbolicLink(atPath: url.path)) != nil
+    }
+
+    private func verifyHash(file: URL, expected: String, label: String) throws {
+        let data = try Data(contentsOf: file)
+        let digest = SHA256.hash(data: data)
+        let got = digest.map { String(format: "%02x", $0) }.joined()
+        guard got == expected.lowercased() else {
+            throw UpdateError.hashMismatch(expected: expected, got: "\(label): \(got)")
+        }
+    }
+
+    private func verifyCodeSignature(file: URL, label: String) throws {
+        #if canImport(Darwin)
+        do {
+            try runProcess("/usr/bin/codesign", arguments: [
+                "--verify",
+                "--strict",
+                "--verbose=2",
+                file.path,
+            ])
+        } catch {
+            throw UpdateError.replaceFailed("\(label) code signature verification failed: \(error.localizedDescription)")
+        }
+        #endif
+    }
+
+    private func runProcess(_ executable: String, arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let stderr = Pipe()
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let data = stderr.fileHandleForReading.readDataToEndOfFile()
+            let message = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw UpdateError.replaceFailed(message?.isEmpty == false ? message! : "\(executable) exited \(process.terminationStatus)")
+        }
     }
 }
 

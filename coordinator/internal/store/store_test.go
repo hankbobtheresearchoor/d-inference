@@ -733,11 +733,13 @@ func TestReleases(t *testing.T) {
 		URL:        "https://r2.example.com/releases/v0.2.0/bundle.tar.gz",
 	}
 	r2 := &Release{
-		Version:    "0.2.1",
-		Platform:   "macos-arm64",
-		BinaryHash: "ccc333",
-		BundleHash: "ddd444",
-		URL:        "https://r2.example.com/releases/v0.2.1/bundle.tar.gz",
+		Version:      "0.2.1",
+		Platform:     "macos-arm64",
+		Backend:      "mlx-swift",
+		BinaryHash:   "ccc333",
+		BundleHash:   "ddd444",
+		MetallibHash: "eee555",
+		URL:          "https://r2.example.com/releases/v0.2.1/bundle.tar.gz",
 	}
 	if err := s.SetRelease(r1); err != nil {
 		t.Fatalf("SetRelease r1: %v", err)
@@ -763,6 +765,12 @@ func TestReleases(t *testing.T) {
 	}
 	if latest.BinaryHash != "ccc333" {
 		t.Errorf("expected binary_hash ccc333, got %s", latest.BinaryHash)
+	}
+	if latest.Backend != "mlx-swift" {
+		t.Errorf("expected backend mlx-swift, got %s", latest.Backend)
+	}
+	if latest.MetallibHash != "eee555" {
+		t.Errorf("expected metallib_hash eee555, got %s", latest.MetallibHash)
 	}
 
 	// Unknown platform returns nil.

@@ -209,18 +209,12 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 				provider.Mu().Unlock()
 			}
 
-			// Verify runtime integrity against the known-good manifest. The Swift
-			// provider has no Python/vllm runtime; it is covered by signed binary
-			// hash attestation during the challenge path instead.
-			if registry.BackendUsesSwiftRuntime(regMsg.Backend) {
-				provider.Mu().Lock()
-				provider.RuntimeVerified = true
-				provider.RuntimeManifestChecked = true
-				provider.TemplateHashes = registry.CloneStringMap(regMsg.TemplateHashes)
-				provider.Mu().Unlock()
-			} else if s.knownRuntimeManifest != nil {
-				runtimeOK, mismatches := s.verifyRuntimeHashes(
-					regMsg.PythonHash, regMsg.RuntimeHash, regMsg.TemplateHashes)
+			// Verify runtime integrity against the known-good manifest. Swift
+			// providers omit Python/vllm hashes, but they still report external
+			// runtime assets such as mlx.metallib under template_hashes.
+			if s.knownRuntimeManifest != nil {
+				runtimeOK, mismatches := s.verifyRuntimeHashesForBackend(
+					regMsg.Backend, regMsg.PythonHash, regMsg.RuntimeHash, regMsg.TemplateHashes)
 				provider.Mu().Lock()
 				provider.RuntimeVerified = runtimeOK
 				provider.RuntimeManifestChecked = runtimeOK
@@ -762,20 +756,12 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 		}
 	}
 
-	// Verify runtime integrity hashes from challenge response. Swift providers
-	// omit Python/vllm runtime hashes and rely on the signed binary hash check
-	// above plus the signed status payload.
-	if registry.BackendUsesSwiftRuntime(provider.Backend) {
-		provider.Mu().Lock()
-		provider.RuntimeVerified = true
-		provider.RuntimeManifestChecked = true
-		if len(resp.TemplateHashes) > 0 {
-			provider.TemplateHashes = registry.CloneStringMap(resp.TemplateHashes)
-		}
-		provider.Mu().Unlock()
-	} else if s.knownRuntimeManifest != nil {
-		runtimeOK, mismatches := s.verifyRuntimeHashes(
-			resp.PythonHash, resp.RuntimeHash, resp.TemplateHashes)
+	// Verify runtime integrity hashes from the signed challenge response.
+	// Swift providers omit Python/vllm hashes, but must still match manifest
+	// entries for external runtime assets such as mlx.metallib.
+	if s.knownRuntimeManifest != nil {
+		runtimeOK, mismatches := s.verifyRuntimeHashesForBackend(
+			provider.Backend, resp.PythonHash, resp.RuntimeHash, resp.TemplateHashes)
 		provider.Mu().Lock()
 		provider.RuntimeVerified = runtimeOK
 		provider.RuntimeManifestChecked = runtimeOK

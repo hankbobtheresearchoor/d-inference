@@ -37,6 +37,34 @@ func (s *Server) handleRegisterRelease(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "binary_hash is required"))
 		return
 	}
+	if release.BundleHash == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "bundle_hash is required"))
+		return
+	}
+	if normalized, err := normalizeSHA256Hex(release.BinaryHash, "binary_hash"); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", err.Error()))
+		return
+	} else {
+		release.BinaryHash = normalized
+	}
+	if normalized, err := normalizeSHA256Hex(release.BundleHash, "bundle_hash"); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", err.Error()))
+		return
+	} else {
+		release.BundleHash = normalized
+	}
+	if release.MetallibHash != "" {
+		if normalized, err := normalizeSHA256Hex(release.MetallibHash, "metallib_hash"); err != nil {
+			writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", err.Error()))
+			return
+		} else {
+			release.MetallibHash = normalized
+		}
+	}
+	if release.Backend == "mlx-swift" && release.MetallibHash == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "metallib_hash is required for mlx-swift releases"))
+		return
+	}
 	if release.URL == "" {
 		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "url is required"))
 		return

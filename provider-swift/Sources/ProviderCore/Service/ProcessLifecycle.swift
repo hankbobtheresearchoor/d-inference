@@ -92,6 +92,44 @@ public enum ProcessLifecycle {
         }
     }
 
+    /// Replace this process image with the current executable and argv.
+    /// Used after startup auto-update so launchd keeps the same service
+    /// lifecycle while the provider begins serving with the new binary.
+    public static func execCurrentProcess() throws -> Never {
+        #if canImport(Darwin)
+        guard let executablePath = Bundle.main.executablePath else {
+            throw NSError(
+                domain: "ProcessLifecycle",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "could not determine current executable path"]
+            )
+        }
+
+        let argvStrings = [executablePath] + Array(CommandLine.arguments.dropFirst())
+        let cStrings = argvStrings.compactMap { strdup($0) }
+        defer {
+            for ptr in cStrings {
+                free(ptr)
+            }
+        }
+
+        var argv: [UnsafeMutablePointer<CChar>?] = cStrings.map { $0 }
+        argv.append(nil)
+        execv(executablePath, &argv)
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))]
+        )
+        #else
+        throw NSError(
+            domain: "ProcessLifecycle",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "exec is only supported on Darwin"]
+        )
+        #endif
+    }
+
     // MARK: - Internals
 
     private static func readPID(at url: URL) -> Int32? {

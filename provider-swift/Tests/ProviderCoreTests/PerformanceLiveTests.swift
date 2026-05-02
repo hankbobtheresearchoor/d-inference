@@ -301,7 +301,8 @@ struct PerformanceLiveTests {
     private func runBatchedTTFT(_ config: ModelConfig) async throws {
         let loaded = try await LiveInferenceFixtures.loadScheduler(
             modelID: config.modelID,
-            maxConcurrentRequests: 4
+            maxConcurrentRequests: 4,
+            memoryBudgetBytes: config.wiredMemoryGB * 1024 * 1024 * 1024
         )
         let scheduler = loaded.scheduler
         defer { Task { await scheduler.unloadModel() } }
@@ -536,7 +537,7 @@ struct PerformanceLiveTests {
         // max_tokens=decodeTokens+1 so we can drop the first token's
         // prefill cost from the steady-state measurement.
         let scheduler = BatchScheduler(
-            maxConcurrentRequests: 1,
+            maxConcurrentRequests: 4,
             pendingTimeout: .seconds(60),
             defaultMaxTokens: decodeTokens + 1
         )
@@ -550,22 +551,22 @@ struct PerformanceLiveTests {
         let stream = await scheduler.submit(request: req)
         var firstChunkAt: ContinuousClock.Instant?
         var lastChunkAt: ContinuousClock.Instant?
-        var produced = 0
+        var completionTokens = 0
+        var schedulerTPS = 0.0
         for await event in stream {
             switch event {
             case .chunk:
-                produced += 1
                 if firstChunkAt == nil { firstChunkAt = .now }
                 lastChunkAt = .now
-            case .info, .error:
+            case .info(_, let completion, let tps):
+                completionTokens = completion
+                schedulerTPS = tps
+            case .error:
                 break
             }
         }
-        let schedulerTPS: Double
-        if let first = firstChunkAt, let last = lastChunkAt, produced > 1 {
-            schedulerTPS = Self.tokensPerSecond(produced - 1, last - first)
-        } else {
-            schedulerTPS = 0
+        if let first = firstChunkAt, let last = lastChunkAt, completionTokens > 1 {
+            schedulerTPS = Self.tokensPerSecond(completionTokens - 1, last - first)
         }
         await scheduler.unloadModel()
 
@@ -602,7 +603,10 @@ struct PerformanceLiveTests {
     ) {
         applyMemoryBudget(gigabytes: config.wiredMemoryGB)
         do {
-            return try await LiveInferenceFixtures.loadScheduler(modelID: config.modelID)
+            return try await LiveInferenceFixtures.loadScheduler(
+                modelID: config.modelID,
+                memoryBudgetBytes: config.wiredMemoryGB * 1024 * 1024 * 1024
+            )
         } catch let skip as LiveFixtureSkip {
             Issue.record("skipped: \(skip.description)")
             throw skip

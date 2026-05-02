@@ -104,10 +104,70 @@ struct ModelCatalogTests {
         #expect(ModelCatalogError.http(503, "x").description == "coordinator HTTP 503: x")
         #expect(ModelCatalogError.modelNotInCatalog("y").description == "model 'y' is not in the coordinator catalog")
     }
+
+    @Test("downloadFile resumes from .part and publishes final path atomically")
+    func downloadFileResumesFromPartFile() async throws {
+        let full = Data("0123456789abcdef".utf8)
+        RangeURLProtocol.payload = full
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RangeURLProtocol.self]
+        let session = URLSession(configuration: config)
+        let downloader = ModelDownloader(r2CDNURL: "https://cdn.example.test", urlSession: session)
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("model-download-test-\(UUID().uuidString)", isDirectory: true)
+        let final = dir.appendingPathComponent("model.safetensors")
+        let partial = final.appendingPathExtension("part")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data("01234567".utf8).write(to: partial)
+
+        let ok = try await downloader.downloadFileForTesting(
+            from: "https://cdn.example.test/model.safetensors",
+            to: final
+        )
+
+        #expect(ok)
+        #expect(try Data(contentsOf: final) == full)
+        #expect(!FileManager.default.fileExists(atPath: partial.path))
+        #expect(RangeURLProtocol.lastRangeHeader == "bytes=8-")
+    }
 }
 
 // Mirror of the private wrapper used inside ModelCatalog.swift so we can
 // unit-test the wire format without exposing the internal type.
 private struct CatalogResponseShim: Codable {
     let models: [CatalogModel]
+}
+
+private final class RangeURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var payload = Data()
+    nonisolated(unsafe) static var lastRangeHeader: String?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let range = request.value(forHTTPHeaderField: "Range")
+        Self.lastRangeHeader = range
+        let start: Int
+        if let range, range.hasPrefix("bytes="), range.hasSuffix("-") {
+            start = Int(range.dropFirst("bytes=".count).dropLast()) ?? 0
+        } else {
+            start = 0
+        }
+        let body = Self.payload.dropFirst(start)
+        let status = start > 0 ? 206 : 200
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Length": "\(body.count)"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
