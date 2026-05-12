@@ -1003,11 +1003,11 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 
 	// Calculate cost — check provider's custom price, then platform DB price,
 	// then hardcoded defaults.
-	providerWalletForPricing := ""
+	providerAccountForPricing := ""
 	if p := s.registry.GetProvider(providerID); p != nil {
-		providerWalletForPricing = p.WalletAddress
+		providerAccountForPricing = p.AccountID
 	}
-	customIn, customOut, hasCustom := s.store.GetModelPrice(providerWalletForPricing, pr.Model)
+	customIn, customOut, hasCustom := s.store.GetModelPrice(providerAccountForPricing, pr.Model)
 	if !hasCustom {
 		customIn, customOut, hasCustom = s.store.GetModelPrice("platform", pr.Model)
 	}
@@ -1089,16 +1089,6 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 				s.logger.Error("failed to credit linked provider account",
 					"provider_id", providerID,
 					"account_id", p.AccountID,
-					"request_id", msg.RequestID,
-					"error", err,
-				)
-			}
-		} else if p.WalletAddress != "" {
-			// Unlinked provider — atomically credit the wallet and record payout history.
-			if err := s.ledger.CreditProvider(p.WalletAddress, providerPayout, pr.Model, msg.RequestID); err != nil {
-				s.logger.Error("failed to credit provider wallet payout",
-					"provider_id", providerID,
-					"wallet_address", p.WalletAddress,
 					"request_id", msg.RequestID,
 					"error", err,
 				)

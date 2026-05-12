@@ -431,11 +431,11 @@ func TestIntegration_ReferralRewardDistribution(t *testing.T) {
 
 	// Verify provider got 95% of the charge.
 	// The provider in this test has no account linkage (connected via connectProvider),
-	// so payout goes to the wallet address. Since connectProvider does not set a
-	// wallet address, let's check the ledger's pending payouts instead.
-	// Provider without AccountID and without WalletAddress won't receive payout
-	// via CreditProvider (the code checks p.WalletAddress). But the cost flow is:
-	// handleComplete checks p.AccountID first, then p.WalletAddress.
+	// so payout goes to the provider address. Since connectProvider does not set a
+	// provider address, let's check the ledger's pending payouts instead.
+	// Provider without AccountID and without provider address won't receive payout
+	// via CreditProviderAccount. But the cost flow is:
+	// handleComplete checks p.AccountID first, then provider address.
 	// connectProvider doesn't set either, so no provider credit occurs.
 	// Verify the math is correct by checking the provider payout calculation.
 	if expectedProviderPayout != payments.ProviderPayout(totalCost) {
@@ -560,7 +560,7 @@ func TestIntegration_DeviceAuthFullFlow(t *testing.T) {
 	pubKey := testPublicKeyB64()
 	model := "device-auth-model"
 	models := []protocol.ModelInfo{{ID: model, ModelType: "chat", Quantization: "4bit"}}
-	conn := connectProviderWithToken(t, ctx, ts.URL, models, pubKey, tokenResult.Token, "0xDeviceTestWallet")
+	conn := connectProviderWithToken(t, ctx, ts.URL, models, pubKey, tokenResult.Token)
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	// Wait for registration to complete.
@@ -664,14 +664,14 @@ func TestIntegration_MultiNodeSameAccount(t *testing.T) {
 
 	conn1 := connectProviderWithToken(t, ctx, ts.URL,
 		[]protocol.ModelInfo{{ID: model1, ModelType: "chat", Quantization: "4bit"}},
-		pubKey1, rawToken, "0xMultiNode1")
+		pubKey1, rawToken)
 	defer conn1.Close(websocket.StatusNormalClosure, "")
 
 	time.Sleep(200 * time.Millisecond)
 
 	conn2 := connectProviderWithToken(t, ctx, ts.URL,
 		[]protocol.ModelInfo{{ID: model2, ModelType: "chat", Quantization: "4bit"}},
-		pubKey2, rawToken, "0xMultiNode2")
+		pubKey2, rawToken)
 	defer conn2.Close(websocket.StatusNormalClosure, "")
 
 	time.Sleep(200 * time.Millisecond)

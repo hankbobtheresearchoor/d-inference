@@ -2313,9 +2313,8 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 
 // handleProviderEarnings handles GET /v1/provider/earnings?wallet=0x...
 //
-// Returns the provider's balance and payout history by wallet address.
-// No API key auth required — providers identify by wallet address.
-// The wallet address is the same one sent during WebSocket registration.
+// Returns the provider's balance and payout history.
+// No API key auth required — providers identify by provider address.
 func (s *Server) handleProviderEarnings(w http.ResponseWriter, r *http.Request) {
 	wallet := r.URL.Query().Get("wallet")
 	if wallet == "" {
@@ -2326,7 +2325,7 @@ func (s *Server) handleProviderEarnings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Look up balance by wallet address (same account ID used in CreditProvider)
+	// Look up balance by provider address
 	balance := s.ledger.Balance(wallet)
 	history := s.ledger.LedgerHistory(wallet)
 	payouts := s.ledger.AllPayouts()
@@ -2368,7 +2367,6 @@ func (s *Server) handleProviderEarnings(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"wallet_address":         wallet,
 		"balance_micro_usd":      balance,
 		"balance_usd":            fmt.Sprintf("%.6f", float64(balance)/1_000_000),
 		"total_earned_micro_usd": totalEarned,

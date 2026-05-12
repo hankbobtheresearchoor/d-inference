@@ -41,7 +41,6 @@ mod security;
 mod server;
 mod service;
 mod telemetry;
-mod wallet;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -1924,7 +1923,7 @@ async fn cmd_install(
     );
     println!();
 
-    // Step 2: Initialize config, keys, and wallet
+    // Step 2: Initialize config, keys
     println!("Step 2/6: Initializing configuration...");
     let config_path = config::default_config_path()?;
     if !config_path.exists() {
@@ -2778,11 +2777,6 @@ async fn cmd_serve(
             node_keypair.clone(),
         )
         .with_attestation(attestation)
-        .with_wallet_address(
-            wallet::Wallet::load_or_create()
-                .ok()
-                .map(|w| w.address.clone()),
-        )
         .with_auth_token(auth_token)
         .with_runtime_hashes(Some(runtime_hashes))
         .with_runtime_hash_command(Some(python_cmd.clone()))
