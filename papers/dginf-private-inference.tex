@@ -143,7 +143,7 @@ We present a system that makes this possible. Rather than encrypting memory (whi
 \begin{enumerate}[leftmargin=*,itemsep=2pt,topsep=2pt]
     \item A \textbf{decentralized private inference architecture} that enables confidential AI computation on a network of third-party Apple Silicon machines, where each machine's owner is assumed to be adversarial.
     \item A \textbf{formal security model} for this setting, including a proof that System Integrity Protection provides runtime immutability under standard assumptions (Theorem~\ref{thm:sip}), and a complete enumeration of the software attack surface.
-    \item An \textbf{in-process inference design} that embeds the inference engine directly in a hardened process, eliminating all inter-process communication channels that could be observed, with optional \textbf{hypervisor memory isolation} that extends protection from software-enforced to hardware-enforced via ARM Stage~2 page tables at zero performance cost.
+    \item An \textbf{in-process inference design} that embeds the inference engine directly in a hardened process, eliminating all inter-process communication channels that could be observed, with optional \textbf{hypervisor memory isolation} (Section~\ref{sec:hypervisor}) that extends protection from software-enforced to hardware-enforced via ARM Stage~2 page tables at zero performance cost.
     \item A \textbf{multi-layer attestation architecture} combining Secure Enclave signatures, MDM-based independent verification, Apple MDA hardware attestation with Apple-signed certificate chains, MDA nonce-based SE key binding, and periodic challenge-response with fresh security state.
     \item A \textbf{combined enrollment protocol} that unifies MDM enrollment and ACME device attestation into a single configuration profile, reducing trust establishment to a one-step process.
     \item \textbf{End-to-end validation} on production hardware (Apple M2 and M4~Max) with live inference, demonstrating that the security mechanisms introduce negligible overhead.
@@ -422,7 +422,7 @@ Modify kernel code at runtime & Kernel Integrity Protection: hardware denies wri
 Disable SIP & Requires reboot into Recovery Mode, terminating all processes (Theorem~\ref{thm:sip}) & Hardware \\
 Read physical memory via \texttt{/dev/mem} & Device node does not exist on Apple Silicon & Hardware \\
 DMA-based extraction via Thunderbolt/PCIe & Per-device IOMMU (DART) with default-deny; unauthorized DMA triggers kernel panic & Hardware \\
-RDMA over Thunderbolt~5 (80\,Gb/s) & Hypervisor Stage~2 page tables isolate inference memory; RDMA status verified in attestation challenge-response (Section~\ref{sec:hypervisor}) & Hardware \\
+RDMA over Thunderbolt~5 (80\,Gb/s) & Disabled by default; requires Recovery OS boot to enable; RDMA status reported in attestation challenge-response (Section~\ref{sec:challenge}) & Architecture + Hardware \\
 \midrule
 \textit{Physical memory probing} & \textit{LPDDR5x soldered into SoC package; desoldering is destructive} & \textit{Physical} \\
 \bottomrule
@@ -479,16 +479,16 @@ The 16\,MB alignment requirement is imposed by macOS~26 Hypervisor.framework; sm
 
 \subsection{Fail-Closed Invariant}
 
-If the VM-mapped pool is exhausted, the provider refuses inference requests rather than falling back to unprotected memory. This fail-closed design ensures that no inference data---model weights, activations, KV cache---ever resides in memory accessible to RDMA. The coordinator enforces this via the attestation challenge-response: providers that report \texttt{rdmaDisabled = false} without \texttt{hypervisorActive = true} are marked untrusted.
+If the VM-mapped pool is exhausted, the provider refuses inference requests rather than falling back to unprotected memory. This fail-closed design ensures that no inference data---model weights, activations, KV cache---ever resides in memory accessible to RDMA. The coordinator reports RDMA status in the attestation challenge-response for consumer visibility but does not automatically mark providers as untrusted when RDMA is enabled without hypervisor isolation.
 
 \subsection{RDMA Policy}
 
 The security policy for RDMA is:
 \begin{itemize}[leftmargin=*,itemsep=1pt]
     \item \textbf{Single-node, RDMA disabled}: All software protections apply. Hypervisor optional (defense-in-depth).
-    \item \textbf{Single-node, RDMA enabled, hypervisor active}: Stage~2 page tables isolate inference memory from RDMA. Acceptable.
-    \item \textbf{Single-node, RDMA enabled, no hypervisor}: Provider is marked untrusted. No inference requests are routed.
-    \item \textbf{Multi-node (future)}: Both nodes must have RDMA enabled and hypervisor active. Activations transferred via encrypted RDMA (Section~\ref{sec:future}).
+    \item \textbf{Single-node, RDMA enabled, hypervisor active}: Stage~2 page tables isolate inference memory from RDMA. Provides hardware-level defense-in-depth.
+    \item \textbf{Single-node, RDMA enabled, no hypervisor}: RDMA status is reported to consumers via attestation; consumers may select trust tiers or routing preferences based on this information. The provider is not automatically marked untrusted.
+    \item \textbf{Multi-node (future)}: Both nodes must have RDMA enabled. Hypervisor isolation is recommended. Activations transferred via encrypted RDMA (Section~\ref{sec:future}).
 \end{itemize}
 
 \subsection{Experimental Validation}
@@ -544,10 +544,10 @@ On first execution, the provider generates a P-256 ECDSA signing key inside Appl
 \texttt{chipName} & string & Hardware identity \\
 \texttt{encryptionPublicKey} & base64 & X25519 key bound to this identity \\
 \texttt{hardwareModel} & string & Machine model identifier \\
-\texttt{hypervisorActive} & bool & Hypervisor VM active (Section~\ref{sec:hypervisor}) \\
+\texttt{hypervisorActive} & bool & Hypervisor VM active, optional (Section~\ref{sec:hypervisor}) \\
 \texttt{osVersion} & string & macOS version \\
 \texttt{publicKey} & base64 & P-256 public key (raw X$\|$Y) \\
-\texttt{rdmaDisabled} & bool & RDMA status via \texttt{rdma\_ctl} \\
+\texttt{rdmaDisabled} & bool & RDMA status via \texttt{rdma\_ctl} (informational) \\
 \texttt{secureBootEnabled} & bool & Secure Boot status \\
 \texttt{secureEnclaveAvailable} & bool & SE hardware present \\
 \texttt{serialNumber} & string & Device serial for MDM cross-ref \\
@@ -721,7 +721,7 @@ Every 5 minutes, the coordinator generates a random 32-byte nonce $n$ and timest
     \item Check current SIP status via \texttt{csrutil status}
     \item Check current Secure Boot status
     \item Check current RDMA status via \texttt{rdma\_ctl status}
-    \item Check current hypervisor status
+    \item Check current hypervisor status (optional)
     \item Compute signature $\sigma = \text{Sign}_{\text{SE}}(n \| t \| \text{pk})$ where $\text{pk}$ is the registered public key
     \item Return $(\sigma, n, \text{pk}, \text{sip\_enabled}, \text{secure\_boot\_enabled}, \text{rdma\_disabled}, \text{hypervisor\_active})$ within 30 seconds
 \end{enumerate}
@@ -733,10 +733,10 @@ The coordinator verifies:
     \item ECDSA signature $\sigma$ is valid
     \item \texttt{sip\_enabled} = true (immediate untrust if false)
     \item \texttt{secure\_boot\_enabled} = true (immediate untrust if false)
-    \item If \texttt{rdma\_disabled} = false, then \texttt{hypervisor\_active} must be true (immediate untrust otherwise)
+    \item RDMA and hypervisor status are reported to consumers for trust tier selection; RDMA enabled without hypervisor is not an automatic untrust condition
 \end{itemize}
 
-\textbf{Immediate untrust policy:} If SIP or Secure Boot is reported as disabled, or if RDMA is enabled without hypervisor isolation, the provider is immediately marked untrusted with no grace period. Disabled SIP or Secure Boot indicates a deliberate reboot with weakened security (by Theorem~\ref{thm:sip}, SIP cannot be disabled without rebooting). Enabled RDMA without hypervisor indicates that inference memory is accessible via Thunderbolt~5 DMA.
+\textbf{Immediate untrust policy:} If SIP or Secure Boot is reported as disabled, the provider is immediately marked untrusted with no grace period. Disabled SIP or Secure Boot indicates a deliberate reboot with weakened security (by Theorem~\ref{thm:sip}, SIP cannot be disabled without rebooting). RDMA and hypervisor status are informational: consumers may use these fields to inform trust tier selection, but the coordinator does not automatically untrust providers with RDMA enabled.
 
 \textbf{Failure escalation:} Three consecutive signature verification failures result in untrust marking. This catches providers experiencing connectivity issues versus providers that have been replaced or compromised.
 
@@ -998,7 +998,7 @@ Coordinator TEE & N/A (Apple infra) & Intel TDX \\
 OS immutability & SSV & SIP + ARV + SSV hash \\
 Shell/debug access & Removed entirely & Blocked at kernel level \\
 Memory encryption & None & None \\
-DMA/RDMA isolation & Facility controls & Hypervisor Stage~2 pages \\
+DMA/RDMA isolation & Facility controls & IOMMU + optional Hypervisor Stage~2 pages \\
 Provider verification & Apple-signed & SE + MDM + MDA \\
 Hardware provenance & Apple supply chain & Apple MDA certificates \\
 Residual attack & Physical probing & Physical probing \\
@@ -1176,7 +1176,7 @@ Dense models exceeding 32B parameters favor cloud infrastructure: H100 clusters 
 
 \textbf{Timing side channels.}\quad Our architecture protects token \emph{content}---the provider cannot observe what tokens are generated. However, token \emph{timing} is observable. Network packet intervals reveal approximate prompt length (from prefill duration), response length (from output packet count), and relative generation difficulty (from inter-token delays). We do not implement constant-time inference. Mitigations include response buffering and random jitter. This limitation is shared with Apple PCC and all non-TEE inference systems.
 
-\textbf{Single-device throughput.}\quad The Python GIL serializes inference to one request at a time when using the PyO3 embedding. A prototype Rust binary linking MLX's C++ API directly (via a thin C bridge with 23 FFI functions) eliminates the GIL and the Python dependency. This prototype achieves correct inference output with zero hypervisor overhead, but requires additional work for production readiness.
+\textbf{Single-device throughput.}\quad The Python GIL serializes inference to one request at a time when using the PyO3 embedding. A prototype Rust binary linking MLX's C++ API directly (via a thin C bridge with 23 FFI functions) eliminates the GIL and the Python dependency. This prototype achieves correct inference output with zero measurable overhead, but requires additional work for production readiness.
 
 \textbf{MDA availability.}\quad ACME \texttt{device-attest-01} requires devices to be enrolled with an organization that has Apple attestation authority. Expanding to arbitrary consumer devices requires integration with Apple Business Manager or equivalent enrollment pathway.
 
@@ -1200,7 +1200,7 @@ Dense models exceeding 32B parameters favor cloud infrastructure: H100 clusters 
 
 We have presented a decentralized inference system in which consumers get private AI computation on machines they do not own or control. The machine owners---who have root access and physical custody---cannot observe the prompts or responses processed on their hardware.
 
-The approach works by systematically eliminating every software path to inference data: in-process execution removes inter-process communication, kernel-enforced isolation blocks memory inspection, and operating system integrity guarantees are provably immutable at runtime (Theorem~\ref{thm:sip}). Hypervisor Stage~2 page tables extend this protection to the hardware level, isolating inference memory from RDMA-based DMA attacks with zero measured performance overhead. A multi-layer attestation architecture---Secure Enclave signatures, MDM-based independent verification, Apple MDA with Apple-signed certificate chains, MDA nonce-based SE key binding, and continuous challenge-response with fresh hypervisor and RDMA status---provides defense-in-depth where each layer independently verifies properties that the others cannot.
+The approach works by systematically eliminating every software path to inference data: in-process execution removes inter-process communication, kernel-enforced isolation blocks memory inspection, and operating system integrity guarantees are provably immutable at runtime (Theorem~\ref{thm:sip}). Optional Hypervisor Stage~2 page tables extend this protection to the hardware level, isolating inference memory from RDMA-based DMA attacks with zero measured performance overhead. A multi-layer attestation architecture---Secure Enclave signatures, MDM-based independent verification, Apple MDA with Apple-signed certificate chains, MDA nonce-based SE key binding, and continuous challenge-response with fresh RDMA and hypervisor status---provides defense-in-depth where each layer independently verifies properties that the others cannot.
 
 The residual attack surface reduces to physical memory probing of LPDDR5x soldered into Apple's System-on-Chip package, even when RDMA is enabled. This is the same threat model accepted by Apple's Private Cloud Compute for Siri and Apple Intelligence queries. Our system achieves equivalent privacy guarantees on a decentralized network of independently owned machines.
 
