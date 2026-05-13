@@ -32,7 +32,7 @@ name: Release Provider Bundle (Swift)
 #   DEV_R2_BUCKET         / PROD_R2_BUCKET
 #   DEV_R2_PUBLIC_URL     / PROD_R2_PUBLIC_URL
 #   DEV_COORDINATOR_URL   / PROD_COORDINATOR_URL
-#   RELEASE_KEY           — shared across environments (no prefix)
+#   DEV_RELEASE_KEY       / PROD_RELEASE_KEY
 # Apple signing secrets are shared (same cert for both envs).
 
 on:
@@ -120,9 +120,11 @@ jobs:
           PROD_R2_PUBLIC_URL: ${{ secrets.PROD_R2_PUBLIC_URL }}
           DEV_COORDINATOR_URL: ${{ secrets.DEV_COORDINATOR_URL }}
           PROD_COORDINATOR_URL: ${{ secrets.PROD_COORDINATOR_URL }}
+          DEV_RELEASE_KEY: ${{ secrets.DEV_RELEASE_KEY }}
+          PROD_RELEASE_KEY: ${{ secrets.PROD_RELEASE_KEY }}
         run: |
           PREFIX=$(echo "$ENV_PREFIX" | tr '[:lower:]' '[:upper:]')
-          for key in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET R2_PUBLIC_URL COORDINATOR_URL; do
+          for key in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET R2_PUBLIC_URL COORDINATOR_URL RELEASE_KEY; do
             varname="${PREFIX}_${key}"
             outkey=$(echo "$key" | tr '[:upper:]' '[:lower:]')
             echo "${outkey}=${!varname}" >> "$GITHUB_ENV"
@@ -370,7 +372,7 @@ jobs:
       - name: Register release with coordinator
         env:
           COORDINATOR_URL: ${{ env.coordinator_url }}
-          RELEASE_KEY: ${{ secrets.RELEASE_KEY }}
+          RELEASE_KEY: ${{ env.release_key }}
           R2_PUBLIC_URL: ${{ env.r2_public_url }}
         run: |
           set -euo pipefail
