@@ -16,16 +16,16 @@ name: Release Rust Bridge Provider Bundle
 # The tag prefix is intentionally not `v...` so the Swift release workflow
 # cannot accidentally publish a Swift bundle for the bridge tag.
 #
-# Environment-scoped secrets (configure per GitHub environment: dev, prod):
-#   R2_ACCESS_KEY_ID      — Cloudflare R2 API token ID for the target bucket
-#   R2_SECRET_ACCESS_KEY  — Cloudflare R2 API token secret
-#   R2_ENDPOINT           — e.g. https://<account-id>.r2.cloudflarestorage.com
-#   R2_BUCKET             — dev: d-inf-app-dev, prod: d-inf-app-prod
-#   R2_PUBLIC_URL         — public CDN URL for the target bucket
-#   COORDINATOR_URL       — dev: https://api.dev.darkbloom.xyz, prod: https://api.darkbloom.dev
-#   RELEASE_KEY           — scoped release key for the target coordinator
-#   APPLE_CERTIFICATE_P12, APPLE_CERTIFICATE_PASSWORD, APPLE_ID, APPLE_APP_PASSWORD
-#                          — shared across environments
+# Repo secrets use DEV_/PROD_ prefixes so both environments live at repo
+# level without needing GitHub environments:
+#   DEV_R2_ACCESS_KEY_ID  / PROD_R2_ACCESS_KEY_ID
+#   DEV_R2_SECRET_ACCESS_KEY / PROD_R2_SECRET_ACCESS_KEY
+#   DEV_R2_ENDPOINT       / PROD_R2_ENDPOINT
+#   DEV_R2_BUCKET         / PROD_R2_BUCKET
+#   DEV_R2_PUBLIC_URL     / PROD_R2_PUBLIC_URL
+#   DEV_COORDINATOR_URL   / PROD_COORDINATOR_URL
+#   DEV_RELEASE_KEY       / PROD_RELEASE_KEY
+# Apple signing secrets are shared (same cert for both envs).
 
 on:
   push:
@@ -64,6 +64,13 @@ jobs:
     outputs:
       environment: ${{ steps.pick.outputs.environment }}
       version: ${{ steps.pick.outputs.version }}
+      r2_access_key_id: ${{ steps.secrets.outputs.r2_access_key_id }}
+      r2_secret_access_key: ${{ steps.secrets.outputs.r2_secret_access_key }}
+      r2_endpoint: ${{ steps.secrets.outputs.r2_endpoint }}
+      r2_bucket: ${{ steps.secrets.outputs.r2_bucket }}
+      r2_public_url: ${{ steps.secrets.outputs.r2_public_url }}
+      coordinator_url: ${{ steps.secrets.outputs.coordinator_url }}
+      release_key: ${{ steps.secrets.outputs.release_key }}
     steps:
       - id: pick
         run: |
@@ -83,10 +90,36 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Resolved env=$ENV version=$VERSION"
 
+      - id: secrets
+        env:
+          ENV_PREFIX: ${{ steps.pick.outputs.environment }}
+          DEV_R2_ACCESS_KEY_ID: ${{ secrets.DEV_R2_ACCESS_KEY_ID }}
+          PROD_R2_ACCESS_KEY_ID: ${{ secrets.PROD_R2_ACCESS_KEY_ID }}
+          DEV_R2_SECRET_ACCESS_KEY: ${{ secrets.DEV_R2_SECRET_ACCESS_KEY }}
+          PROD_R2_SECRET_ACCESS_KEY: ${{ secrets.PROD_R2_SECRET_ACCESS_KEY }}
+          DEV_R2_ENDPOINT: ${{ secrets.DEV_R2_ENDPOINT }}
+          PROD_R2_ENDPOINT: ${{ secrets.PROD_R2_ENDPOINT }}
+          DEV_R2_BUCKET: ${{ secrets.DEV_R2_BUCKET }}
+          PROD_R2_BUCKET: ${{ secrets.PROD_R2_BUCKET }}
+          DEV_R2_PUBLIC_URL: ${{ secrets.DEV_R2_PUBLIC_URL }}
+          PROD_R2_PUBLIC_URL: ${{ secrets.PROD_R2_PUBLIC_URL }}
+          DEV_COORDINATOR_URL: ${{ secrets.DEV_COORDINATOR_URL }}
+          PROD_COORDINATOR_URL: ${{ secrets.PROD_COORDINATOR_URL }}
+          DEV_RELEASE_KEY: ${{ secrets.DEV_RELEASE_KEY }}
+          PROD_RELEASE_KEY: ${{ secrets.PROD_RELEASE_KEY }}
+        run: |
+          set -euo pipefail
+          PREFIX=$(echo "$ENV_PREFIX" | tr '[:lower:]' '[:upper:]')
+          for key in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET R2_PUBLIC_URL COORDINATOR_URL RELEASE_KEY; do
+            varname="${PREFIX}_${key}"
+            val="${!varname}"
+            outkey=$(echo "$key" | tr '[:upper:]' '[:lower:]')
+            echo "${outkey}=${val}" >> "$GITHUB_OUTPUT"
+          done
+
   build-and-release:
     name: Build, sign, notarize, upload, register
     needs: [resolve-env]
-    environment: ${{ needs.resolve-env.outputs.environment }}
     runs-on: macos-26-xlarge
 
     env:
@@ -317,10 +350,10 @@ jobs:
 
       - name: Upload bridge artifacts to R2
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ needs.resolve-env.outputs.r2_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ needs.resolve-env.outputs.r2_secret_access_key }}
+          R2_ENDPOINT: ${{ needs.resolve-env.outputs.r2_endpoint }}
+          R2_BUCKET: ${{ needs.resolve-env.outputs.r2_bucket }}
         run: |
           set -euo pipefail
           PREFIX="s3://${R2_BUCKET}/releases/v${VERSION}"
@@ -350,9 +383,9 @@ jobs:
 
       - name: Register bridge release with coordinator
         env:
-          COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
-          RELEASE_KEY: ${{ secrets.RELEASE_KEY }}
-          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          COORDINATOR_URL: ${{ needs.resolve-env.outputs.coordinator_url }}
+          RELEASE_KEY: ${{ needs.resolve-env.outputs.release_key }}
+          R2_PUBLIC_URL: ${{ needs.resolve-env.outputs.r2_public_url }}
         run: |
           set -euo pipefail
           BUNDLE_URL="${R2_PUBLIC_URL}/releases/v${VERSION}/eigeninference-bundle-macos-arm64.tar.gz"
