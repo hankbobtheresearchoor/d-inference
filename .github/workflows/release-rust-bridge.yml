@@ -24,7 +24,7 @@ name: Release Rust Bridge Provider Bundle
 #   DEV_R2_BUCKET         / PROD_R2_BUCKET
 #   DEV_R2_PUBLIC_URL     / PROD_R2_PUBLIC_URL
 #   DEV_COORDINATOR_URL   / PROD_COORDINATOR_URL
-#   DEV_RELEASE_KEY       / PROD_RELEASE_KEY
+#   RELEASE_KEY           — shared across environments (no prefix)
 # Apple signing secrets are shared (same cert for both envs).
 
 on:
@@ -70,7 +70,6 @@ jobs:
       r2_bucket: ${{ steps.secrets.outputs.r2_bucket }}
       r2_public_url: ${{ steps.secrets.outputs.r2_public_url }}
       coordinator_url: ${{ steps.secrets.outputs.coordinator_url }}
-      release_key: ${{ steps.secrets.outputs.release_key }}
     steps:
       - id: pick
         run: |
@@ -105,12 +104,10 @@ jobs:
           PROD_R2_PUBLIC_URL: ${{ secrets.PROD_R2_PUBLIC_URL }}
           DEV_COORDINATOR_URL: ${{ secrets.DEV_COORDINATOR_URL }}
           PROD_COORDINATOR_URL: ${{ secrets.PROD_COORDINATOR_URL }}
-          DEV_RELEASE_KEY: ${{ secrets.DEV_RELEASE_KEY }}
-          PROD_RELEASE_KEY: ${{ secrets.PROD_RELEASE_KEY }}
         run: |
           set -euo pipefail
           PREFIX=$(echo "$ENV_PREFIX" | tr '[:lower:]' '[:upper:]')
-          for key in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET R2_PUBLIC_URL COORDINATOR_URL RELEASE_KEY; do
+          for key in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET R2_PUBLIC_URL COORDINATOR_URL; do
             varname="${PREFIX}_${key}"
             val="${!varname}"
             outkey=$(echo "$key" | tr '[:upper:]' '[:lower:]')
@@ -384,7 +381,7 @@ jobs:
       - name: Register bridge release with coordinator
         env:
           COORDINATOR_URL: ${{ needs.resolve-env.outputs.coordinator_url }}
-          RELEASE_KEY: ${{ needs.resolve-env.outputs.release_key }}
+          RELEASE_KEY: ${{ secrets.RELEASE_KEY }}
           R2_PUBLIC_URL: ${{ needs.resolve-env.outputs.r2_public_url }}
         run: |
           set -euo pipefail
