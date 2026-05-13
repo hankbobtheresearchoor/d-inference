@@ -64,12 +64,6 @@ jobs:
     outputs:
       environment: ${{ steps.pick.outputs.environment }}
       version: ${{ steps.pick.outputs.version }}
-      r2_access_key_id: ${{ steps.secrets.outputs.r2_access_key_id }}
-      r2_secret_access_key: ${{ steps.secrets.outputs.r2_secret_access_key }}
-      r2_endpoint: ${{ steps.secrets.outputs.r2_endpoint }}
-      r2_bucket: ${{ steps.secrets.outputs.r2_bucket }}
-      r2_public_url: ${{ steps.secrets.outputs.r2_public_url }}
-      coordinator_url: ${{ steps.secrets.outputs.coordinator_url }}
     steps:
       - id: pick
         run: |
@@ -89,9 +83,18 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Resolved env=$ENV version=$VERSION"
 
-      - id: secrets
+  build-and-release:
+    name: Build, sign, notarize, upload, register
+    needs: [resolve-env]
+    runs-on: macos-26-xlarge
+
+    env:
+      VERSION: ${{ needs.resolve-env.outputs.version }}
+      ENV_PREFIX: ${{ needs.resolve-env.outputs.environment }}
+
+    steps:
+      - name: Resolve env-specific secrets
         env:
-          ENV_PREFIX: ${{ steps.pick.outputs.environment }}
           DEV_R2_ACCESS_KEY_ID: ${{ secrets.DEV_R2_ACCESS_KEY_ID }}
           PROD_R2_ACCESS_KEY_ID: ${{ secrets.PROD_R2_ACCESS_KEY_ID }}
           DEV_R2_SECRET_ACCESS_KEY: ${{ secrets.DEV_R2_SECRET_ACCESS_KEY }}
@@ -105,24 +108,13 @@ jobs:
           DEV_COORDINATOR_URL: ${{ secrets.DEV_COORDINATOR_URL }}
           PROD_COORDINATOR_URL: ${{ secrets.PROD_COORDINATOR_URL }}
         run: |
-          set -euo pipefail
           PREFIX=$(echo "$ENV_PREFIX" | tr '[:lower:]' '[:upper:]')
           for key in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET R2_PUBLIC_URL COORDINATOR_URL; do
             varname="${PREFIX}_${key}"
-            val="${!varname}"
             outkey=$(echo "$key" | tr '[:upper:]' '[:lower:]')
-            echo "${outkey}=${val}" >> "$GITHUB_OUTPUT"
+            echo "${outkey}=${!varname}" >> "$GITHUB_ENV"
           done
 
-  build-and-release:
-    name: Build, sign, notarize, upload, register
-    needs: [resolve-env]
-    runs-on: macos-26-xlarge
-
-    env:
-      VERSION: ${{ needs.resolve-env.outputs.version }}
-
-    steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -347,10 +339,10 @@ jobs:
 
       - name: Upload bridge artifacts to R2
         env:
-          AWS_ACCESS_KEY_ID: ${{ needs.resolve-env.outputs.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ needs.resolve-env.outputs.r2_secret_access_key }}
-          R2_ENDPOINT: ${{ needs.resolve-env.outputs.r2_endpoint }}
-          R2_BUCKET: ${{ needs.resolve-env.outputs.r2_bucket }}
+          AWS_ACCESS_KEY_ID: ${{ env.r2_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.r2_secret_access_key }}
+          R2_ENDPOINT: ${{ env.r2_endpoint }}
+          R2_BUCKET: ${{ env.r2_bucket }}
         run: |
           set -euo pipefail
           PREFIX="s3://${R2_BUCKET}/releases/v${VERSION}"
@@ -380,9 +372,9 @@ jobs:
 
       - name: Register bridge release with coordinator
         env:
-          COORDINATOR_URL: ${{ needs.resolve-env.outputs.coordinator_url }}
+          COORDINATOR_URL: ${{ env.coordinator_url }}
           RELEASE_KEY: ${{ secrets.RELEASE_KEY }}
-          R2_PUBLIC_URL: ${{ needs.resolve-env.outputs.r2_public_url }}
+          R2_PUBLIC_URL: ${{ env.r2_public_url }}
         run: |
           set -euo pipefail
           BUNDLE_URL="${R2_PUBLIC_URL}/releases/v${VERSION}/eigeninference-bundle-macos-arm64.tar.gz"
