@@ -23,6 +23,17 @@ name: Release Provider Bundle (Swift)
 #
 # The one-time Rust migration bridge intentionally uses `rust-bridge-vX.Y.Z`
 # so it cannot be confused with the Swift cutover tags above.
+#
+# Environment-scoped secrets (configure per GitHub environment: dev, prod):
+#   R2_ACCESS_KEY_ID      — Cloudflare R2 API token ID for the target bucket
+#   R2_SECRET_ACCESS_KEY  — Cloudflare R2 API token secret
+#   R2_ENDPOINT           — e.g. https://<account-id>.r2.cloudflarestorage.com
+#   R2_BUCKET             — dev: d-inf-app-dev, prod: d-inf-app-prod
+#   R2_PUBLIC_URL         — public CDN URL for the target bucket
+#   COORDINATOR_URL       — dev: https://api.dev.darkbloom.xyz, prod: https://api.darkbloom.dev
+#   RELEASE_KEY           — scoped release key for the target coordinator
+#   APPLE_CERTIFICATE_P12, APPLE_CERTIFICATE_PASSWORD, APPLE_ID, APPLE_APP_PASSWORD
+#                          — shared across environments (Apple signing is the same)
 
 on:
   push:
@@ -298,7 +309,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
         run: |
           set -euo pipefail
           PREFIX="s3://${R2_BUCKET}/releases/v${VERSION}"
