@@ -810,7 +810,7 @@ func TestEdge_ReleaseRegisterAndRetrieve(t *testing.T) {
 func TestEdge_ErrorResponseFormat(t *testing.T) {
 	srv, _ := testServer(t)
 
-	// Send invalid request to trigger error
+	// Send invalid request to trigger error (empty model triggers "model is required")
 	body := `{"model":"","messages":[]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
@@ -821,6 +821,8 @@ func TestEdge_ErrorResponseFormat(t *testing.T) {
 		Error struct {
 			Type    string `json:"type"`
 			Message string `json:"message"`
+			Code    string `json:"code"`
+			Param   string `json:"param"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
@@ -832,6 +834,12 @@ func TestEdge_ErrorResponseFormat(t *testing.T) {
 	}
 	if errResp.Error.Message == "" {
 		t.Error("error response missing 'message' field")
+	}
+	if errResp.Error.Code == "" {
+		t.Error("error response missing 'code' field — required by OpenAI spec for SDK error handling")
+	}
+	if errResp.Error.Param != "model" {
+		t.Errorf("error response param = %q, want %q", errResp.Error.Param, "model")
 	}
 }
 
