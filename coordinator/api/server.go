@@ -1341,7 +1341,7 @@ func (s *Server) rateLimitWithTier(getLimiter func() *ratelimit.Limiter, tier st
 			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(retryAfter).Unix(), 10))
 			s.ddIncr("ratelimit.rejections", []string{"tier:" + tier})
 			writeJSON(w, http.StatusTooManyRequests, errorResponse("rate_limit_exceeded",
-				"too many requests — slow down and retry after the Retry-After interval"))
+				"too many requests — slow down and retry after the Retry-After interval", withCode("rate_limit_exceeded")))
 			return
 		}
 		next(w, r)

@@ -391,7 +391,7 @@ func (s *Server) handleAdminPricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Model == "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "model is required"))
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "model is required", withParam("model")))
 		return
 	}
 	if req.InputPrice <= 0 || req.OutputPrice <= 0 {
@@ -438,7 +438,7 @@ func (s *Server) handleSetPricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Model == "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "model is required"))
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "model is required", withParam("model")))
 		return
 	}
 	if req.InputPrice <= 0 || req.OutputPrice <= 0 {
@@ -477,7 +477,7 @@ func (s *Server) handleDeletePricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Model == "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "model is required"))
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "model is required", withParam("model")))
 		return
 	}
 

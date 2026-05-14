@@ -539,7 +539,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	model, _ := parsed["model"].(string)
 	if model == "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "model is required"))
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "model is required", withParam("model")))
 		return
 	}
 
@@ -597,7 +597,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		reservedMicroUSD = s.reservationCost(model, estimatedPromptTokens, requestedMaxTokens)
 		if err := s.ledger.Charge(consumerKey, reservedMicroUSD, "reserve:"+consumerKey); err != nil {
 			writeJSON(w, http.StatusPaymentRequired, errorResponse("insufficient_funds",
-				"your balance is too low for this request — add funds at /billing or lower max_tokens"))
+				"your balance is too low for this request — add funds at /billing or lower max_tokens", withCode("insufficient_quota")))
 			return
 		}
 	}
@@ -615,7 +615,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !s.registry.IsModelInCatalog(model) {
 		refundReservation()
 		writeJSON(w, http.StatusNotFound, errorResponse("model_not_found",
-			fmt.Sprintf("model %q is not available — see /v1/models for supported models", model)))
+			fmt.Sprintf("model %q is not available — see /v1/models for supported models", model), withParam("model")))
 		return
 	}
 
@@ -2419,12 +2419,12 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 
 	model, _ := parsed["model"].(string)
 	if model == "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "model is required"))
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "model is required", withParam("model")))
 		return
 	}
 	if !s.registry.IsModelInCatalog(model) {
 		writeJSON(w, http.StatusNotFound, errorResponse("model_not_found",
-			fmt.Sprintf("model %q is not available — see /v1/models for supported models", model)))
+			fmt.Sprintf("model %q is not available — see /v1/models for supported models", model), withParam("model")))
 		return
 	}
 
@@ -2459,7 +2459,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		reservedMicroUSD = s.reservationCost(model, estimatedPromptTokens, requestedMaxTokens)
 		if err := s.ledger.Charge(consumerKey, reservedMicroUSD, "reserve:"+consumerKey); err != nil {
 			writeJSON(w, http.StatusPaymentRequired, errorResponse("insufficient_funds",
-				"your balance is too low for this request — add funds at /billing or lower max_tokens"))
+				"your balance is too low for this request — add funds at /billing or lower max_tokens", withCode("insufficient_quota")))
 			return
 		}
 	}
@@ -2599,12 +2599,36 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
+// errorDetailOpt carries optional fields for OpenAI-compatible error responses.
+type errorDetailOpt struct {
+	param string // e.g. "model", "max_tokens"
+	code  string // e.g. "model_not_found", "insufficient_quota"
+}
+
 // errorResponse builds a standard OpenAI-compatible error response body.
-func errorResponse(errType, message string) map[string]any {
+// By default, code is inferred from errType. Callers can override code or
+// set param via withParam / withCode helpers.
+func errorResponse(errType, message string, opts ...errorDetailOpt) map[string]any {
+	detail := map[string]any{
+		"type":    errType,
+		"message": message,
+		"code":    errType, // default: code mirrors type
+	}
+	for _, o := range opts {
+		if o.param != "" {
+			detail["param"] = o.param
+		}
+		if o.code != "" {
+			detail["code"] = o.code
+		}
+	}
 	return map[string]any{
-		"error": map[string]any{
-			"type":    errType,
-			"message": message,
-		},
+		"error": detail,
 	}
 }
+
+// withParam returns an option that sets the "param" field on an error response.
+func withParam(p string) errorDetailOpt { return errorDetailOpt{param: p} }
+
+// withCode returns an option that overrides the "code" field on an error response.
+func withCode(c string) errorDetailOpt { return errorDetailOpt{code: c} }
