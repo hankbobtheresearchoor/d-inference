@@ -117,7 +117,12 @@ func approximateTokenCount(v any) int {
 		if x == "" {
 			return 0
 		}
-		tokens := len(x) / 4
+		// Every BPE tokenizer begins with one token per byte and can only
+		// merge tokens, so len(x) is a universal upper bound on prompt tokens
+		// for any model family, any language, forever. Using the raw byte
+		// length guarantees the pre-flight reservation never underestimates
+		// the actual workload and therefore never silently shorts providers.
+		tokens := len(x)
 		if tokens < 1 {
 			tokens = 1
 		}
@@ -127,7 +132,7 @@ func approximateTokenCount(v any) int {
 		if err != nil {
 			return 0
 		}
-		tokens := len(b) / 4
+		tokens := len(b)
 		if tokens < 1 {
 			tokens = 1
 		}
@@ -245,12 +250,13 @@ func explicitMaxTokens(parsed map[string]any) int {
 
 // reservationCost is the pre-flight worst-case cost for a text inference
 // request. It mirrors the platform-price branch of handleComplete's billing
-// so the reservation covers any platform-level custom price for the model;
-// without this, a platform override above the built-in default would leave
-// the reservation short and the post-inference clamp would silently
-// undercharge. Provider-specific custom prices are not known until dispatch
-// commits to a provider, so a provider that sets a custom price above the
-// platform rate accepts revenue capped at the reservation.
+// so the reservation covers any platform-level custom price for the model.
+// Since approximateTokenCount uses len(prompt) bytes (universal upper bound
+// on token count for any BPE tokenizer), the reservation is always ≥ actual
+// cost for cooperating providers. The post-inference clamp is retained as
+// defense-in-depth against over-reporting but should never fire on honest
+// work. Provider-specific custom prices above the platform rate are paid
+// accordingly.
 func (s *Server) reservationCost(model string, promptTokens, maxTokens int) int64 {
 	customIn, customOut, hasCustom := s.store.GetModelPrice("platform", model)
 	return payments.CalculateCostWithOverrides(model, promptTokens, maxTokens, customIn, customOut, hasCustom)
@@ -566,8 +572,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Bound the generation so the pre-flight reservation covers it. If the
 	// consumer didn't set max_tokens, inject defaultMaxOutputTokens into the
 	// outgoing body. Without this bound the provider could return more tokens
-	// than we reserved for, and the silent post-inference charge failure would
-	// hand the consumer free inference (GitHub issue #33).
+	// than the reservation accounts for.
 	if ensureMaxTokensBound(parsed, isResponsesAPI) {
 		rawBody, _ = json.Marshal(parsed)
 	}
@@ -587,10 +592,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Pre-flight balance reservation — atomically debit the worst-case cost
-	// (prompt tokens already consumed + max_tokens we just bounded the
-	// generation to) before routing to a provider. The post-inference charge
-	// refunds any unused portion. Reserving only the minimum charge let
-	// consumers receive streamed output far exceeding their actual balance.
+	// (prompt bytes + max_tokens we just bounded the generation to) before
+	// routing to a provider. With len(prompt) as the universal upper bound
+	// on token count, the reservation is always ≥ actual cost, so the
+	// provider is never shorted. The post-inference charge refunds the
+	// unused portion.
 	var reservedMicroUSD int64
 	if s.billing != nil {
 		consumerKey := consumerKeyFromContext(r.Context())

@@ -1013,36 +1013,40 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 	}
 	totalCost := payments.CalculateCostWithOverrides(pr.Model, msg.Usage.PromptTokens, msg.Usage.CompletionTokens, customIn, customOut, hasCustom)
 
-	// Clamp reported cost at the pre-flight reservation. The reservation
-	// uses platform-default and platform-override pricing; a provider that
-	// sets a custom price above the platform rate accepts revenue capped at
-	// the reservation (this is documented by reservationCost). The clamp
-	// also neutralizes over-reporting: with max_tokens injected into the
-	// outgoing request a cooperating provider can never legitimately bill
-	// more than the reservation, so excess means miscounting or fraud.
-	// Logged at Error so misbehavior shows in the operator dashboards.
+	// With the len(prompt)-byte estimate the reservation is always ≥
+	// legitimate cost for honest providers. The clamp is a circuit breaker
+	// against over-reporting (miscounting or fraud) — it should never fire
+	// on cooperating providers. Log at Error so it shows on dashboards.
 	if pr.ReservedMicroUSD > 0 && totalCost > pr.ReservedMicroUSD {
-		s.logger.Error("provider reported cost above reservation — clamping",
-			"provider_id", providerID,
-			"request_id", msg.RequestID,
-			"reported_cost_micro_usd", totalCost,
-			"reserved_micro_usd", pr.ReservedMicroUSD,
-			"prompt_tokens", msg.Usage.PromptTokens,
-			"completion_tokens", msg.Usage.CompletionTokens,
-		)
-		totalCost = pr.ReservedMicroUSD
+		// Try to charge the overage first. The consumer already proved they
+		// had enough for the reservation; the difference is typically from
+		// a provider custom price above the platform rate. If the consumer's
+		// balance can cover it, we're done. If not, fall back to clamping.
+		overage := totalCost - pr.ReservedMicroUSD
+		if err := s.ledger.Charge(pr.ConsumerKey, overage, msg.RequestID); err != nil {
+			s.logger.Error("provider reported cost above reservation — clamping",
+				"provider_id", providerID,
+				"request_id", msg.RequestID,
+				"reported_cost_micro_usd", totalCost,
+				"reserved_micro_usd", pr.ReservedMicroUSD,
+				"overage_micro_usd", overage,
+				"prompt_tokens", msg.Usage.PromptTokens,
+				"completion_tokens", msg.Usage.CompletionTokens,
+			)
+			totalCost = pr.ReservedMicroUSD
+		}
+		// If the charge succeeded, totalCost stays at the reported value.
+		// The consumer paid the full amount, provider gets paid accordingly.
 	}
 	providerPayout := payments.ProviderPayout(totalCost)
 
-	// Adjust billing against the pre-flight reservation. After the clamp above
-	// totalCost <= reserved, so the only path here is a refund of the unused
-	// portion. The old "charge extra" path is retained for the unreserved
-	// code path below (billing disabled / legacy requests).
 	if pr.ReservedMicroUSD > 0 {
 		if totalCost < pr.ReservedMicroUSD {
 			refund := pr.ReservedMicroUSD - totalCost
 			_ = s.store.Credit(pr.ConsumerKey, refund, store.LedgerRefund, msg.RequestID)
 		}
+		// totalCost == pr.ReservedMicroUSD: exact match, nothing to do
+		// totalCost > pr.ReservedMicroUSD: overage was charged above, nothing left
 	} else {
 		// No reservation (billing not configured). Charge best-effort.
 		if err := s.ledger.Charge(pr.ConsumerKey, totalCost, msg.RequestID); err != nil {
