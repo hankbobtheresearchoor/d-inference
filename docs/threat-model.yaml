@@ -146,68 +146,536 @@ trust_boundaries:
   - id: TB-001
     name: consumer_to_coordinator
     description: >
-      Consumer applications (OpenAI SDK, curl, console UI) calling the coordinator's
-      OpenAI-compatible HTTP API over TLS. Authentication is via coordinator API keys
-      (verified by the coordinator). The coordinator is trusted; consumers are not.
+      Consumer applications (OpenAI SDK, curl, console UI) call the coordinator's
+      OpenAI-compatible HTTP API over TLS. Two credential types are accepted: long-lived
+      coordinator API keys (eigeninference-* prefix) and short-lived Privy JWTs for
+      interactive sessions. The coordinator is trusted; consumers are not.
+    how_it_works: >
+      Authentication is resolved in server.go:requireAuth. Tokens beginning with "eyJ"
+      are treated as Privy JWTs and verified via ECDSA ES256 against Privy's public key
+      (auth/privy.go); all others are looked up in the store via ValidateKey(). On first
+      Privy login the coordinator auto-provisions a user account by calling the Privy
+      REST API. API keys are hashed before storage; raw tokens are never persisted.
+
+      The middleware chain for inference endpoints is: requireAuth →
+      rateLimitConsumer → sealedTransport → handler. rateLimitConsumer applies a
+      per-account token bucket; the financial rate limiter (rateLimitFinancial) applies
+      to balance-mutating endpoints. Both limiters default to nil (unlimited) unless
+      SetRateLimiter / SetFinancialRateLimiter are called at startup.
+
+      Sender-to-coordinator encryption is opt-in. When enabled (sealedTransport
+      middleware, sender_encryption.go), request bodies are decrypted with the
+      coordinator's long-lived X25519 key and a body cap of 16 MB is enforced. Plaintext
+      inference endpoints (chat/completions, completions, messages) call io.ReadAll on
+      r.Body with no MaxBytesReader wrapper.
+
+      HTTP server config (cmd/coordinator/main.go): ReadTimeout=10s, WriteTimeout=0
+      (streaming), IdleTimeout=120s. No ReadHeaderTimeout and no MaxHeaderBytes are set.
+    current_limitations:
+      - "API key validation uses a simple store lookup — not constant-time comparison.
+        Allows timing attacks to enumerate valid key prefixes (server.go:1216)."
+      - "No body size limit on plaintext inference endpoints (consumer.go:526, 2359).
+        An authenticated consumer can send arbitrarily large bodies to exhaust coordinator
+        memory."
+      - "ReadHeaderTimeout and MaxHeaderBytes are absent from the HTTP server config,
+        leaving the server exposed to slow-header attacks (cmd/coordinator/main.go:496)."
+      - "WriteTimeout=0 combined with unbounded body reads enables slow-read DoS on
+        inference endpoints."
+      - "Consumer rate limiter defaults to nil (unlimited) unless explicitly configured
+        at deploy time. No IP-level rate limiting exists."
+      - "POST /v1/device/code and POST /v1/device/token have no rate limits, enabling
+        device code enumeration and provider token brute force (device_auth.go)."
+      - "Device codes are not consumed atomically on first token exchange; the approved
+        code can be polled multiple times to mint multiple provider tokens (device_auth.go:99-158)."
+      - "Error responses distinguish 'not found' (404) from 'expired' (410) on device
+        token polling, leaking information about code lifecycle (device_auth.go:111-117)."
 
   - id: TB-002
     name: coordinator_to_provider_websocket
     description: >
-      Outbound WebSocket connection from provider to coordinator. The provider
-      authenticates via a coordinator-issued provider token and presents an attestation
-      blob. Before attestation is verified the provider is untrusted.
+      Providers open an outbound WebSocket to the coordinator. The coordinator upgrades
+      the connection, receives a RegisterMessage, and runs attestation verification.
+      Critically, providers are added to the active registry before attestation completes;
+      verification is asynchronous. The coordinator is trusted; providers are adversarial
+      until fully attested.
+    how_it_works: >
+      The WebSocket upgrade (provider.go:94) uses InsecureSkipVerify: true — no origin
+      validation. A hard 10 MB per-message read limit is applied (line 106). No
+      pre-authentication, rate limiting, or connection limit exists before the upgrade.
+
+      On receiving a RegisterMessage the coordinator immediately calls registry.Register()
+      (line 166) which adds the provider to the active registry. Attestation verification
+      runs asynchronously after this. Registration validates: TPS values clamped to hard
+      limits; hardware memory clamped to 0–1024 GB; models filtered against the catalog;
+      X25519 public key decoded and checked for 32-byte length.
+
+      Binary hash policy: if a policy is configured, the hash in the attestation must
+      match a registered blessed hash or the provider is marked untrusted — but it
+      remains in the registry. If no policy is configured, any binary passes. Weight
+      hash enforcement is fail-open: omitting weight_hash never fails admission.
+
+      The private-text routing gate (registry.go:169–197) requires 11 flags to all be
+      true simultaneously: PublicKey present, backend in {inprocess-mlx, mlx-swift},
+      EncryptedResponseChunks, RuntimeManifestChecked, ChallengeVerifiedSIP, and six
+      PrivacyCapabilities fields. ChallengeVerifiedSIP is set by the coordinator after
+      receiving a challenge response — not trusted from the provider.
+
+      Challenge-response runs immediately after registration and then every 5 minutes.
+      The coordinator generates a 32-byte cryptographically random nonce, stores it in
+      a one-time-use tracker (deleted on first response), and waits 30 seconds. The
+      provider signs (nonce + timestamp) with the SE P-256 key; the coordinator verifies
+      the ECDSA signature against the registered public key. Three consecutive failures
+      mark the provider permanently untrusted; SIP=false or SecureBoot=false in any
+      response triggers immediate untrust without the 3-strike rule.
+
+      Status fields (SIPEnabled, BinaryHash, ActiveModelHash, etc.) may optionally be
+      covered by a separate status_signature over a canonical JSON payload. For providers
+      that omit status_signature, negative reports (SIP=false) are still acted on
+      immediately, but positive reports are treated as advisory only.
+    current_limitations:
+      - "No pre-authentication rate limiting or per-IP connection caps before WebSocket
+        upgrade. Any client can open arbitrary connections and attempt registration
+        (provider.go:94–106, SEC-034)."
+      - "Provider is added to the active registry before attestation verification
+        completes. There is an async window where a provider with an invalid attestation
+        is technically registered (provider.go:166 vs async verify)."
+      - "Weight hash enforcement is fail-open: a provider can omit weight_hash entirely
+        and still be admitted, even for models with a known expected hash in the catalog
+        (registry.go:785–792, SEC-007)."
+      - "status_signature is optional for pre-v0.3.11 providers. Positive status claims
+        (SIP=true, BinaryHash=X) are not cryptographically bound for older providers,
+        creating a rollout window where a compromised OS can echo a valid nonce while
+        lying about its security posture (provider.go:573–606)."
+      - "WebSocket frames after registration are not individually authenticated. Trust
+        for the session is based entirely on the connection identity established at
+        registration."
+      - "Python-specific privacy flags (pythonRuntimeLocked, dangerousModulesBlocked)
+        are required by the routing gate but Swift providers always report them as false,
+        excluding Swift providers from private-text routing (registry.go:169–197,
+        provider-swift/ProviderLoop.swift:274, SEC-017)."
+      - "10 MB per-message cap is global with no per-provider send/receive quota."
 
   - id: TB-003
     name: provider_operator_vs_process
     description: >
-      The human operator who owns and administers the Mac has full OS-level access:
-      filesystem, process list, network. The darkbloom process must remain secure
-      against this adversary through SIP, Hardened Runtime, SE hardware, and
-      code-signing enforcement.
+      The human operator who owns the Mac has full OS-level access: filesystem, process
+      list, network interfaces. The darkbloom process must remain secure against this
+      adversary. The design assumes SIP and Hardened Runtime are active (enforced at
+      startup and via 5-minute coordinator challenges). The Secure Enclave provides a
+      hardware boundary that even the operator cannot cross.
+    how_it_works: >
+      PT_DENY_ATTACH is applied at process startup via a raw ptrace(PT_DENY_ATTACH, 0,
+      nil, 0) syscall (AntiDebug.swift). While SIP is active this blocks debugger
+      attachment even from root. On EPERM (already set) the error is treated as
+      non-fatal and a P_TRACED sysctl check is used as a belt-and-suspenders fallback.
+
+      SIP is checked once at startup by spawning /usr/bin/csrutil status and parsing for
+      "enabled" (SecurityHardening.swift:70–97). If disabled the process aborts. The
+      check is not repeated after startup; it is sound because disabling SIP requires a
+      reboot into Recovery Mode which kills the process and purges inference data.
+
+      The binary is SHA-256 hashed at startup via _NSGetExecutablePath() with symlink
+      resolution, read in 64 KB chunks (BinaryHasher.swift). The hash is included in the
+      SE-signed attestation blob and verified by the coordinator against its registry of
+      blessed hashes. The hash is computed once at startup and not re-verified at runtime.
+
+      The SE P-256 signing key is generated fresh on every process launch using
+      CryptoKit's SecureEnclave.P256.Signing.PrivateKey() (SecureEnclaveIdentity.swift).
+      The private key never leaves the Secure Enclave silicon. Only signing operations
+      are possible via the CryptoKit API.
+
+      The X25519 encryption key pair is generated ephemerally in memory using libsodium
+      (NodeKeyPair.swift). It is NOT persisted to disk. Legacy on-disk key paths
+      (~/.darkbloom/node_key and equivalents) are actively purged via purgeLegacyFiles()
+      on startup. The secret key exists only in process memory, protected by Hardened
+      Runtime (kernel denies task_for_pid).
+
+      The provider config file (~/.config/darkbloom/provider.toml) stores only
+      operational settings (coordinator URL, backend port, idle timeout, model list).
+      It contains no cryptographic secrets. Core dumps are disabled (RLIMIT_CORE=0).
+      Memory wiping functions (secureZero via memset_s) are defined in
+      SecurityHardening.swift but call-site coverage in the inference path is not
+      confirmed from static analysis.
+    current_limitations:
+      - "Binary hash is computed once at startup. A binary modification after the hash
+        is captured (e.g. via a writable path the binary was loaded from) would not be
+        detected until the next coordinator challenge (BinaryHasher.swift)."
+      - "SIP check is single-shot at startup. This is sound given the Recovery Mode
+        reboot requirement, but there is no in-process re-verification between coordinator
+        challenges."
+      - "secureZero* (memset_s) functions are defined but their invocation in the actual
+        inference data path (decrypted prompt buffers, KV-cache tensors) is not confirmed
+        by static analysis of SecurityHardening.swift."
+      - "GPU-side MLX buffers (Metal) are not explicitly zeroed between requests.
+        Residual prompt tokens and KV-cache data may persist in GPU memory until
+        overwritten by the next batch."
+      - "PT_DENY_ATTACH EPERM is treated as non-fatal; a narrow race window exists on
+        very fast process restart where a debugger could attach before the syscall fires
+        (AntiDebug.swift)."
+      - "The operator can read and replace model weight files at
+        ~/.cache/huggingface. The coordinator's weight hash check is currently fail-open
+        (SEC-007), so a substituted model may be served without detection."
 
   - id: TB-004
     name: browser_to_coordinator
     description: >
-      The console-ui Next.js frontend running in a browser, plus its server-side API
-      routes (BFF) that proxy coordinator calls. Threats here involve client-side
-      secrets, XSS, and SSRF through the BFF.
+      The console-ui Next.js frontend runs in the browser and communicates with the
+      coordinator through server-side API routes (BFF). Secrets stored in localStorage
+      and the BFF's willingness to accept a client-supplied coordinator URL are the
+      primary attack surfaces.
+    how_it_works: >
+      The coordinator API key is stored in localStorage as darkbloom_api_key in
+      plaintext (useAuth.ts:7). On first Privy login the key is auto-provisioned via
+      /api/auth/keys and persisted. The Privy JWT is managed by the Privy SDK in its
+      own storage. The coordinator URL is stored in darkbloom_coordinator_url but is
+      explicitly cleared on login (useAuth.ts:112) to prevent a pre-injection attack
+      where an attacker pre-loads a malicious coordinator URL before the victim logs in.
+
+      On logout (useAuth.ts:117–122) the following are cleared: darkbloom_api_key,
+      eigeninference_api_key (legacy), darkbloom_coordinator_url, and the Privy session.
+      The Zustand chat store, persisted to localStorage under darkbloom-store
+      (store.ts:164–174), is NOT cleared on logout. Chat history and prior messages
+      remain readable in localStorage after logout.
+
+      Sender-to-coordinator encryption is controlled by a localStorage boolean flag
+      (darkbloom_encrypt_to_coordinator, encryption.ts:18), defaulting to false. When
+      enabled, each request uses a fresh ephemeral X25519 keypair and XSalsa20-Poly1305.
+      If encryption setup fails the request hard-fails with a user-facing error; there
+      is no silent plaintext fallback at the browser layer.
+
+      Several Next.js BFF routes read the coordinator URL from the x-coordinator-url
+      request header and use it for server-side fetches, forwarding Privy tokens or API
+      keys to that origin (payments/stripe/checkout/route.ts:10, and four other payment
+      routes, telemetry/route.ts:14). The inference and auth routes use the hardcoded
+      NEXT_PUBLIC_COORDINATOR_URL environment variable and do not accept a
+      client-supplied URL.
+
+      next.config.ts contains only TypeScript build settings (ignoreBuildErrors: true).
+      No security headers (CSP, X-Frame-Options, HSTS, Referrer-Policy, Permissions-Policy)
+      are configured at the application layer.
+    current_limitations:
+      - "Chat history (Zustand store) is persisted to localStorage and not cleared on
+        logout. A subsequent user of the same browser can read prior session prompts and
+        responses (store.ts:164–174, SEC-024)."
+      - "Five Next.js BFF routes accept x-coordinator-url from the client request header
+        and use it for authenticated server-side fetches. This is a server-side request
+        forgery primitive: an attacker with XSS, a malicious extension, or access to the
+        same browser session can redirect payment and telemetry calls — including
+        forwarded auth credentials — to an attacker-controlled host
+        (payments/stripe/checkout/route.ts:10, SEC-001, SEC-002)."
+      - "No Content-Security-Policy, X-Frame-Options, HSTS, or Referrer-Policy headers
+        are configured at the application layer. XSS impact is unrestricted (next.config.ts,
+        SEC-014)."
+      - "Sender-to-coordinator encryption is opt-in and defaults off. The product UI
+        claims all prompts are E2E encrypted, but the coordinator leg is unprotected in
+        the default configuration (encryption.ts:12, api.ts:299, SEC-015)."
+      - "next.config.ts sets ignoreBuildErrors: true, allowing TypeScript errors to be
+        silently ignored at build time, potentially masking type-safety regressions in
+        security-sensitive code paths."
+      - "Long-lived API keys in localStorage are not re-bound to the current Privy
+        identity. A leaked key remains valid until explicitly revoked (SEC-003)."
 
   - id: TB-005
     name: coordinator_to_apple_mdm_mda
     description: >
-      The coordinator's trust ingress from Apple's MDM/MDA services: MicroMDM webhook
-      callbacks carrying SecurityInfo and DevicePropertiesAttestation results, and
-      verification of the Apple Enterprise Attestation Root CA cert chain.
+      The coordinator upgrades providers from self-signed to hardware trust level by
+      independently querying Apple's MDM and MDA services. MicroMDM sends SecurityInfo
+      data to the coordinator via an inbound webhook. The coordinator also sends an SE
+      public key hash as a nonce to Apple and receives back a DER-encoded certificate
+      chain signed by Apple's Enterprise Attestation Root CA.
+    how_it_works: >
+      MDM webhook (server.go:876–887, POST /v1/mdm/webhook): the handler calls
+      io.ReadAll(r.Body) with no size limit and passes the raw bytes to
+      mdmClient.HandleWebhook(). There is no signature verification, no shared secret,
+      no IP allowlist, and no command UUID correlation. The webhook is completely
+      unauthenticated. MicroMDM credentials are used only for outbound API calls to
+      MicroMDM, not to authenticate inbound callbacks.
+
+      When a provider registers, the coordinator asynchronously sends a SecurityInfo MDM
+      command to the enrolled device (mdm.go:155–183), then waits up to 30 seconds for
+      the webhook response via a buffered channel (mdm.go:373–390). The webhook parses
+      SecurityInfo fields from the plist response: SIPEnabled, SecureBootLevel,
+      AuthenticatedRootVolumeEnabled, IsRecoveryLockEnabled, FirewaultEnabled.
+      These are cross-checked against the provider's self-reported attestation values.
+      A match on SIPEnabled and SecureBoot triggers async promotion to TrustHardware
+      (provider.go:1398).
+
+      MDA verification (provider.go:1419–1539): the coordinator computes
+      sha256(SE_public_key_bytes) and sends this as a nonce to Apple via
+      SendDeviceAttestationCommand(). Apple returns a plist containing DER-encoded
+      certificate chain entries. The coordinator parses the chain, verifies it against
+      the embedded Apple Enterprise Attestation Root CA (P-384, valid 2022–2047) using
+      Go's standard x509.Verify() with ExtKeyUsageAny. Custom OIDs are extracted from
+      the leaf certificate: device serial number (1.2.840.113635.100.8.9.1), UDID
+      (.8.9.2), OS version (.8.10.1), SepOS version (.8.10.2), Secure Boot level
+      (.8.13.2), and freshness code (.8.11.1). The freshness code is compared against
+      sha256(SE_public_key_bytes) byte-for-byte (provider.go:1502–1504).
+
+      The SE attestation blob (attestation.go:127–231) is a JSON structure
+      containing: SE public key (raw 64-byte P-256 X||Y in base64), hardware info, SIP
+      and SecureBoot state, X25519 encryption public key, binary hash, system volume
+      hash, serial number, and an RFC3339 timestamp. It is signed with SE P-256 ECDSA
+      (DER). The coordinator SHA-256 hashes the canonical sorted JSON bytes and verifies
+      the signature with ecdsa.Verify(). Three mandatory checks always run: SE must be
+      available, SIP must be enabled, SecureBoot must be enabled. ARV status is parsed
+      but not enforced (informational). RDMA status is informational only.
+    current_limitations:
+      - "The MDM webhook is completely unauthenticated. Any party that can reach
+        POST /v1/mdm/webhook can inject arbitrary SecurityInfo or
+        DevicePropertiesAttestation payloads and trigger trust upgrades without genuine
+        MDM enrollment (server.go:876–887, SEC-004)."
+      - "No body size limit on the MDM webhook endpoint. io.ReadAll(r.Body) with no
+        MaxBytesReader allows a DoS via oversized plist payloads (SEC-004)."
+      - "No MDM command UUID correlation: the webhook response is not bound to a specific
+        outbound command. A replay of any old SecurityInfo webhook response for the same
+        UDID would be accepted."
+      - "The MDA freshness code is sha256(SE_public_key_bytes). The SE public key is
+        publicly visible in the provider's attestation blob. An attacker who captures the
+        attestation can pre-compute the expected freshness code, potentially forging a
+        cert with a matching OID value."
+      - "No OCSP/CRL checks on the Apple MDA certificate chain. A revoked Apple
+        intermediate CA would be accepted until the embedded root is manually updated."
+      - "x509.Verify() is called with ExtKeyUsageAny, which does not enforce leaf or
+        intermediate key usage extensions (mda.go:132)."
+      - "ARV (Authenticated Root Volume) and RDMA status are parsed from attestation and
+        MDM data but explicitly not enforced by the trust state machine — old provider
+        versions omit these fields."
+      - "MDM verification and MDA verification are asynchronous. A provider is routable
+        at TrustSelfSigned while both checks are pending, before any independent Apple
+        verification has completed."
 
   - id: TB-006
     name: admin_to_coordinator
     description: >
-      Admin-level API surface (/v1/admin/*, /v1/releases POST). Gated by a separate
-      admin API key. Controls release registration, binary hash registry, trust-level
-      overrides, and provider management.
+      A distinct admin API surface controls release registration, binary hash registry,
+      trust-level overrides, provider management, and platform configuration. It is gated
+      by a separate admin key (constant-time compared) and by Privy admin email
+      membership. The release key is a narrower credential for GitHub Actions that can
+      only POST /v1/releases.
+    how_it_works: >
+      isAdminAuthorized() (release_handlers.go:186–203) first checks the admin key
+      using subtle.ConstantTimeCompare(). If that fails it checks whether the Privy
+      JWT user is in the configured admin email list. Admin key requests bypass the
+      consumer and financial rate limiters entirely (the accountID is set to "admin"
+      which hits no rate limit bucket). No per-admin audit log is emitted; all admin
+      actions share the same "admin" identity in logs.
+
+      The release key (release_handlers.go:16–22) is a separate secret checked with
+      plain string equality (== operator), NOT subtle.ConstantTimeCompare(). It controls
+      POST /v1/releases, which registers a new release, syncs binary hashes into the
+      provider registry gate, and invalidates caches. After registration the cache key
+      invalidated is latest_release:v1, but the actual per-platform cache key used for
+      lookups is latest_release:v1:<platform> (SEC-021). This means installers and
+      auto-updaters may continue receiving stale release metadata from the per-platform
+      cache after a new release is registered or an old one is deactivated.
+
+      The device auth flow (device_auth.go) has no rate limits on POST /v1/device/code
+      (generates device codes) or POST /v1/device/token (polls for tokens). Approved
+      device codes are not atomically consumed on first token exchange; any holder of
+      the device code can continue polling and minting provider tokens during the 15-minute
+      validity window.
+
+      Admin OTP endpoints (POST /v1/admin/otp/init and /v1/admin/otp/verify) are
+      unauthenticated and not rate-limited, creating a spam and brute-force surface
+      (release_handlers.go:205–221).
+    current_limitations:
+      - "The release key is compared with plain string equality, not constant-time
+        comparison. A timing attack can enumerate key bytes (release_handlers.go:19,
+        SEC-009)."
+      - "Cache invalidation on release registration and deletion targets the wrong key
+        (latest_release:v1 instead of latest_release:v1:<platform>). Installers and
+        providers on a specific platform may see stale release metadata for up to 1 minute
+        after a security-critical release update (release_handlers.go:88, SEC-021)."
+      - "Admin key bypasses all rate limiters. A compromised admin key has unconstrained
+        API throughput (server.go:1318)."
+      - "A single shared admin key means all admin actions are attributed to the same
+        identity. Individual admin revocation is not possible without rotating the single
+        key (server.go:1209)."
+      - "No alerting or audit log entry on release registration, binary hash sync, or
+        admin trust-level overrides. Malicious registration would be silent."
+      - "Admin OTP endpoints are unauthenticated and unrate-limited (SEC-028)."
+      - "Device codes are not atomically consumed on first token exchange, allowing
+        multiple provider tokens to be minted from one approved code (device_auth.go:99–158,
+        SEC-011)."
 
   - id: TB-007
     name: provider_inference_engine
     description: >
-      The in-process MLX inference engine (mlx-swift-lm) running inside the darkbloom
-      process on the provider's GPU. The inference engine operates on decrypted prompt
-      data; isolation from the OS and operator is provided by the process boundary,
-      Hardened Runtime, and memory wiping.
+      The in-process MLX inference engine (mlx-swift-lm) executes inside the darkbloom
+      process on the provider's Apple Silicon GPU. Decrypted prompt data is present in
+      process memory during inference. Isolation from the OS and operator is provided by
+      the process boundary, Hardened Runtime, and memory wiping. The inference engine
+      is the innermost trust boundary — a failure here directly exposes consumer data.
+    how_it_works: >
+      The BatchScheduler actor (BatchScheduler.swift) manages concurrent inference with
+      a configurable maxConcurrentRequests (default 4). All concurrent requests share
+      a single BatchGenerator for continuous batching. Requests waiting more than 120
+      seconds in the pending queue are evicted with an error. The scheduler tracks active
+      requests by UID in an actor-protected dictionary.
+
+      Model weights are loaded from the HuggingFace cache directory
+      (~/.cache/huggingface) via ModelScanner.resolveLocalPath(). Weight integrity is
+      verified by WeightHasher: all weight files (*.safetensors, *.npz, *.bin),
+      config.json, and tokenizer files are sorted lexicographically, SHA-256 hashed
+      individually in parallel, and the per-file digests are concatenated then hashed
+      again to produce a single root hash. This hash is advertised to the coordinator at
+      registration and in heartbeats. The coordinator's enforcement of this hash is
+      currently fail-open (SEC-007).
+
+      Cancellation is managed via InferenceCancellationToken (NSLock-protected boolean).
+      The token is checked between token generation steps in the streaming loop
+      (ProviderLoop.swift:470). When cancelled the provider sends an inference_error
+      response and stops generation. An active GPU forward pass is not interrupted —
+      cancellation is checked only at the Swift layer between MLX calls.
+
+      Response encryption uses the consumer's ephemeral X25519 public key (from the
+      inference request) via NaCl crypto_box (XSalsa20-Poly1305). If encryption throws
+      an exception the catch block logs a warning and encryptedPayload remains nil. The
+      chunk message is then sent with plaintext data in the data field and nil
+      encryptedData (ProviderLoop.swift:436–451). The coordinator currently rejects
+      plaintext chunks and marks the provider untrusted, but this is a coordinator-side
+      defence, not a provider-side fail-closed.
+
+      Idle timeout is managed by IdleTimeoutPolicy: shouldUnload() requires the model
+      to be loaded, no in-flight requests, and elapsed time >= timeout. The monitor
+      polls every 60 seconds (ProviderLoop.swift:622). On unload, model, tokenizer,
+      and generator references are set to nil (BatchScheduler.swift:366–369) and Swift
+      ARC releases the objects; MLX GPU memory reclamation is implicit and non-deterministic.
+
+      GPU memory metrics (MLX.GPU.activeMemory, peakMemory, cacheMemory) are tracked
+      and reported but not explicitly zeroed between requests. There is no Metal-level
+      memset of GPU buffers between inference sessions.
+    current_limitations:
+      - "Response encryption failure falls back to plaintext SSE chunks rather than
+        terminating the request with an error (ProviderLoop.swift:436–451, SEC-016).
+        Provider-side fix requires sending inference_error instead of populating the
+        plaintext data field."
+      - "GPU-side MLX buffers (Metal allocations for activations, KV-cache, logits) are
+        not explicitly zeroed between requests. Residual inference data from one consumer
+        may be readable by a subsequent consumer's batch if MLX reuses allocations."
+      - "Cancellation does not interrupt an active GPU forward pass. The MLX computation
+        continues to completion before the Swift cancellation check fires, wasting
+        provider resources and delaying billing reconciliation."
+      - "The idle timeout monitor polls every 60 seconds, meaning a model can remain
+        resident in GPU memory for up to 60 seconds beyond the configured timeout."
+      - "Weight hash enforcement is fail-open at the coordinator (SEC-007). An operator
+        who replaces model weight files will cause a hash mismatch in the next heartbeat,
+        but omitting the hash entirely passes both registration and challenges."
+      - "Model weight files are loaded from the user-writable HuggingFace cache directory.
+        The operator can replace weight files between idle periods without affecting the
+        currently-loaded model."
 
   - id: TB-008
     name: coordinator_to_payments
     description: >
-      Coordinator interactions with the Solana network (USDC deposits/withdrawals) and
-      Stripe (wired but inactive). Includes the internal ledger and Stripe webhook
-      ingress.
+      The coordinator manages an internal micro-USD ledger backed by PostgreSQL, accepts
+      Solana USDC deposits verified on-chain, and processes Stripe webhook events for
+      fiat top-ups. The Solana BIP39 wallet mnemonic is the highest-value secret in the
+      coordinator's environment.
+    how_it_works: >
+      Stripe webhook ingestion (billing_handlers.go:122–134): the body is read with a
+      1 MB limit (io.LimitReader). The Stripe-Signature header is verified using the
+      Stripe SDK's VerifyWebhookSignature before any processing. Idempotency is checked
+      by looking up the billing_session_id from the event metadata in the store and
+      returning 200 if status == "completed". The status check and the credit insertion
+      are not in a single database transaction; a concurrent duplicate webhook event can
+      pass the completed-session check before either marks it complete, resulting in
+      double credit (billing_handlers.go:158–180, SEC-012).
+
+      The idempotency key used is a custom billing_session_id stored in Stripe metadata,
+      not Stripe's own event.id. There is no unique database constraint on the
+      billing_session_id that would enforce at-most-once credit at the DB level.
+
+      The Solana wallet is derived from a BIP39 mnemonic via SLIP-0010
+      (m/44'/501'/0'/0'). The mnemonic is injected into the coordinator process at
+      startup from EigenCloud KMS environment variables. The coordinator runs inside an
+      AMD SEV-SNP Confidential VM, providing hardware-encrypted memory protection.
+
+      The legacy GET /v1/provider/earnings endpoint (consumer.go:2265–2270) returns
+      provider balance and payment history keyed by wallet address with no authentication
+      requirement.
+    current_limitations:
+      - "Stripe webhook idempotency is not atomic: the completed-session check and the
+        balance credit insertion are separate operations. Concurrent duplicate valid
+        webhooks can both pass the check before either commits, risking double credit
+        (billing_handlers.go:158–176, SEC-012)."
+      - "Idempotency uses a custom billing_session_id rather than Stripe's native
+        event.id. There is no unique database constraint enforcing at-most-once credit
+        at the storage layer."
+      - "GET /v1/provider/earnings is unauthenticated. Any party who knows or can guess
+        a provider's Solana wallet address can retrieve their full earnings history
+        (consumer.go:2265, SEC-030)."
+      - "No rate limiting on payment endpoints beyond the financial rate limiter, which
+        defaults to nil (unlimited) unless explicitly configured."
 
   - id: TB-009
     name: apple_attestation_chain
     description: >
-      Cross-cutting trust chain: SE key generation → attestation blob signing →
-      coordinator signature verification → MDM SecurityInfo cross-check → MDA cert
-      chain from Apple → challenge-response freshness. Any break invalidates the
-      hardware trust level guarantee.
+      The hardware trust guarantee rests on a chain: SE key generation → attestation
+      blob construction and SE signing → coordinator signature verification → MDM
+      SecurityInfo cross-check → MDA cert chain from Apple → ongoing challenge-response.
+      This boundary is cross-cutting; a weakness at any link collapses the trust level
+      of every provider in the field.
+    how_it_works: >
+      SE key lifecycle: CryptoKit generates a fresh SecureEnclave.P256.Signing.PrivateKey
+      on every darkbloom launch (SecureEnclaveIdentity.swift:56). The private key never
+      leaves the SE silicon. The public key (raw 64-byte X||Y, base64-encoded) is bound
+      to the X25519 encryption key in the attestation blob and in the coordinator
+      registration message.
+
+      Attestation blob: AttestationBuilder.swift constructs a JSON structure containing
+      hardware info, SIP/SecureBoot/ARV state, the SE public key, the X25519 encryption
+      public key, the binary SHA-256 hash, system volume hash, serial number, and an
+      RFC3339 timestamp. Keys are serialized in sorted order to match Go's
+      encoding/json field ordering. The blob is signed with SE P-256 ECDSA (DER-encoded).
+
+      Coordinator verification (attestation.go:127–231): the raw P-256 public key is
+      decoded (raw 65-byte uncompressed format), validated on the P-256 curve, then used
+      to verify the DER ECDSA signature over SHA-256(canonical_json_bytes). Three checks
+      are mandatory and will fail the attestation: SecureEnclave not available, SIP
+      disabled, SecureBoot disabled. ARV and RDMA are parsed and logged but not enforced.
+      A 30-second freshness window is checked separately by CheckTimestamp().
+
+      Challenge-response: every 5 minutes the coordinator generates a 32-byte random
+      nonce (base64), stores it in a one-time-use map keyed by nonce string, and sends
+      it with a UTC RFC3339 timestamp. The provider signs (nonce + timestamp) with the
+      SE key — raw string concatenation with no delimiter. The coordinator verifies the
+      ECDSA signature, checks nonce matches, and checks that SIPEnabled is not nil and
+      not false. SIP=false triggers immediate MarkUntrusted(); 3 consecutive timeouts or
+      signature failures trigger MarkUntrusted() via the 3-strike counter.
+
+      Status signature (attestation.go:378–437): an extended canonical JSON payload
+      covering nonce, timestamp, and all security status fields is signed separately.
+      VerifyStatusSignature() checks this signature. If the status_signature field is
+      absent, ErrStatusSignatureMissing is returned; the caller treats this as advisory
+      (not a failure) for compatibility with providers older than v0.3.11. Negative
+      status reports (SIP=false) are always acted on immediately regardless of whether
+      the status_signature is present.
+    current_limitations:
+      - "status_signature is optional for pre-v0.3.11 providers. A compromised provider
+        running OS-level code can report a valid (nonce, timestamp) signature from the
+        SE while reporting SIP=true in unsigned status fields, avoiding untrust during
+        the rollout window (provider.go:573–606)."
+      - "Nonce and timestamp are concatenated without a delimiter for the challenge
+        signature (nonce + timestamp). A crafted nonce ending with a partial timestamp
+        string could theoretically produce the same signed bytes as a different
+        (nonce, timestamp) pair, though in practice base64 nonces (44 chars) and RFC3339
+        timestamps are statistically non-overlapping."
+      - "MDA freshness code is sha256(SE_public_key_bytes). The SE public key is publicly
+        visible in the attestation blob returned by GET /v1/providers/attestation.
+        An attacker can pre-compute the expected freshness code for any known provider."
+      - "No OCSP or CRL checks on the Apple Enterprise Attestation Root CA chain. A
+        compromised or revoked Apple intermediate CA certificate would be accepted by the
+        coordinator until the embedded root CA is manually updated."
+      - "ARV (Authenticated Root Volume) status is parsed from both SE attestation and
+        MDA OIDs but is explicitly not enforced in the trust state machine. Providers
+        with a tampered system volume can still reach TrustHardware."
+      - "MDM webhook is unauthenticated (see TB-005). A forged SecurityInfo callback
+        can cause a provider to reach TrustHardware without genuine Apple MDM enrollment,
+        which is a prerequisite for the MDA step."
+      - "The entire MDM→MDA trust upgrade path is asynchronous and runs in a background
+        goroutine. A provider is routable at TrustSelfSigned during the window between
+        registration and completion of the full verification chain."
 
 # ─────────────────────────────────────────────────────────────
 # THREATS
