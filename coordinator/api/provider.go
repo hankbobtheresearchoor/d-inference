@@ -265,6 +265,7 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 					"version", regMsg.Version,
 					"min_version", s.minProviderVersion,
 				)
+				s.ddIncr("provider_version_below_minimum", []string{"gate:registration", "version:" + regMsg.Version})
 				provider.Mu().Lock()
 				provider.RuntimeVerified = false
 				provider.RuntimeManifestChecked = false
@@ -284,7 +285,7 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 
 		case protocol.TypeInferenceAccepted:
 			acceptMsg := msg.Payload.(*protocol.InferenceAcceptedMessage)
-			s.handleInferenceAccepted(providerID, provider, acceptMsg)
+			s.handleInferenceAccepted(provider, acceptMsg)
 
 		case protocol.TypeInferenceResponseChunk:
 			chunkMsg := msg.Payload.(*protocol.InferenceResponseChunkMessage)
@@ -475,7 +476,7 @@ func (s *Server) sendChallenge(ctx context.Context, conn *websocket.Conn, provid
 		tracker.remove(nonce)
 		return
 	}
-	s.ddIncr("attestation.challenges", []string{"outcome:sent"})
+	s.ddIncr("attestation.challenges_sent", nil)
 
 	s.logger.Debug("sent attestation challenge", "provider_id", providerID, "nonce", nonce[:8]+"...")
 
@@ -814,6 +815,7 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 			"version", version,
 			"min_version", s.minProviderVersion,
 		)
+		s.ddIncr("provider_version_below_minimum", []string{"gate:challenge_revalidation", "version:" + version})
 		provider.Mu().Lock()
 		provider.RuntimeVerified = false
 		provider.RuntimeManifestChecked = false
@@ -965,7 +967,7 @@ func (e *textChunkViolationError) Error() string {
 	return e.reason
 }
 
-func (s *Server) handleInferenceAccepted(providerID string, provider *registry.Provider, msg *protocol.InferenceAcceptedMessage) {
+func (s *Server) handleInferenceAccepted(provider *registry.Provider, msg *protocol.InferenceAcceptedMessage) {
 	if provider == nil {
 		return
 	}
@@ -1030,6 +1032,7 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 			"prompt_tokens", msg.Usage.PromptTokens,
 			"completion_tokens", msg.Usage.CompletionTokens,
 		)
+		s.ddIncr("billing.cost_clamped", []string{"model:" + pr.Model})
 		totalCost = pr.ReservedMicroUSD
 	}
 	providerPayout := payments.ProviderPayout(totalCost)
@@ -1041,10 +1044,13 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 	if pr.ReservedMicroUSD > 0 {
 		if totalCost < pr.ReservedMicroUSD {
 			refund := pr.ReservedMicroUSD - totalCost
+			start := time.Now()
 			_ = s.store.Credit(pr.ConsumerKey, refund, store.LedgerRefund, msg.RequestID)
+			s.ddHistogram("billing.settlement_refund_micro_usd", float64(refund), []string{"model:" + pr.Model})
+			s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:settlement_refund"})
 		}
 	} else {
-		// No reservation (billing not configured). Charge best-effort.
+		start := time.Now()
 		if err := s.ledger.Charge(pr.ConsumerKey, totalCost, msg.RequestID); err != nil {
 			s.logger.Warn("could not charge consumer (insufficient balance)",
 				"consumer_key", pr.ConsumerKey,
@@ -1052,6 +1058,7 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 				"error", err,
 			)
 		}
+		s.ddHistogram("store.debit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:charge"})
 	}
 
 	// Record usage entry — both in-memory (for current session) and persisted
@@ -1066,6 +1073,9 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 	})
 	s.store.RecordUsageWithCost(providerID, pr.ConsumerKey, pr.Model, msg.RequestID, msg.Usage.PromptTokens, msg.Usage.CompletionTokens, totalCost)
 	s.ddIncr("inference.completions", []string{"model:" + pr.Model})
+	s.ddCount("inference.prompt_tokens_total", int64(msg.Usage.PromptTokens), []string{"model:" + pr.Model})
+	s.ddHistogram("inference.prompt_tokens", float64(msg.Usage.PromptTokens), []string{"model:" + pr.Model})
+	s.ddCount("inference.completion_tokens_total", int64(msg.Usage.CompletionTokens), []string{"model:" + pr.Model})
 	s.ddHistogram("inference.completion_tokens", float64(msg.Usage.CompletionTokens), []string{"model:" + pr.Model})
 
 	// Credit the provider's pending payout.
@@ -1073,8 +1083,7 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 	// Otherwise, fall back to the provider's self-reported wallet address.
 	if p := s.registry.GetProvider(providerID); p != nil {
 		if p.AccountID != "" {
-			// Provider is linked to a Privy account — atomically credit the
-			// account and record the per-node earning in one store transaction.
+			start := time.Now()
 			if err := s.store.CreditProviderAccount(&store.ProviderEarning{
 				AccountID:        p.AccountID,
 				ProviderID:       providerID,
@@ -1093,8 +1102,10 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 					"error", err,
 				)
 			}
+			s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:provider_account_credit"})
+			s.ddCount("billing.provider_credits_micro_usd", providerPayout, []string{"model:" + pr.Model, "type:account"})
 		} else if p.WalletAddress != "" {
-			// Unlinked provider — atomically credit the wallet and record payout history.
+			start := time.Now()
 			if err := s.ledger.CreditProvider(p.WalletAddress, providerPayout, pr.Model, msg.RequestID); err != nil {
 				s.logger.Error("failed to credit provider wallet payout",
 					"provider_id", providerID,
@@ -1103,6 +1114,8 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 					"error", err,
 				)
 			}
+			s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:provider_wallet_credit"})
+			s.ddCount("billing.provider_credits_micro_usd", providerPayout, []string{"model:" + pr.Model, "type:wallet"})
 		}
 	}
 
@@ -1114,7 +1127,10 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 		if s.billing != nil && s.billing.Referral() != nil {
 			platformFee = s.billing.Referral().DistributeReferralReward(pr.ConsumerKey, platformFee, msg.RequestID)
 		}
+		start := time.Now()
 		_ = s.store.Credit("platform", platformFee, store.LedgerPlatformFee, msg.RequestID)
+		s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:platform_fee"})
+		s.ddCount("billing.platform_fees_micro_usd", platformFee, []string{"model:" + pr.Model})
 	}
 
 	// Signal completion to the consumer response handler. This must happen

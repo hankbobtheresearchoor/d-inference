@@ -595,11 +595,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if s.billing != nil {
 		consumerKey := consumerKeyFromContext(r.Context())
 		reservedMicroUSD = s.reservationCost(model, estimatedPromptTokens, requestedMaxTokens)
+		start := time.Now()
 		if err := s.ledger.Charge(consumerKey, reservedMicroUSD, "reserve:"+consumerKey); err != nil {
 			writeJSON(w, http.StatusPaymentRequired, errorResponse("insufficient_funds",
 				"your balance is too low for this request — add funds at /billing or lower max_tokens", withCode("insufficient_quota")))
 			return
 		}
+		s.ddHistogram("billing.reserved_micro_usd", float64(reservedMicroUSD), []string{"model:" + model})
+		s.ddHistogram("store.debit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:reserve"})
 	}
 	timing.ReservedAt = time.Now()
 
@@ -607,7 +610,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	refundReservation := func() {
 		if reservedMicroUSD > 0 {
 			consumerKey := consumerKeyFromContext(r.Context())
+			start := time.Now()
 			_ = s.store.Credit(consumerKey, reservedMicroUSD, store.LedgerRefund, "reservation_refund")
+			s.ddIncr("billing.reservation_refunds", []string{"model:" + model})
+			s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:reservation_refund"})
 		}
 	}
 
@@ -678,7 +684,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 					// "fleet over-subscribed for this model size".
 					outcome = "over_capacity"
 				}
-				s.ddIncr("routing.decisions", []string{"model:" + model, "outcome:" + outcome})
+				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:" + outcome})
 				break
 			}
 			// No idle provider — try queueing.
@@ -690,12 +696,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			pr.Timing.QueuedAt = time.Now()
 			if err := s.registry.Queue().Enqueue(queuedReq); err != nil {
-				s.ddIncr("routing.decisions", []string{"model:" + model, "outcome:over_capacity"})
+				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:over_capacity"})
 				refundReservation()
 				writeJSON(w, http.StatusServiceUnavailable, errorResponse("model_not_available", fmt.Sprintf("no hardware-trusted provider available for model %q and queue is full", model)))
 				return
 			}
-			s.ddIncr("routing.decisions", []string{"model:" + model, "outcome:queued"})
+			s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:queued"})
 
 			s.logger.Info("request queued, waiting for provider",
 				"model", model,
@@ -710,7 +716,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				refundReservation()
-				s.ddIncr("request_queue.timeout", []string{"model:" + model})
+				s.ddIncr("request_queue.timeout", []string{"model:" + model, "model_type:" + s.registry.ModelType(model)})
 				writeJSON(w, http.StatusServiceUnavailable, errorResponse("model_not_available", fmt.Sprintf("no hardware-trusted provider became available for model %q (queue timeout)", model)))
 				return
 			}
@@ -719,7 +725,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		timing.RoutedAt = time.Now()
 		s.ddIncr("routing.decisions", []string{"model:" + model, "outcome:selected"})
 		s.ddIncr("routing.provider_selected", []string{"provider_id:" + provider.ID, "model:" + model})
-		s.ddHistogram("routing.cost_ms", decision.CostMs, []string{"model:" + model})
+		s.ddHistogram("routing.cost_ms", decision.CostMs, []string{"model:" + model, "provider_id:" + provider.ID})
 		if decision.EffectiveTPS > 0 {
 			s.ddGauge("routing.effective_decode_tps", decision.EffectiveTPS, []string{"provider_id:" + provider.ID})
 		}
@@ -839,7 +845,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"attempt", attempt+1,
 				"error", errMsg.Error,
 			)
-			s.emitRequest(r.Context(), protocol.SeverityWarn, protocol.KindInferenceError, requestID,
+			s.emitRequest(r.Context(), protocol.SeverityWarn, requestID,
 				"provider failed, retrying",
 				map[string]any{
 					"provider_id": provider.ID,
@@ -875,7 +881,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"provider_id", provider.ID,
 				"attempt", attempt+1,
 			)
-			s.emitRequest(r.Context(), protocol.SeverityWarn, protocol.KindInferenceError, requestID,
+			s.emitRequest(r.Context(), protocol.SeverityWarn, requestID,
 				"provider first-chunk timeout",
 				map[string]any{
 					"provider_id": provider.ID,
@@ -924,7 +930,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 							"attempt", attempt+1,
 							"error", errMsg.Error,
 						)
-						s.emitRequest(r.Context(), protocol.SeverityWarn, protocol.KindInferenceError, requestID,
+						s.emitRequest(r.Context(), protocol.SeverityWarn, requestID,
 							"provider failed after accepting request, retrying",
 							map[string]any{
 								"provider_id": provider.ID,
@@ -956,7 +962,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 					"attempt", attempt+1,
 					"error", errMsg.Error,
 				)
-				s.emitRequest(r.Context(), protocol.SeverityWarn, protocol.KindInferenceError, requestID,
+				s.emitRequest(r.Context(), protocol.SeverityWarn, requestID,
 					"provider failed after accepting request, retrying",
 					map[string]any{
 						"provider_id": provider.ID,
@@ -983,7 +989,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 					"provider_id", provider.ID,
 					"attempt", attempt+1,
 				)
-				s.emitRequest(r.Context(), protocol.SeverityWarn, protocol.KindInferenceError, requestID,
+				s.emitRequest(r.Context(), protocol.SeverityWarn, requestID,
 					"provider accepted timeout",
 					map[string]any{
 						"provider_id": provider.ID,
@@ -1015,7 +1021,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if statusCode == 0 {
 			statusCode = http.StatusServiceUnavailable
 		}
-		s.emitRequest(r.Context(), protocol.SeverityError, protocol.KindInferenceError, requestID,
+		s.emitRequest(r.Context(), protocol.SeverityError, requestID,
 			fmt.Sprintf("inference failed after %d attempt(s)", maxDispatchAttempts),
 			map[string]any{
 				"reason":      "dispatch_exhausted",
@@ -2223,7 +2229,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	const cacheKey = "api_version:v1"
 	if cached, ok := s.readCache.Get(cacheKey); ok {
-		writeCachedJSON(w, http.StatusOK, cached)
+		writeCachedJSON(w, cached)
 		return
 	}
 
@@ -2258,7 +2264,7 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.readCache.Set(cacheKey, body, time.Minute)
-	writeCachedJSON(w, http.StatusOK, body)
+	writeCachedJSON(w, body)
 }
 
 // --- payment handlers ---
@@ -2457,16 +2463,21 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	var reservedMicroUSD int64
 	if s.billing != nil {
 		reservedMicroUSD = s.reservationCost(model, estimatedPromptTokens, requestedMaxTokens)
+		start := time.Now()
 		if err := s.ledger.Charge(consumerKey, reservedMicroUSD, "reserve:"+consumerKey); err != nil {
 			writeJSON(w, http.StatusPaymentRequired, errorResponse("insufficient_funds",
 				"your balance is too low for this request — add funds at /billing or lower max_tokens", withCode("insufficient_quota")))
 			return
 		}
+		s.ddHistogram("billing.reserved_micro_usd", float64(reservedMicroUSD), []string{"model:" + model})
+		s.ddHistogram("store.debit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:reserve"})
 	}
-	// Refund the reservation on any early failure before dispatch.
 	refundReservation := func() {
 		if reservedMicroUSD > 0 {
+			start := time.Now()
 			_ = s.store.Credit(consumerKey, reservedMicroUSD, store.LedgerRefund, "reservation_refund")
+			s.ddIncr("billing.reservation_refunds", []string{"model:" + model})
+			s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:reservation_refund"})
 		}
 	}
 
@@ -2494,12 +2505,12 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		}
 		if err := s.registry.Queue().Enqueue(queuedReq); err != nil {
 			refundReservation()
-			s.ddIncr("routing.decisions", []string{"model:" + model, "outcome:over_capacity"})
+			s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:over_capacity"})
 			writeJSON(w, http.StatusServiceUnavailable, errorResponse("model_not_available",
 				fmt.Sprintf("no provider available for model %q", model)))
 			return
 		}
-		s.ddIncr("routing.decisions", []string{"model:" + model, "outcome:queued"})
+		s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:queued"})
 		provider, err = s.registry.Queue().WaitForProviderContext(r.Context(), queuedReq)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -2513,9 +2524,9 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		}
 		decision = queuedReq.Decision
 	}
-	s.ddIncr("routing.decisions", []string{"model:" + model, "outcome:selected"})
+	s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:selected"})
 	s.ddIncr("routing.provider_selected", []string{"provider_id:" + provider.ID, "model:" + model})
-	s.ddHistogram("routing.cost_ms", decision.CostMs, []string{"model:" + model})
+	s.ddHistogram("routing.cost_ms", decision.CostMs, []string{"model:" + model, "provider_id:" + provider.ID})
 	if decision.EffectiveTPS > 0 {
 		s.ddGauge("routing.effective_decode_tps", decision.EffectiveTPS, []string{"provider_id:" + provider.ID})
 	}

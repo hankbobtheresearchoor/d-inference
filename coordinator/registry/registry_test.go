@@ -171,6 +171,67 @@ func TestProviderWithoutChallengeVerifiedSIPExcluded(t *testing.T) {
 	}
 }
 
+func TestSwiftProviderPrivateTextWithoutPythonCaps(t *testing.T) {
+	reg := New(testLogger())
+	msg := testRegisterMessage()
+	msg.Backend = BackendMLXSwift
+	msg.PrivacyCapabilities.PythonRuntimeLocked = false
+	msg.PrivacyCapabilities.DangerousModulesBlocked = false
+
+	p := reg.Register("p-swift-nopython", nil, msg)
+	testMakeTextRoutable(p)
+
+	if !providerSupportsPrivateTextLocked(p) {
+		t.Fatal("Swift provider should support private text without PythonRuntimeLocked/DangerousModulesBlocked")
+	}
+
+	found := reg.FindProvider("mlx-community/Qwen3.5-9B-Instruct-4bit")
+	if found == nil {
+		t.Fatal("Swift provider without Python caps should be routable for text models")
+	}
+}
+
+func TestPythonProviderRequiresPythonCaps(t *testing.T) {
+	reg := New(testLogger())
+	msg := testRegisterMessage()
+	msg.Backend = BackendInprocessMLX
+	msg.PrivacyCapabilities.PythonRuntimeLocked = false
+	msg.PrivacyCapabilities.DangerousModulesBlocked = false
+
+	p := reg.Register("p-python-nocaps", nil, msg)
+	testMakeTextRoutable(p)
+
+	if providerSupportsPrivateTextLocked(p) {
+		t.Fatal("Python (inprocess-mlx) provider without PythonRuntimeLocked/DangerousModulesBlocked should NOT support private text")
+	}
+
+	found := reg.FindProvider("mlx-community/Qwen3.5-9B-Instruct-4bit")
+	if found != nil {
+		t.Fatal("Python provider without Python caps should not be routable for text models")
+	}
+}
+
+func TestSwiftProviderMissingBaseCapsExcluded(t *testing.T) {
+	reg := New(testLogger())
+	msg := testRegisterMessage()
+	msg.Backend = BackendMLXSwift
+	msg.PrivacyCapabilities.PythonRuntimeLocked = false
+	msg.PrivacyCapabilities.DangerousModulesBlocked = false
+	msg.PrivacyCapabilities.AntiDebugEnabled = false
+
+	p := reg.Register("p-swift-no-antidebug", nil, msg)
+	testMakeTextRoutable(p)
+
+	if providerSupportsPrivateTextLocked(p) {
+		t.Fatal("Swift provider without AntiDebugEnabled should NOT support private text")
+	}
+
+	found := reg.FindProvider("mlx-community/Qwen3.5-9B-Instruct-4bit")
+	if found != nil {
+		t.Fatal("Swift provider without base privacy caps should not be routable")
+	}
+}
+
 func TestProviderPartialPrivacyCapsExcluded(t *testing.T) {
 	reg := New(testLogger())
 	msg := testRegisterMessage()
@@ -718,6 +779,42 @@ func TestChallengeFailureThreshold(t *testing.T) {
 	p := reg.GetProvider("p1")
 	if p.FailedChallenges != 3 {
 		t.Errorf("failed_challenges = %d, want 3", p.FailedChallenges)
+	}
+}
+
+func TestHeartbeatDoesNotReviveUntrusted(t *testing.T) {
+	reg := New(testLogger())
+	msg := testRegisterMessage()
+	reg.Register("p1", nil, msg)
+
+	if reg.OnlineCount() != 1 {
+		t.Fatalf("OnlineCount = %d, want 1 after register", reg.OnlineCount())
+	}
+
+	reg.MarkUntrusted("p1")
+	if reg.OnlineCount() != 0 {
+		t.Errorf("OnlineCount = %d, want 0 after MarkUntrusted", reg.OnlineCount())
+	}
+
+	p := reg.GetProvider("p1")
+	if p.Status != StatusUntrusted {
+		t.Fatalf("status = %q, want %q", p.Status, StatusUntrusted)
+	}
+
+	// Heartbeat with idle status must not revive an untrusted provider
+	reg.Heartbeat("p1", &protocol.HeartbeatMessage{Status: "idle"})
+	p = reg.GetProvider("p1")
+	if p.Status != StatusUntrusted {
+		t.Errorf("status = %q after heartbeat, want %q (untrusted must not revive)", p.Status, StatusUntrusted)
+	}
+	if reg.OnlineCount() != 0 {
+		t.Errorf("OnlineCount = %d after heartbeat on untrusted, want 0", reg.OnlineCount())
+	}
+
+	// Disconnect should NOT decrement again (no double-decrement)
+	reg.Disconnect("p1")
+	if reg.OnlineCount() != 0 {
+		t.Errorf("OnlineCount = %d after disconnect, want 0 (no double-decrement)", reg.OnlineCount())
 	}
 }
 
@@ -1743,6 +1840,41 @@ func TestModelCatalogFilterOnRegister(t *testing.T) {
 	}
 	if p.Models[0].ID != "mlx-community/Qwen3.5-9B-Instruct-4bit" {
 		t.Errorf("expected whitelisted model, got %q", p.Models[0].ID)
+	}
+}
+
+func TestModelTypeIncludesUntrusted(t *testing.T) {
+	reg := New(testLogger())
+	reg.MinTrustLevel = TrustNone
+
+	msg := &protocol.RegisterMessage{
+		Type:     protocol.TypeRegister,
+		Hardware: testRegisterMessage().Hardware,
+		Models: []protocol.ModelInfo{
+			{ID: "model-a", SizeBytes: 1000, ModelType: "text", Quantization: "4bit"},
+			{ID: "model-b", SizeBytes: 2000, ModelType: "image", Quantization: "8bit"},
+		},
+		Backend: "vllm_mlx",
+	}
+	p := reg.Register("p1", nil, msg)
+
+	if got := reg.ModelType("model-a"); got != "text" {
+		t.Errorf("ModelType(model-a) = %q, want %q", got, "text")
+	}
+	if got := reg.ModelType("model-b"); got != "image" {
+		t.Errorf("ModelType(model-b) = %q, want %q", got, "image")
+	}
+
+	reg.MarkUntrusted(p.ID)
+
+	if got := reg.ModelType("model-a"); got != "text" {
+		t.Errorf("ModelType(model-a) after untrusted = %q, want %q", got, "text")
+	}
+	if got := reg.ModelType("model-b"); got != "image" {
+		t.Errorf("ModelType(model-b) after untrusted = %q, want %q", got, "image")
+	}
+	if got := reg.ModelType("nonexistent"); got != "unknown" {
+		t.Errorf("ModelType(nonexistent) = %q, want %q", got, "unknown")
 	}
 }
 

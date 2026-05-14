@@ -3,13 +3,14 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o coordinator ./coordinator/cmd/coordinator
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o /app/coordinator-bin ./coordinator/cmd/coordinator
 
 # Pre-built base with MicroMDM v1.13.1, step-ca v0.28.3, step CLI v0.28.3.
 # Rebuild base only when tool versions change: docker build -f Dockerfile.base -t eigengajesh/d-inference-base:latest . && docker push
 FROM eigengajesh/d-inference-base:v1-amd64
 
-COPY --from=builder /app/coordinator /usr/local/bin/coordinator
+COPY --from=builder /app/coordinator-bin /usr/local/bin/coordinator
+RUN chmod +x /usr/local/bin/coordinator
 
 RUN mkdir -p /var/www/html/dl
 

@@ -19,8 +19,8 @@ import (
 	"github.com/eigeninference/d-inference/coordinator/payments"
 	"github.com/eigeninference/d-inference/e2e/testbed"
 	tbassert "github.com/eigeninference/d-inference/e2e/testbed/assert"
-	tbprofile "github.com/eigeninference/d-inference/e2e/testbed/profile"
 	"github.com/eigeninference/d-inference/e2e/testbed/profile"
+	tbprofile "github.com/eigeninference/d-inference/e2e/testbed/profile"
 )
 
 var httpTimeout = 300 * time.Second
@@ -571,6 +571,32 @@ func TestIntegration_AttestationHeaders(t *testing.T) {
 		resp.Header.Get("X-Provider-Trust-Level"),
 		len(result.SESignature),
 	)
+}
+
+func TestIntegration_SwiftProviderRealRoutingGates(t *testing.T) {
+	ctx := context.Background()
+	s := testbed.NewSuite(testbed.SuiteConfig{})
+	require.NoError(t, s.Start(ctx), "suite startup failed")
+	t.Cleanup(s.Stop)
+
+	for _, id := range s.Coordinator.Registry.ProviderIDs() {
+		p := s.Coordinator.Registry.GetProvider(id)
+		require.NotNil(t, p)
+		p.ChallengeVerifiedSIP = true
+		p.RuntimeManifestChecked = true
+		s.Coordinator.Registry.RecordChallengeSuccess(id)
+	}
+
+	model := s.PrimaryModelID()
+	found := s.Coordinator.Registry.FindProvider(model)
+	require.NotNil(t, found, "Swift provider should be routable after challenge success without ForceTrustProvider")
+
+	resp := postChatCompletions(t, s, "What is 1+1? Answer with just the number.", false, 20)
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body: %s", string(respBody[:min(len(respBody), 500)]))
+
+	t.Logf("Swift provider real routing: status=200 via challenge-verified path")
 }
 
 func TestIntegration_ReferralRewardDistribution(t *testing.T) {

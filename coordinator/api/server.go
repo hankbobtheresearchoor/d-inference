@@ -17,11 +17,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
 	_ "embed"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -320,13 +318,13 @@ func (s *Server) emit(ctx context.Context, severity protocol.TelemetrySeverity, 
 }
 
 // emitRequest is like emit but preserves a request_id for correlation.
-func (s *Server) emitRequest(ctx context.Context, severity protocol.TelemetrySeverity, kind protocol.TelemetryKind, requestID, message string, fields map[string]any) {
+func (s *Server) emitRequest(ctx context.Context, severity protocol.TelemetrySeverity, requestID, message string, fields map[string]any) {
 	if s.emitter == nil {
 		return
 	}
 	s.emitter.Emit(ctx, telemetry.Event{
 		Severity:  severity,
-		Kind:      kind,
+		Kind:      protocol.KindInferenceError,
 		Message:   message,
 		Fields:    fields,
 		RequestID: requestID,
@@ -337,6 +335,13 @@ func (s *Server) emitRequest(ctx context.Context, severity protocol.TelemetrySev
 func (s *Server) ddIncr(name string, tags []string) {
 	if s.dd != nil {
 		s.dd.Incr(name, tags)
+	}
+}
+
+// ddCount increments a DogStatsD counter by the given value. No-op if DD is not configured.
+func (s *Server) ddCount(name string, value int64, tags []string) {
+	if s.dd != nil {
+		s.dd.Count(name, value, tags)
 	}
 }
 
@@ -354,7 +359,6 @@ func (s *Server) ddGauge(name string, value float64, tags []string) {
 	}
 }
 
-// emitPanic is the panic-specific emit helper. Captures stack separately.
 func (s *Server) emitPanic(ctx context.Context, message, stack string, fields map[string]any) {
 	if s.emitter == nil {
 		return
@@ -482,17 +486,6 @@ func hasConfiguredHashInput(hashes []string) bool {
 		}
 	}
 	return false
-}
-
-func normalizeSHA256Hex(value, field string) (string, error) {
-	value = strings.ToLower(strings.TrimSpace(value))
-	if len(value) != sha256.Size*2 {
-		return "", fmt.Errorf("%s must be a 64-character SHA-256 hex digest", field)
-	}
-	if _, err := hex.DecodeString(value); err != nil {
-		return "", fmt.Errorf("%s must be a valid SHA-256 hex digest", field)
-	}
-	return value, nil
 }
 
 // SetConsoleURL sets the frontend URL for device auth verification links.
@@ -672,6 +665,7 @@ func (s *Server) revalidateConnectedProvidersAgainstRuntimePolicy() {
 			semverLess(version, s.minProviderVersion):
 			provider.RuntimeVerified = false
 			provider.RuntimeManifestChecked = false
+			s.ddIncr("provider_version_below_minimum", []string{"gate:manifest_sync", "version:" + version})
 		default:
 			runtimeOK, _ := s.verifyRuntimeHashesForBackend(
 				backend,
@@ -861,7 +855,7 @@ func (s *Server) verifyRuntimeHashesAgainstManifest(manifest *RuntimeManifest, p
 func (s *Server) handleRuntimeManifest(w http.ResponseWriter, r *http.Request) {
 	const cacheKey = "runtime_manifest:v1"
 	if cached, ok := s.readCache.Get(cacheKey); ok {
-		writeCachedJSON(w, http.StatusOK, cached)
+		writeCachedJSON(w, cached)
 		return
 	}
 	var resp map[string]any
@@ -881,7 +875,7 @@ func (s *Server) handleRuntimeManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.readCache.Set(cacheKey, body, time.Minute)
-	writeCachedJSON(w, http.StatusOK, body)
+	writeCachedJSON(w, body)
 }
 
 // HandleMDMWebhook processes a MicroMDM webhook callback.
@@ -1101,6 +1095,12 @@ func (s *Server) registerDefaultGauges() {
 	s.metrics.RegisterGauge("providers_online", func() float64 {
 		return float64(s.registry.ProviderCount())
 	})
+	s.metrics.RegisterGauge("min_provider_version_set", func() float64 {
+		if s.minProviderVersion != "" {
+			return 1
+		}
+		return 0
+	})
 }
 
 // StartDDGaugeLoop periodically pushes gauge values to DogStatsD. Gauges
@@ -1117,7 +1117,16 @@ func (s *Server) StartDDGaugeLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.ddGauge("providers.online", float64(s.registry.ProviderCount()), nil)
+			s.ddGauge("providers.online", float64(s.registry.OnlineCount()), nil)
+			for model, count := range s.registry.ModelProviderSnapshot() {
+				s.ddGauge("providers.per_model", float64(count), []string{"model:" + model})
+			}
+			for ver, count := range s.registry.ProviderCountByVersion() {
+				s.ddGauge("providers.per_version", float64(count), []string{"version:" + ver})
+			}
+			if s.minProviderVersion != "" {
+				s.ddGauge("coordinator.min_provider_version_set", 1, []string{"min_version:" + s.minProviderVersion})
+			}
 			if q := s.registry.Queue(); q != nil {
 				s.ddGauge("request_queue.depth", float64(q.TotalSize()), nil)
 			}
@@ -1443,14 +1452,15 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 }
 
 // httpPathLabel returns a bounded label for HTTP metrics.
-// We use the mux route pattern (e.g. "POST /v1/chat/completions")
+// We use the mux route pattern (e.g. "POST-/v1/chat/completions")
 // instead of URL.Path so attacker-controlled unmatched paths cannot create
-// unbounded metric cardinality.
+// unbounded metric cardinality. Dashes replace spaces so DogStatsD tags
+// parse cleanly (spaces break tag parsing).
 func httpPathLabel(route string) string {
 	if route == "" {
 		return "unmatched"
 	}
-	return route
+	return strings.ReplaceAll(route, " ", "-")
 }
 
 // strconvItoa is a shim to avoid pulling strconv into every middleware file.
