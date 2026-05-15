@@ -2023,18 +2023,6 @@ func firstChoice(resp chatCompletionResponse) *chatCompletionChoice {
 	return &resp.Choices[0]
 }
 
-func messageField(msg chatCompletionMessage, keys ...string) string {
-	for _, key := range keys {
-		switch key {
-		case "content":
-			if msg.Content != "" { return msg.Content }
-		case "reasoning", "reasoning_content":
-			if msg.Reasoning != "" { return msg.Reasoning }
-		}
-	}
-	return ""
-}
-
 func chatUsageToResponsesUsage(resp chatCompletionResponse, reasoning string) responsesUsage {
 	reasoningTokens := 0
 	if reasoning != "" {
@@ -2447,14 +2435,14 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 
 // providerEarningsResponse is the GET /v1/provider/earnings response.
 type providerEarningsResponse struct {
-	WalletAddress       string             `json:"wallet_address"`
-	BalanceMicroUSD     int64              `json:"balance_micro_usd"`
-	BalanceUSD          string             `json:"balance_usd"`
-	TotalEarnedMicroUSD int64              `json:"total_earned_micro_usd"`
-	TotalEarnedUSD      string             `json:"total_earned_usd"`
-	TotalJobs           int                `json:"total_jobs"`
-	Payouts             []payments.Payout  `json:"payouts"`
-	Ledger              []store.LedgerEntry  `json:"ledger"`
+	WalletAddress       string              `json:"wallet_address"`
+	BalanceMicroUSD     int64               `json:"balance_micro_usd"`
+	BalanceUSD          string              `json:"balance_usd"`
+	TotalEarnedMicroUSD int64               `json:"total_earned_micro_usd"`
+	TotalEarnedUSD      string              `json:"total_earned_usd"`
+	TotalJobs           int                 `json:"total_jobs"`
+	Payouts             []payments.Payout   `json:"payouts"`
+	Ledger              []store.LedgerEntry `json:"ledger"`
 }
 
 // handleProviderEarnings handles GET /v1/provider/earnings?wallet=0x...
