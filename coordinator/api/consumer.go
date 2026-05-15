@@ -1485,7 +1485,7 @@ func writeResponsesStreamOutput(w http.ResponseWriter, flusher http.Flusher, pr 
 			"created_at":         createdAt,
 			"model":              pr.Model,
 			"incomplete_details": nil,
-			"usage":              responsesUsage(uint64(usage.PromptTokens), uint64(usage.CompletionTokens), reasoningTokens),
+			"usage":              buildResponsesUsage(uint64(usage.PromptTokens), uint64(usage.CompletionTokens), reasoningTokens),
 			"service_tier":       nil,
 		},
 	})
@@ -1498,6 +1498,7 @@ func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, r *http.Reque
 
 // handleNonStreamingResponseWithFirstChunk collects all chunks from the
 // provider and assembles them into a single OpenAI-compatible JSON response.
+
 // If firstChunk is non-empty, it is prepended to the collected chunks.
 func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter, r *http.Request, pr *registry.PendingRequest, firstChunk string) {
 	ctx, cancel := context.WithTimeout(r.Context(), inferenceTimeout)
@@ -1532,7 +1533,7 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 							if objType == "chat.completion" {
 								normalizeCompleteChatResponse(obj, pr.Model)
 								if pr.IsResponsesAPI {
-									obj = chatCompletionToResponses(obj, pr.Model, pr.SESignature, pr.ResponseHash)
+									obj = chatCompletionToResponses(resp, pr.Model, pr.SESignature, pr.ResponseHash)
 									writeJSON(w, http.StatusOK, obj)
 									return
 								}
@@ -1551,7 +1552,7 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 				msg := extractMessage(chunks)
 				select {
 				case usage := <-pr.CompleteCh:
-					var resp map[string]any
+					var resp any
 					if pr.IsResponsesAPI {
 						resp = buildResponsesResponse(pr.RequestID, pr.Model, msg, usage, pr.SESignature, pr.ResponseHash)
 					} else {
@@ -1890,25 +1891,40 @@ func extractMessage(chunks []string) extractedMessage {
 	return msg
 }
 
-func responsesUsage(promptTokens, completionTokens uint64, reasoningTokens uint64) map[string]any {
-	return map[string]any{
-		"input_tokens": promptTokens,
-		"input_tokens_details": map[string]any{
-			"cached_tokens": 0,
-		},
-		"output_tokens": completionTokens,
-		"output_tokens_details": map[string]any{
-			"reasoning_tokens": reasoningTokens,
-		},
+// responsesUsageDetail holds token breakdown details.
+type responsesUsageDetail struct {
+	CachedTokens    int `json:"cached_tokens,omitempty"`
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+}
+
+// responsesUsage is the usage object in a Responses API response.
+type responsesUsage struct {
+	InputTokens        int                  `json:"input_tokens"`
+	InputTokensDetail  responsesUsageDetail `json:"input_tokens_details"`
+	OutputTokens       int                  `json:"output_tokens"`
+	OutputTokensDetail responsesUsageDetail `json:"output_tokens_details"`
+}
+
+func buildResponsesUsage(promptTokens, completionTokens uint64, reasoningTokens uint64) responsesUsage {
+	return responsesUsage{
+		InputTokens:        int(promptTokens),
+		InputTokensDetail:  responsesUsageDetail{},
+		OutputTokens:       int(completionTokens),
+		OutputTokensDetail: responsesUsageDetail{ReasoningTokens: int(reasoningTokens)},
 	}
 }
 
-func responsesIncompleteDetails(finishReason string) any {
+// responsesIncompleteDetail is the incomplete_details block.
+type responsesIncompleteDetail struct {
+	Reason string `json:"reason"`
+}
+
+func buildResponsesIncompleteDetails(finishReason string) any {
 	switch finishReason {
 	case "length":
-		return map[string]any{"reason": "max_output_tokens"}
+		return responsesIncompleteDetail{Reason: "max_output_tokens"}
 	case "content_filter":
-		return map[string]any{"reason": "content_filter"}
+		return responsesIncompleteDetail{Reason: "content_filter"}
 	default:
 		return nil
 	}
@@ -1964,140 +1980,174 @@ func appendResponsesOutputItems(output []any, requestID string, msg extractedMes
 	return output
 }
 
-func buildResponsesResponse(requestID, model string, msg extractedMessage, usage protocol.UsageInfo, seSignature, responseHash string) map[string]any {
+// responsesResponse is an OpenAI-compatible Responses API response.
+type responsesResponse struct {
+	ID               string `json:"id"`
+	Object           string `json:"object"`
+	CreatedAt        int64  `json:"created_at"`
+	Model            string `json:"model"`
+	Output           []any  `json:"output"`
+	Usage            any    `json:"usage"`
+	IncompleteDetail any    `json:"incomplete_details,omitempty"`
+	SESignature      string `json:"se_signature,omitempty"`
+	ResponseHash     string `json:"response_hash,omitempty"`
+}
+
+func buildResponsesResponse(requestID, model string, msg extractedMessage, usage protocol.UsageInfo, seSignature, responseHash string) responsesResponse {
 	reasoningTokens := uint64(0)
 	if msg.Reasoning != "" {
 		reasoningTokens = uint64(usage.CompletionTokens)
 	}
-	resp := map[string]any{
-		"id":         "resp_" + strings.ReplaceAll(requestID, "-", ""),
-		"object":     "response",
-		"created_at": time.Now().Unix(),
-		"model":      model,
-		"output":     appendResponsesOutputItems(nil, requestID, msg),
-		"usage":      responsesUsage(uint64(usage.PromptTokens), uint64(usage.CompletionTokens), reasoningTokens),
+	resp := responsesResponse{
+		ID:        "resp_" + strings.ReplaceAll(requestID, "-", ""),
+		Object:    "response",
+		CreatedAt: time.Now().Unix(),
+		Model:     model,
+		Output:    appendResponsesOutputItems(nil, requestID, msg),
+		Usage:     buildResponsesUsage(uint64(usage.PromptTokens), uint64(usage.CompletionTokens), reasoningTokens),
 	}
 	if seSignature != "" {
-		resp["se_signature"] = seSignature
-		resp["response_hash"] = responseHash
+		resp.SESignature = seSignature
+		resp.ResponseHash = responseHash
 	}
 	return resp
 }
 
-func firstChoice(obj map[string]any) map[string]any {
-	choices, _ := obj["choices"].([]any)
-	if len(choices) == 0 {
+func firstChoice(resp chatCompletionResponse) *chatCompletionChoice {
+	if len(resp.Choices) == 0 {
 		return nil
 	}
-	choice, _ := choices[0].(map[string]any)
-	return choice
+	return &resp.Choices[0]
 }
 
-func stringFromMap(m map[string]any, keys ...string) string {
+func messageField(msg chatCompletionMessage, keys ...string) string {
 	for _, key := range keys {
-		if s, _ := m[key].(string); s != "" {
-			return s
+		switch key {
+		case "content":
+			if msg.Content != "" { return msg.Content }
+		case "reasoning", "reasoning_content":
+			if msg.Reasoning != "" { return msg.Reasoning }
 		}
 	}
 	return ""
 }
 
-func chatUsageToResponsesUsage(obj map[string]any, reasoning string) map[string]any {
-	usage, _ := obj["usage"].(map[string]any)
-	promptTokens, _ := intFromRequestValue(usage["prompt_tokens"])
-	completionTokens, _ := intFromRequestValue(usage["completion_tokens"])
+func chatUsageToResponsesUsage(resp chatCompletionResponse, reasoning string) responsesUsage {
 	reasoningTokens := 0
 	if reasoning != "" {
-		reasoningTokens = completionTokens
+		reasoningTokens = resp.Usage.CompletionTokens
 	}
-	return responsesUsage(uint64(promptTokens), uint64(completionTokens), uint64(reasoningTokens))
+	return buildResponsesUsage(uint64(resp.Usage.PromptTokens), uint64(resp.Usage.CompletionTokens), uint64(reasoningTokens))
 }
 
-func chatCompletionToResponses(obj map[string]any, requestedModel, seSignature, responseHash string) map[string]any {
-	requestID, _ := obj["id"].(string)
-	requestID = strings.TrimPrefix(requestID, "chatcmpl-")
+func chatCompletionToResponses(resp chatCompletionResponse, requestedModel, seSignature, responseHash string) responsesResponse {
+	requestID := strings.TrimPrefix(resp.ID, "chatcmpl-")
 	if requestID == "" {
 		requestID = uuid.NewString()
 	}
-	created, ok := intFromRequestValue(obj["created"])
-	if !ok || created <= 0 {
+	created := int(resp.Created)
+	if created <= 0 {
 		created = int(time.Now().Unix())
 	}
 
 	msg := extractedMessage{}
 	finishReason := ""
-	if choice := firstChoice(obj); choice != nil {
-		finishReason, _ = choice["finish_reason"].(string)
-		if message, _ := choice["message"].(map[string]any); message != nil {
-			msg.Content = stringFromMap(message, "content")
-			msg.Reasoning = stringFromMap(message, "reasoning", "reasoning_content")
-			if rawToolCalls, _ := message["tool_calls"].([]any); len(rawToolCalls) > 0 {
-				msg.ToolCalls = make([]map[string]any, 0, len(rawToolCalls))
-				for _, rawTC := range rawToolCalls {
-					if tc, _ := rawTC.(map[string]any); tc != nil {
-						msg.ToolCalls = append(msg.ToolCalls, tc)
-					}
-				}
-			}
-		}
+	if choice := firstChoice(resp); choice != nil {
+		finishReason = choice.FinishReason
+		msg.Content = choice.Message.Content
+		msg.Reasoning = choice.Message.Reasoning
+		msg.ToolCalls = choice.Message.ToolCalls
 	}
 
-	resp := map[string]any{
-		"id":                 "resp_" + strings.ReplaceAll(requestID, "-", ""),
-		"object":             "response",
-		"created_at":         created,
-		"model":              requestedModel,
-		"output":             appendResponsesOutputItems(nil, requestID, msg),
-		"incomplete_details": responsesIncompleteDetails(finishReason),
-		"usage":              chatUsageToResponsesUsage(obj, msg.Reasoning),
+	r := responsesResponse{
+		ID:        "resp_" + strings.ReplaceAll(requestID, "-", ""),
+		Object:    "response",
+		CreatedAt: int64(created),
+		Model:     requestedModel,
+		Output:    appendResponsesOutputItems(nil, requestID, msg),
+		Usage:     chatUsageToResponsesUsage(resp, msg.Reasoning),
+	}
+	if finishReason != "" && finishReason != "stop" {
+		r.IncompleteDetail = buildResponsesIncompleteDetails(finishReason)
 	}
 	if seSignature != "" {
-		resp["se_signature"] = seSignature
-		resp["response_hash"] = responseHash
+		r.SESignature = seSignature
+		r.ResponseHash = responseHash
 	}
-	return resp
+	return r
 }
 
 // buildNonStreamingResponse constructs a complete OpenAI-compatible chat
 // completion response from the aggregated message and usage info.
-func buildNonStreamingResponse(requestID, model string, msg extractedMessage, usage protocol.UsageInfo, seSignature, responseHash string) map[string]any {
-	message := map[string]any{
-		"role":    "assistant",
-		"content": msg.Content,
+// chatCompletionMessage is the assistant message in a chat completion choice.
+type chatCompletionMessage struct {
+	Role      string           `json:"role"`
+	Content   string           `json:"content"`
+	Reasoning string           `json:"reasoning,omitempty"`
+	ToolCalls []map[string]any `json:"tool_calls,omitempty"`
+}
+
+// chatCompletionChoice is a single choice in a chat completion response.
+type chatCompletionChoice struct {
+	Index        int                   `json:"index"`
+	Message      chatCompletionMessage `json:"message"`
+	FinishReason string                `json:"finish_reason"`
+}
+
+// chatCompletionUsage is token usage in a chat completion response.
+type chatCompletionUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// chatCompletionResponse is an OpenAI-compatible chat completion response.
+type chatCompletionResponse struct {
+	ID           string                 `json:"id"`
+	Object       string                 `json:"object"`
+	Created      int64                  `json:"created"`
+	Model        string                 `json:"model"`
+	Choices      []chatCompletionChoice `json:"choices"`
+	Usage        chatCompletionUsage    `json:"usage"`
+	SESignature  string                 `json:"se_signature,omitempty"`
+	ResponseHash string                 `json:"response_hash,omitempty"`
+}
+
+func buildNonStreamingResponse(requestID, model string, msg extractedMessage, usage protocol.UsageInfo, seSignature, responseHash string) chatCompletionResponse {
+	message := chatCompletionMessage{
+		Role:    "assistant",
+		Content: msg.Content,
 	}
 	if msg.Reasoning != "" {
-		message["reasoning"] = msg.Reasoning
+		message.Reasoning = msg.Reasoning
 	}
 
 	finishReason := "stop"
 	if len(msg.ToolCalls) > 0 {
-		message["tool_calls"] = msg.ToolCalls
+		message.ToolCalls = msg.ToolCalls
 		finishReason = "tool_calls"
 	}
 
-	resp := map[string]any{
-		"id":      "chatcmpl-" + requestID,
-		"object":  "chat.completion",
-		"created": time.Now().Unix(),
-		"model":   model,
-		"choices": []map[string]any{
-			{
-				"index":         0,
-				"message":       message,
-				"finish_reason": finishReason,
-			},
-		},
-		"usage": map[string]any{
-			"prompt_tokens":     usage.PromptTokens,
-			"completion_tokens": usage.CompletionTokens,
-			"total_tokens":      usage.PromptTokens + usage.CompletionTokens,
+	resp := chatCompletionResponse{
+		ID:      "chatcmpl-" + requestID,
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []chatCompletionChoice{{
+			Index:        0,
+			Message:      message,
+			FinishReason: finishReason,
+		}},
+		Usage: chatCompletionUsage{
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			TotalTokens:      usage.PromptTokens + usage.CompletionTokens,
 		},
 	}
 
-	// Include SE signature if the provider signed the response
 	if seSignature != "" {
-		resp["se_signature"] = seSignature
-		resp["response_hash"] = responseHash
+		resp.SESignature = seSignature
+		resp.ResponseHash = responseHash
 	}
 
 	return resp
@@ -2158,6 +2208,12 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// createKeyResponse is the POST /v1/auth/keys response.
+type createKeyResponse struct {
+	APIKey    string `json:"api_key"`
+	AccountID string `json:"account_id"`
+}
+
 // handleCreateKey handles POST /v1/auth/keys — creates a new consumer API key.
 // Requires Privy authentication. The key is linked to the user's account so
 // requests made with the key are billed to the same account.
@@ -2174,9 +2230,9 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errorResponse("server_error", "failed to create key"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"api_key":    key,
-		"account_id": user.AccountID,
+	writeJSON(w, http.StatusOK, createKeyResponse{
+		APIKey:    key,
+		AccountID: user.AccountID,
 	})
 }
 
@@ -2215,11 +2271,29 @@ func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
 // handleHealth handles GET /health.
 // Returns the coordinator's status and the number of connected providers.
 // This endpoint does not require authentication.
+// healthResponse is the GET /health response.
+type healthResponse struct {
+	Status    string `json:"status"`
+	Providers int    `json:"providers"`
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":    "ok",
-		"providers": s.registry.ProviderCount(),
+	writeJSON(w, http.StatusOK, healthResponse{
+		Status:    "ok",
+		Providers: s.registry.ProviderCount(),
 	})
+}
+
+// versionResponse is the GET /api/version response.
+type versionResponse struct {
+	Version      string `json:"version"`
+	Platform     string `json:"platform,omitempty"`
+	Backend      string `json:"backend,omitempty"`
+	DownloadURL  string `json:"download_url"`
+	BinaryHash   string `json:"binary_hash,omitempty"`
+	BundleHash   string `json:"bundle_hash,omitempty"`
+	MetallibHash string `json:"metallib_hash,omitempty"`
+	Changelog    string `json:"changelog,omitempty"`
 }
 
 // handleVersion returns the latest provider CLI version and download URL.
@@ -2233,18 +2307,18 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var resp map[string]any
+	var resp versionResponse
 	// Try release table first.
 	if release := s.store.GetLatestRelease("macos-arm64"); release != nil {
-		resp = map[string]any{
-			"version":       release.Version,
-			"platform":      release.Platform,
-			"backend":       release.Backend,
-			"download_url":  release.URL,
-			"binary_hash":   release.BinaryHash,
-			"bundle_hash":   release.BundleHash,
-			"metallib_hash": release.MetallibHash,
-			"changelog":     release.Changelog,
+		resp = versionResponse{
+			Version:      release.Version,
+			Platform:     release.Platform,
+			Backend:      release.Backend,
+			DownloadURL:  release.URL,
+			BinaryHash:   release.BinaryHash,
+			BundleHash:   release.BundleHash,
+			MetallibHash: release.MetallibHash,
+			Changelog:    release.Changelog,
 		}
 	} else {
 		// Fallback to hardcoded version + coordinator download.
@@ -2253,9 +2327,9 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 			scheme = "http"
 		}
 		downloadURL := fmt.Sprintf("%s://%s/dl/eigeninference-bundle-macos-arm64.tar.gz", scheme, r.Host)
-		resp = map[string]any{
-			"version":      LatestProviderVersion,
-			"download_url": downloadURL,
+		resp = versionResponse{
+			Version:     LatestProviderVersion,
+			DownloadURL: downloadURL,
 		}
 	}
 	body, err := json.Marshal(resp)
@@ -2269,6 +2343,14 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 
 // --- payment handlers ---
 
+// balanceResponse is the GET /v1/payments/balance response.
+type balanceResponse struct {
+	BalanceMicroUSD      int64  `json:"balance_micro_usd"`
+	BalanceUSD           string `json:"balance_usd"`
+	WithdrawableMicroUSD int64  `json:"withdrawable_micro_usd"`
+	WithdrawableUSD      string `json:"withdrawable_usd"`
+}
+
 // handleBalance handles GET /v1/payments/balance.
 // Returns the consumer's current balance in both micro-USD and USD.
 func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
@@ -2276,12 +2358,17 @@ func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
 	balance := s.ledger.Balance(consumerKey)
 	withdrawable := s.store.GetWithdrawableBalance(consumerKey)
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"balance_micro_usd":      balance,
-		"balance_usd":            fmt.Sprintf("%.6f", float64(balance)/1_000_000),
-		"withdrawable_micro_usd": withdrawable,
-		"withdrawable_usd":       fmt.Sprintf("%.6f", float64(withdrawable)/1_000_000),
+	writeJSON(w, http.StatusOK, balanceResponse{
+		BalanceMicroUSD:      balance,
+		BalanceUSD:           fmt.Sprintf("%.6f", float64(balance)/1_000_000),
+		WithdrawableMicroUSD: withdrawable,
+		WithdrawableUSD:      fmt.Sprintf("%.6f", float64(withdrawable)/1_000_000),
 	})
+}
+
+// usageResponse is the GET /v1/payments/usage response.
+type usageResponse struct {
+	Usage []payments.UsageEntry `json:"usage"`
 }
 
 // handleUsage handles GET /v1/payments/usage.
@@ -2312,9 +2399,21 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"usage": entries,
+	writeJSON(w, http.StatusOK, usageResponse{
+		Usage: entries,
 	})
+}
+
+// providerEarningsResponse is the GET /v1/provider/earnings response.
+type providerEarningsResponse struct {
+	WalletAddress       string             `json:"wallet_address"`
+	BalanceMicroUSD     int64              `json:"balance_micro_usd"`
+	BalanceUSD          string             `json:"balance_usd"`
+	TotalEarnedMicroUSD int64              `json:"total_earned_micro_usd"`
+	TotalEarnedUSD      string             `json:"total_earned_usd"`
+	TotalJobs           int                `json:"total_jobs"`
+	Payouts             []payments.Payout  `json:"payouts"`
+	Ledger              []store.LedgerEntry  `json:"ledger"`
 }
 
 // handleProviderEarnings handles GET /v1/provider/earnings?wallet=0x...
@@ -2373,15 +2472,15 @@ func (s *Server) handleProviderEarnings(w http.ResponseWriter, r *http.Request) 
 		walletPayouts = []payments.Payout{}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"wallet_address":         wallet,
-		"balance_micro_usd":      balance,
-		"balance_usd":            fmt.Sprintf("%.6f", float64(balance)/1_000_000),
-		"total_earned_micro_usd": totalEarned,
-		"total_earned_usd":       fmt.Sprintf("%.6f", float64(totalEarned)/1_000_000),
-		"total_jobs":             totalJobs,
-		"payouts":                walletPayouts,
-		"ledger":                 history,
+	writeJSON(w, http.StatusOK, providerEarningsResponse{
+		WalletAddress:       wallet,
+		BalanceMicroUSD:     balance,
+		BalanceUSD:          fmt.Sprintf("%.6f", float64(balance)/1_000_000),
+		TotalEarnedMicroUSD: totalEarned,
+		TotalEarnedUSD:      fmt.Sprintf("%.6f", float64(totalEarned)/1_000_000),
+		TotalJobs:           totalJobs,
+		Payouts:             walletPayouts,
+		Ledger:              history,
 	})
 }
 
