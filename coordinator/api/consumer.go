@@ -1533,8 +1533,11 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 							if objType == "chat.completion" {
 								normalizeCompleteChatResponse(obj, pr.Model)
 								if pr.IsResponsesAPI {
-									obj = chatCompletionToResponses(resp, pr.Model, pr.SESignature, pr.ResponseHash)
-									writeJSON(w, http.StatusOK, obj)
+									var chatResp chatCompletionResponse
+									b, _ := json.Marshal(obj)
+									json.Unmarshal(b, &chatResp)
+									respObj := chatCompletionToResponses(chatResp, pr.Model, pr.SESignature, pr.ResponseHash)
+									writeJSON(w, http.StatusOK, respObj)
 									return
 								}
 							}
@@ -2153,6 +2156,39 @@ func buildNonStreamingResponse(requestID, model string, msg extractedMessage, us
 	return resp
 }
 
+// modelAttestation is the attestation metadata for a model in /v1/models.
+type modelAttestation struct {
+	SecureEnclave bool `json:"secure_enclave"`
+	SIPEnabled    bool `json:"sip_enabled"`
+	SecureBoot    bool `json:"secure_boot"`
+}
+
+// modelMetadata is the metadata block for a model in /v1/models.
+type modelMetadata struct {
+	ModelType         string            `json:"model_type"`
+	Quantization      string            `json:"quantization"`
+	ProviderCount     int               `json:"provider_count"`
+	AttestedProviders int               `json:"attested_providers"`
+	TrustLevel        string            `json:"trust_level"`
+	Attestation       *modelAttestation `json:"attestation,omitempty"`
+	DisplayName       string            `json:"display_name,omitempty"`
+}
+
+// modelEntry is a single model entry in the /v1/models response.
+type modelEntry struct {
+	ID       string        `json:"id"`
+	Object   string        `json:"object"`
+	Created  int           `json:"created"`
+	OwnedBy  string        `json:"owned_by"`
+	Metadata modelMetadata `json:"metadata"`
+}
+
+// modelListResponse is the top-level /v1/models response.
+type modelListResponse struct {
+	Object string       `json:"object"`
+	Data   []modelEntry `json:"data"`
+}
+
 // handleListModels handles GET /v1/models.
 //
 // Returns a deduplicated list of models across all connected providers,
@@ -2170,41 +2206,41 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	data := make([]map[string]any, 0, len(models))
+	data := make([]modelEntry, 0, len(models))
 	for _, m := range models {
 		cm, inCatalog := catalogByID[m.ID]
 		if len(catalogByID) > 0 && !inCatalog {
 			continue
 		}
-		metadata := map[string]any{
-			"model_type":         m.ModelType,
-			"quantization":       m.Quantization,
-			"provider_count":     m.Providers,
-			"attested_providers": m.AttestedProviders,
-			"trust_level":        string(m.TrustLevel),
+		metadata := modelMetadata{
+			ModelType:         m.ModelType,
+			Quantization:      m.Quantization,
+			ProviderCount:     m.Providers,
+			AttestedProviders: m.AttestedProviders,
+			TrustLevel:        string(m.TrustLevel),
 		}
 		if m.Attestation != nil {
-			metadata["attestation"] = map[string]any{
-				"secure_enclave": m.Attestation.SecureEnclave,
-				"sip_enabled":    m.Attestation.SIPEnabled,
-				"secure_boot":    m.Attestation.SecureBoot,
+			metadata.Attestation = &modelAttestation{
+				SecureEnclave: m.Attestation.SecureEnclave,
+				SIPEnabled:    m.Attestation.SIPEnabled,
+				SecureBoot:    m.Attestation.SecureBoot,
 			}
 		}
 		if inCatalog && cm.DisplayName != "" {
-			metadata["display_name"] = cm.DisplayName
+			metadata.DisplayName = cm.DisplayName
 		}
-		data = append(data, map[string]any{
-			"id":       m.ID,
-			"object":   "model",
-			"created":  0,
-			"owned_by": "eigeninference",
-			"metadata": metadata,
+		data = append(data, modelEntry{
+			ID:       m.ID,
+			Object:   "model",
+			Created:  0,
+			OwnedBy:  "eigeninference",
+			Metadata: metadata,
 		})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"object": "list",
-		"data":   data,
+	writeJSON(w, http.StatusOK, modelListResponse{
+		Object: "list",
+		Data:   data,
 	})
 }
 
@@ -2212,6 +2248,11 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 type createKeyResponse struct {
 	APIKey    string `json:"api_key"`
 	AccountID string `json:"account_id"`
+}
+
+// revokeKeyResponse is the DELETE /v1/auth/keys response.
+type revokeKeyResponse struct {
+	Status string `json:"status"`
 }
 
 // handleCreateKey handles POST /v1/auth/keys — creates a new consumer API key.
@@ -2265,7 +2306,7 @@ func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"status": "revoked"})
+	writeJSON(w, http.StatusOK, revokeKeyResponse{Status: "revoked"})
 }
 
 // handleHealth handles GET /health.

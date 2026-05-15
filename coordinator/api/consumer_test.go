@@ -1023,42 +1023,41 @@ func TestResponsesInputToolTranscriptToChatMessages(t *testing.T) {
 }
 
 func TestChatCompletionToResponses(t *testing.T) {
-	chat := map[string]any{
-		"id":      "chatcmpl-test",
-		"object":  "chat.completion",
-		"created": float64(123),
-		"model":   "local-path",
-		"choices": []any{
-			map[string]any{
-				"finish_reason": "tool_calls",
-				"message": map[string]any{
-					"role":      "assistant",
-					"content":   "",
-					"reasoning": "need weather",
-					"tool_calls": []any{
-						map[string]any{
-							"id":   "call_123",
-							"type": "function",
-							"function": map[string]any{
-								"name":      "get_current_weather",
-								"arguments": `{"city":"Paris"}`,
-							},
+	chat := chatCompletionResponse{
+		ID:      "chatcmpl-test",
+		Object:  "chat.completion",
+		Created: 123,
+		Model:   "local-path",
+		Choices: []chatCompletionChoice{{
+			FinishReason: "tool_calls",
+			Message: chatCompletionMessage{
+				Role:      "assistant",
+				Content:   "",
+				Reasoning: "need weather",
+				ToolCalls: []map[string]any{
+					{
+						"id":   "call_123",
+						"type": "function",
+						"function": map[string]any{
+							"name":      "get_current_weather",
+							"arguments": `{"city":"Paris"}`,
 						},
 					},
 				},
 			},
-		},
-		"usage": map[string]any{
-			"prompt_tokens":     float64(10),
-			"completion_tokens": float64(5),
+		}},
+		Usage: chatCompletionUsage{
+			PromptTokens:     10,
+			CompletionTokens: 5,
+			TotalTokens:      15,
 		},
 	}
 
 	got := chatCompletionToResponses(chat, "mlx-community/gemma-4-26b-a4b-it-8bit", "", "")
-	if got["object"] != "response" || got["model"] != "mlx-community/gemma-4-26b-a4b-it-8bit" {
+	if got.Object != "response" || got.Model != "mlx-community/gemma-4-26b-a4b-it-8bit" {
 		t.Fatalf("response metadata = %#v", got)
 	}
-	output := got["output"].([]any)
+	output := got.Output
 	if output[0].(map[string]any)["type"] != "reasoning" {
 		t.Fatalf("first output = %#v", output[0])
 	}
@@ -1066,8 +1065,8 @@ func TestChatCompletionToResponses(t *testing.T) {
 	if call["type"] != "function_call" || call["call_id"] != "call_123" {
 		t.Fatalf("function call output = %#v", call)
 	}
-	usage := got["usage"].(map[string]any)
-	if usage["input_tokens"] != uint64(10) || usage["output_tokens"] != uint64(5) {
+	usage := got.Usage.(responsesUsage)
+	if usage.InputTokens != 10 || usage.OutputTokens != 5 {
 		t.Fatalf("usage = %#v", usage)
 	}
 }
