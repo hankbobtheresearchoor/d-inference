@@ -1069,8 +1069,8 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 	s.ddHistogram("inference.completion_tokens", float64(msg.Usage.CompletionTokens), []string{"model:" + pr.Model})
 
 	// Credit the provider's pending payout.
-	// If the provider is linked to an account (via device auth), credit that account.
-	// Otherwise, fall back to the provider's self-reported wallet address.
+	// Only providers linked to an account (via device auth) receive credit.
+	// Unlinked providers do not accrue earnings.
 	if p := s.registry.GetProvider(providerID); p != nil {
 		if p.AccountID != "" {
 			// Provider is linked to a Privy account — atomically credit the

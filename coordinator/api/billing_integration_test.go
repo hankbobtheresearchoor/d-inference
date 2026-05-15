@@ -11,7 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"io" 
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -433,10 +433,10 @@ func TestIntegration_ReferralRewardDistribution(t *testing.T) {
 	// The provider in this test has no account linkage (connected via connectProvider),
 	// so payout goes to the provider address. Since connectProvider does not set a
 	// provider address, let's check the ledger's pending payouts instead.
-	// Provider without AccountID and without provider address won't receive payout
+	// Provider without AccountID won't receive payout
 	// via CreditProviderAccount. But the cost flow is:
-	// handleComplete checks p.AccountID first, then provider address.
-	// connectProvider doesn't set either, so no provider credit occurs.
+	// handleComplete checks p.AccountID — connectProvider doesn't set it,
+	// so no provider credit occurs.
 	// Verify the math is correct by checking the provider payout calculation.
 	if expectedProviderPayout != payments.ProviderPayout(totalCost) {
 		t.Errorf("provider payout calculation mismatch")

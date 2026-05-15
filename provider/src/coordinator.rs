@@ -988,7 +988,7 @@ mod tests {
             weight_hash: None,
         }];
 
-        let msg = build_register_message(&hw, &models, "vllm_mlx", None);
+        let msg = build_register_message(&hw, &models, "vllm_mlx", None, None);
         match msg {
             ProviderMessage::Register {
                 hardware,
@@ -1452,5 +1452,4 @@ mod tests {
         assert!(parsed.get("hypervisor_active").is_some());
         assert!(parsed.get("secure_boot_enabled").is_some());
     }
-
 }

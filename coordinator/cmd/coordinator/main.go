@@ -313,7 +313,7 @@ func main() {
 
 	// Configure billing service (Stripe-only).
 	billingCfg := billing.Config{
-	// Mnemonic — used for coordinator encryption key derivation (e2e.DeriveCoordinatorKey).
+		// Mnemonic — used for coordinator encryption key derivation (e2e.DeriveCoordinatorKey).
 		EncryptionMnemonic: firstNonEmpty(
 			os.Getenv("MNEMONIC"),
 			os.Getenv("EIGENINFERENCE_MNEMONIC"),
