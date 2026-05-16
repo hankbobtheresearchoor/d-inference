@@ -33,6 +33,8 @@ import (
 	"github.com/eigeninference/d-inference/coordinator/store"
 	"github.com/google/uuid"
 	"nhooyr.io/websocket"
+
+	"github.com/eigeninference/d-inference/coordinator/api/types"
 )
 
 const (
@@ -1533,7 +1535,7 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 							if objType == "chat.completion" {
 								normalizeCompleteChatResponse(obj, pr.Model)
 								if pr.IsResponsesAPI {
-									var chatResp chatCompletionResponse
+									var chatResp types.ChatCompletionResponse
 									b, _ := json.Marshal(obj)
 									json.Unmarshal(b, &chatResp)
 									respObj := chatCompletionToResponses(chatResp, pr.Model, pr.SESignature, pr.ResponseHash)
@@ -1894,40 +1896,21 @@ func extractMessage(chunks []string) extractedMessage {
 	return msg
 }
 
-// responsesUsageDetail holds token breakdown details.
-type responsesUsageDetail struct {
-	CachedTokens    int `json:"cached_tokens,omitempty"`
-	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
-}
-
-// responsesUsage is the usage object in a Responses API response.
-type responsesUsage struct {
-	InputTokens        int                  `json:"input_tokens"`
-	InputTokensDetail  responsesUsageDetail `json:"input_tokens_details"`
-	OutputTokens       int                  `json:"output_tokens"`
-	OutputTokensDetail responsesUsageDetail `json:"output_tokens_details"`
-}
-
-func buildResponsesUsage(promptTokens, completionTokens uint64, reasoningTokens uint64) responsesUsage {
-	return responsesUsage{
+func buildResponsesUsage(promptTokens, completionTokens uint64, reasoningTokens uint64) types.ResponsesUsage {
+	return types.ResponsesUsage{
 		InputTokens:        int(promptTokens),
-		InputTokensDetail:  responsesUsageDetail{},
+		InputTokensDetail:  types.ResponsesUsageDetail{},
 		OutputTokens:       int(completionTokens),
-		OutputTokensDetail: responsesUsageDetail{ReasoningTokens: int(reasoningTokens)},
+		OutputTokensDetail: types.ResponsesUsageDetail{ReasoningTokens: int(reasoningTokens)},
 	}
-}
-
-// responsesIncompleteDetail is the incomplete_details block.
-type responsesIncompleteDetail struct {
-	Reason string `json:"reason"`
 }
 
 func buildResponsesIncompleteDetails(finishReason string) any {
 	switch finishReason {
 	case "length":
-		return responsesIncompleteDetail{Reason: "max_output_tokens"}
+		return types.ResponsesIncompleteDetail{Reason: "max_output_tokens"}
 	case "content_filter":
-		return responsesIncompleteDetail{Reason: "content_filter"}
+		return types.ResponsesIncompleteDetail{Reason: "content_filter"}
 	default:
 		return nil
 	}
@@ -1983,25 +1966,12 @@ func appendResponsesOutputItems(output []any, requestID string, msg extractedMes
 	return output
 }
 
-// responsesResponse is an OpenAI-compatible Responses API response.
-type responsesResponse struct {
-	ID               string `json:"id"`
-	Object           string `json:"object"`
-	CreatedAt        int64  `json:"created_at"`
-	Model            string `json:"model"`
-	Output           []any  `json:"output"`
-	Usage            any    `json:"usage"`
-	IncompleteDetail any    `json:"incomplete_details,omitempty"`
-	SESignature      string `json:"se_signature,omitempty"`
-	ResponseHash     string `json:"response_hash,omitempty"`
-}
-
-func buildResponsesResponse(requestID, model string, msg extractedMessage, usage protocol.UsageInfo, seSignature, responseHash string) responsesResponse {
+func buildResponsesResponse(requestID, model string, msg extractedMessage, usage protocol.UsageInfo, seSignature, responseHash string) types.ResponsesResponse {
 	reasoningTokens := uint64(0)
 	if msg.Reasoning != "" {
 		reasoningTokens = uint64(usage.CompletionTokens)
 	}
-	resp := responsesResponse{
+	resp := types.ResponsesResponse{
 		ID:        "resp_" + strings.ReplaceAll(requestID, "-", ""),
 		Object:    "response",
 		CreatedAt: time.Now().Unix(),
@@ -2016,14 +1986,14 @@ func buildResponsesResponse(requestID, model string, msg extractedMessage, usage
 	return resp
 }
 
-func firstChoice(resp chatCompletionResponse) *chatCompletionChoice {
+func firstChoice(resp types.ChatCompletionResponse) *types.ChatCompletionChoice {
 	if len(resp.Choices) == 0 {
 		return nil
 	}
 	return &resp.Choices[0]
 }
 
-func chatUsageToResponsesUsage(resp chatCompletionResponse, reasoning string) responsesUsage {
+func chatUsageToResponsesUsage(resp types.ChatCompletionResponse, reasoning string) types.ResponsesUsage {
 	reasoningTokens := 0
 	if reasoning != "" {
 		reasoningTokens = resp.Usage.CompletionTokens
@@ -2031,7 +2001,7 @@ func chatUsageToResponsesUsage(resp chatCompletionResponse, reasoning string) re
 	return buildResponsesUsage(uint64(resp.Usage.PromptTokens), uint64(resp.Usage.CompletionTokens), uint64(reasoningTokens))
 }
 
-func chatCompletionToResponses(resp chatCompletionResponse, requestedModel, seSignature, responseHash string) responsesResponse {
+func chatCompletionToResponses(resp types.ChatCompletionResponse, requestedModel, seSignature, responseHash string) types.ResponsesResponse {
 	requestID := strings.TrimPrefix(resp.ID, "chatcmpl-")
 	if requestID == "" {
 		requestID = uuid.NewString()
@@ -2050,7 +2020,7 @@ func chatCompletionToResponses(resp chatCompletionResponse, requestedModel, seSi
 		msg.ToolCalls = choice.Message.ToolCalls
 	}
 
-	r := responsesResponse{
+	r := types.ResponsesResponse{
 		ID:        "resp_" + strings.ReplaceAll(requestID, "-", ""),
 		Object:    "response",
 		CreatedAt: int64(created),
@@ -2068,44 +2038,8 @@ func chatCompletionToResponses(resp chatCompletionResponse, requestedModel, seSi
 	return r
 }
 
-// buildNonStreamingResponse constructs a complete OpenAI-compatible chat
-// completion response from the aggregated message and usage info.
-// chatCompletionMessage is the assistant message in a chat completion choice.
-type chatCompletionMessage struct {
-	Role      string           `json:"role"`
-	Content   string           `json:"content"`
-	Reasoning string           `json:"reasoning,omitempty"`
-	ToolCalls []map[string]any `json:"tool_calls,omitempty"`
-}
-
-// chatCompletionChoice is a single choice in a chat completion response.
-type chatCompletionChoice struct {
-	Index        int                   `json:"index"`
-	Message      chatCompletionMessage `json:"message"`
-	FinishReason string                `json:"finish_reason"`
-}
-
-// chatCompletionUsage is token usage in a chat completion response.
-type chatCompletionUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
-
-// chatCompletionResponse is an OpenAI-compatible chat completion response.
-type chatCompletionResponse struct {
-	ID           string                 `json:"id"`
-	Object       string                 `json:"object"`
-	Created      int64                  `json:"created"`
-	Model        string                 `json:"model"`
-	Choices      []chatCompletionChoice `json:"choices"`
-	Usage        chatCompletionUsage    `json:"usage"`
-	SESignature  string                 `json:"se_signature,omitempty"`
-	ResponseHash string                 `json:"response_hash,omitempty"`
-}
-
-func buildNonStreamingResponse(requestID, model string, msg extractedMessage, usage protocol.UsageInfo, seSignature, responseHash string) chatCompletionResponse {
-	message := chatCompletionMessage{
+func buildNonStreamingResponse(requestID, model string, msg extractedMessage, usage protocol.UsageInfo, seSignature, responseHash string) types.ChatCompletionResponse {
+	message := types.ChatCompletionMessage{
 		Role:    "assistant",
 		Content: msg.Content,
 	}
@@ -2119,17 +2053,17 @@ func buildNonStreamingResponse(requestID, model string, msg extractedMessage, us
 		finishReason = "tool_calls"
 	}
 
-	resp := chatCompletionResponse{
+	resp := types.ChatCompletionResponse{
 		ID:      "chatcmpl-" + requestID,
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   model,
-		Choices: []chatCompletionChoice{{
+		Choices: []types.ChatCompletionChoice{{
 			Index:        0,
 			Message:      message,
 			FinishReason: finishReason,
 		}},
-		Usage: chatCompletionUsage{
+		Usage: types.ChatCompletionUsage{
 			PromptTokens:     usage.PromptTokens,
 			CompletionTokens: usage.CompletionTokens,
 			TotalTokens:      usage.PromptTokens + usage.CompletionTokens,
@@ -2142,39 +2076,6 @@ func buildNonStreamingResponse(requestID, model string, msg extractedMessage, us
 	}
 
 	return resp
-}
-
-// modelAttestation is the attestation metadata for a model in /v1/models.
-type modelAttestation struct {
-	SecureEnclave bool `json:"secure_enclave"`
-	SIPEnabled    bool `json:"sip_enabled"`
-	SecureBoot    bool `json:"secure_boot"`
-}
-
-// modelMetadata is the metadata block for a model in /v1/models.
-type modelMetadata struct {
-	ModelType         string            `json:"model_type"`
-	Quantization      string            `json:"quantization"`
-	ProviderCount     int               `json:"provider_count"`
-	AttestedProviders int               `json:"attested_providers"`
-	TrustLevel        string            `json:"trust_level"`
-	Attestation       *modelAttestation `json:"attestation,omitempty"`
-	DisplayName       string            `json:"display_name,omitempty"`
-}
-
-// modelEntry is a single model entry in the /v1/models response.
-type modelEntry struct {
-	ID       string        `json:"id"`
-	Object   string        `json:"object"`
-	Created  int           `json:"created"`
-	OwnedBy  string        `json:"owned_by"`
-	Metadata modelMetadata `json:"metadata"`
-}
-
-// modelListResponse is the top-level /v1/models response.
-type modelListResponse struct {
-	Object string       `json:"object"`
-	Data   []modelEntry `json:"data"`
 }
 
 // handleListModels handles GET /v1/models.
@@ -2194,13 +2095,13 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	data := make([]modelEntry, 0, len(models))
+	data := make([]types.ModelEntry, 0, len(models))
 	for _, m := range models {
 		cm, inCatalog := catalogByID[m.ID]
 		if len(catalogByID) > 0 && !inCatalog {
 			continue
 		}
-		metadata := modelMetadata{
+		metadata := types.ModelMetadata{
 			ModelType:         m.ModelType,
 			Quantization:      m.Quantization,
 			ProviderCount:     m.Providers,
@@ -2208,7 +2109,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 			TrustLevel:        string(m.TrustLevel),
 		}
 		if m.Attestation != nil {
-			metadata.Attestation = &modelAttestation{
+			metadata.Attestation = &types.ModelAttestation{
 				SecureEnclave: m.Attestation.SecureEnclave,
 				SIPEnabled:    m.Attestation.SIPEnabled,
 				SecureBoot:    m.Attestation.SecureBoot,
@@ -2217,7 +2118,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		if inCatalog && cm.DisplayName != "" {
 			metadata.DisplayName = cm.DisplayName
 		}
-		data = append(data, modelEntry{
+		data = append(data, types.ModelEntry{
 			ID:       m.ID,
 			Object:   "model",
 			Created:  0,
@@ -2226,21 +2127,10 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	writeJSON(w, http.StatusOK, modelListResponse{
+	writeJSON(w, http.StatusOK, types.ModelListResponse{
 		Object: "list",
 		Data:   data,
 	})
-}
-
-// createKeyResponse is the POST /v1/auth/keys response.
-type createKeyResponse struct {
-	APIKey    string `json:"api_key"`
-	AccountID string `json:"account_id"`
-}
-
-// revokeKeyResponse is the DELETE /v1/auth/keys response.
-type revokeKeyResponse struct {
-	Status string `json:"status"`
 }
 
 // handleCreateKey handles POST /v1/auth/keys — creates a new consumer API key.
@@ -2259,7 +2149,7 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errorResponse("server_error", "failed to create key"))
 		return
 	}
-	writeJSON(w, http.StatusOK, createKeyResponse{
+	writeJSON(w, http.StatusOK, types.CreateKeyResponse{
 		APIKey:    key,
 		AccountID: user.AccountID,
 	})
@@ -2294,35 +2184,17 @@ func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, revokeKeyResponse{Status: "revoked"})
+	writeJSON(w, http.StatusOK, types.RevokeKeyResponse{Status: "revoked"})
 }
 
 // handleHealth handles GET /health.
 // Returns the coordinator's status and the number of connected providers.
 // This endpoint does not require authentication.
-// healthResponse is the GET /health response.
-type healthResponse struct {
-	Status    string `json:"status"`
-	Providers int    `json:"providers"`
-}
-
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, healthResponse{
+	writeJSON(w, http.StatusOK, types.HealthResponse{
 		Status:    "ok",
 		Providers: s.registry.ProviderCount(),
 	})
-}
-
-// versionResponse is the GET /api/version response.
-type versionResponse struct {
-	Version      string `json:"version"`
-	Platform     string `json:"platform,omitempty"`
-	Backend      string `json:"backend,omitempty"`
-	DownloadURL  string `json:"download_url"`
-	BinaryHash   string `json:"binary_hash,omitempty"`
-	BundleHash   string `json:"bundle_hash,omitempty"`
-	MetallibHash string `json:"metallib_hash,omitempty"`
-	Changelog    string `json:"changelog,omitempty"`
 }
 
 // handleVersion returns the latest provider CLI version and download URL.
@@ -2336,10 +2208,10 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var resp versionResponse
+	var resp types.VersionResponse
 	// Try release table first.
 	if release := s.store.GetLatestRelease("macos-arm64"); release != nil {
-		resp = versionResponse{
+		resp = types.VersionResponse{
 			Version:      release.Version,
 			Platform:     release.Platform,
 			Backend:      release.Backend,
@@ -2356,7 +2228,7 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 			scheme = "http"
 		}
 		downloadURL := fmt.Sprintf("%s://%s/dl/eigeninference-bundle-macos-arm64.tar.gz", scheme, r.Host)
-		resp = versionResponse{
+		resp = types.VersionResponse{
 			Version:     LatestProviderVersion,
 			DownloadURL: downloadURL,
 		}
@@ -2372,14 +2244,6 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 
 // --- payment handlers ---
 
-// balanceResponse is the GET /v1/payments/balance response.
-type balanceResponse struct {
-	BalanceMicroUSD      int64  `json:"balance_micro_usd"`
-	BalanceUSD           string `json:"balance_usd"`
-	WithdrawableMicroUSD int64  `json:"withdrawable_micro_usd"`
-	WithdrawableUSD      string `json:"withdrawable_usd"`
-}
-
 // handleBalance handles GET /v1/payments/balance.
 // Returns the consumer's current balance in both micro-USD and USD.
 func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
@@ -2387,17 +2251,12 @@ func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
 	balance := s.ledger.Balance(consumerKey)
 	withdrawable := s.store.GetWithdrawableBalance(consumerKey)
 
-	writeJSON(w, http.StatusOK, balanceResponse{
+	writeJSON(w, http.StatusOK, types.BalanceResponse{
 		BalanceMicroUSD:      balance,
 		BalanceUSD:           fmt.Sprintf("%.6f", float64(balance)/1_000_000),
 		WithdrawableMicroUSD: withdrawable,
 		WithdrawableUSD:      fmt.Sprintf("%.6f", float64(withdrawable)/1_000_000),
 	})
-}
-
-// usageResponse is the GET /v1/payments/usage response.
-type usageResponse struct {
-	Usage []payments.UsageEntry `json:"usage"`
 }
 
 // handleUsage handles GET /v1/payments/usage.
@@ -2428,21 +2287,9 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, usageResponse{
+	writeJSON(w, http.StatusOK, types.UsageResponse{
 		Usage: entries,
 	})
-}
-
-// providerEarningsResponse is the GET /v1/provider/earnings response.
-type providerEarningsResponse struct {
-	WalletAddress       string              `json:"wallet_address"`
-	BalanceMicroUSD     int64               `json:"balance_micro_usd"`
-	BalanceUSD          string              `json:"balance_usd"`
-	TotalEarnedMicroUSD int64               `json:"total_earned_micro_usd"`
-	TotalEarnedUSD      string              `json:"total_earned_usd"`
-	TotalJobs           int                 `json:"total_jobs"`
-	Payouts             []payments.Payout   `json:"payouts"`
-	Ledger              []store.LedgerEntry `json:"ledger"`
 }
 
 // handleProviderEarnings handles GET /v1/provider/earnings?wallet=0x...
@@ -2501,7 +2348,7 @@ func (s *Server) handleProviderEarnings(w http.ResponseWriter, r *http.Request) 
 		walletPayouts = []payments.Payout{}
 	}
 
-	writeJSON(w, http.StatusOK, providerEarningsResponse{
+	writeJSON(w, http.StatusOK, types.ProviderEarningsResponse{
 		WalletAddress:       wallet,
 		BalanceMicroUSD:     balance,
 		BalanceUSD:          fmt.Sprintf("%.6f", float64(balance)/1_000_000),
