@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eigeninference/d-inference/coordinator/api/types"
 	"github.com/eigeninference/d-inference/coordinator/internal/e2e"
 	"github.com/eigeninference/d-inference/coordinator/protocol"
 	"github.com/eigeninference/d-inference/coordinator/registry"
@@ -1023,14 +1024,14 @@ func TestResponsesInputToolTranscriptToChatMessages(t *testing.T) {
 }
 
 func TestChatCompletionToResponses(t *testing.T) {
-	chat := chatCompletionResponse{
+	chat := types.ChatCompletionResponse{
 		ID:      "chatcmpl-test",
 		Object:  "chat.completion",
 		Created: 123,
 		Model:   "local-path",
-		Choices: []chatCompletionChoice{{
+		Choices: []types.ChatCompletionChoice{{
 			FinishReason: "tool_calls",
-			Message: chatCompletionMessage{
+			Message: types.ChatCompletionMessage{
 				Role:      "assistant",
 				Content:   "",
 				Reasoning: "need weather",
@@ -1046,7 +1047,7 @@ func TestChatCompletionToResponses(t *testing.T) {
 				},
 			},
 		}},
-		Usage: chatCompletionUsage{
+		Usage: types.ChatCompletionUsage{
 			PromptTokens:     10,
 			CompletionTokens: 5,
 			TotalTokens:      15,
@@ -1065,7 +1066,7 @@ func TestChatCompletionToResponses(t *testing.T) {
 	if call["type"] != "function_call" || call["call_id"] != "call_123" {
 		t.Fatalf("function call output = %#v", call)
 	}
-	usage := got.Usage.(responsesUsage)
+	usage := got.Usage.(types.ResponsesUsage)
 	if usage.InputTokens != 10 || usage.OutputTokens != 5 {
 		t.Fatalf("usage = %#v", usage)
 	}

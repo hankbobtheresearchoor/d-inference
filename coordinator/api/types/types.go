@@ -37,14 +37,14 @@ type ChatCompletionUsage struct {
 
 // ChatCompletionResponse is an OpenAI-compatible chat completion response.
 type ChatCompletionResponse struct {
-	ID           string                `json:"id"`
-	Object       string                `json:"object"`
-	Created      int64                 `json:"created"`
-	Model        string                `json:"model"`
+	ID           string                 `json:"id"`
+	Object       string                 `json:"object"`
+	Created      int64                  `json:"created"`
+	Model        string                 `json:"model"`
 	Choices      []ChatCompletionChoice `json:"choices"`
 	Usage        ChatCompletionUsage    `json:"usage"`
-	SESignature  string                `json:"se_signature,omitempty"`
-	ResponseHash string                `json:"response_hash,omitempty"`
+	SESignature  string                 `json:"se_signature,omitempty"`
+	ResponseHash string                 `json:"response_hash,omitempty"`
 }
 
 // ── Responses API ────────────────────────────────────────────────────
