@@ -57,7 +57,7 @@ jobs:
     env:
       DARKBLOOM_REPO_ROOT: ${{ github.workspace }}
       TESTBED_PROVIDER_CONFIG: debug
-      BENCHMARK_MD_PATH: /tmp/benchmark-results.md
+      BENCHMARK_MD_PATH: ${{ github.workspace }}/benchmark-results.md
       RUNNER_DESC: macos-15 (M1 Virtual)
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -95,14 +95,99 @@ jobs:
           go test ./e2e/ -count=1 -v -timeout 25m -p=1 \
             -run 'TestBenchmark'
 
-      - name: Post benchmark results
-        if: always()
+      - name: Generate compact summary
+        if: always() && hashFiles('benchmark-results.md') != ''
+        env:
+          GH_SHA: ${{ github.sha }}
+          BENCH_CDN: ${{ vars.BENCHMARK_CDN_URL || 'https://storage.googleapis.com/darkbloom-benchmarks' }}
         run: |
-          if [ ! -f /tmp/benchmark-results.md ]; then
-            echo "No benchmark results file found"
-            exit 0
-          fi
-          BODY=$(cat /tmp/benchmark-results.md)
+          python3 << 'PYEOF'
+          import re, os, sys
+
+          md = open("benchmark-results.md").read()
+
+          # Parse runner line
+          runner = "unknown"
+          for line in md.splitlines():
+              if line.startswith("Runner:"):
+                  runner = line
+                  break
+
+          # Extract scenario sections
+          sections = re.split(r'\n## ', '\n' + md)[1:]  # skip anything before first ##
+
+          scenarios = []
+          for sec in sections:
+              lines = sec.strip().splitlines()
+              name = lines[0].strip()
+              # Find e2e P50/P95 from latency decomposition
+              p50_e2e = p95_e2e = ""
+              in_decomp = False
+              for l in lines:
+                  if l.startswith("| total_e2e"):
+                      in_decomp = True
+                      parts = [p.strip() for p in l.split("|") if p.strip()]
+                      if len(parts) >= 5:
+                          p50_e2e = parts[3]  # Segment, Count, Mean, P50, P95
+                          p95_e2e = parts[4] if len(parts) > 4 else ""
+                      break
+
+              # Extract metrics: Total Requests, Success, Errors, Throughput
+              reqs = succ = errs = thrpt = ""
+              for l in lines:
+                  m = re.match(r'\|\s*Total Requests\s*\|\s*(\S+)\s*\|', l)
+                  if m: reqs = m.group(1)
+                  m = re.match(r'\|\s*Success\s*\|\s*(\S+)\s*\|', l)
+                  if m: succ = m.group(1)
+                  m = re.match(r'\|\s*Errors\s*\|\s*(\S+)\s*\|', l)
+                  if m: errs = m.group(1)
+                  m = re.match(r'\|\s*Throughput\s*\|\s*([\d.]+)\s*req/s\s*\|', l)
+                  if m: thrpt = f"{m.group(1)}/s"
+
+              # Assertion result
+              assertion = ""
+              for l in lines:
+                  m = re.match(r'###\s*Assertion Report:\s*(PASS|FAIL)', l)
+                  if m:
+                      assertion = m.group(1)
+                      break
+
+              icon = "✅" if assertion == "PASS" else "❌" if assertion == "FAIL" else "—"
+              scenarios.append((name, reqs, succ, errs, thrpt, p50_e2e, p95_e2e, icon))
+
+          # Build compact summary
+          sha = os.environ.get("GH_SHA", "")[:7]
+          cdn = os.environ.get("BENCH_CDN", "https://storage.googleapis.com/darkbloom-benchmarks")
+
+          summary = "## ⚡ E2E Benchmarks\n\n"
+          summary += f"{runner}\n\n"
+          summary += "| Scenario | Req | OK | Thrpt | P50 e2e | P95 e2e | |\n"
+          summary += "|---|---|---|---|---|---|---|\n"
+          for (name, reqs, succ, errs, thrpt, p50, p95, icon) in scenarios:
+              summary += f"| {name} | {reqs} | {succ} | {thrpt} | {p50} | {p95} | {icon} |\n"
+
+          summary += f"\n[📋 Full results]({cdn}/{sha}.md)\n"
+
+          with open("benchmark-summary.md", "w") as f:
+              f.write(summary)
+          print("Summary generated")
+          PYEOF
+
+      - name: Upload to GCS
+        if: always() && hashFiles('benchmark-results.md') != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.GCS_HMAC_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.GCS_HMAC_SECRET }}
+        run: |
+          aws s3 cp benchmark-results.md \
+            "s3://darkbloom-benchmarks/${{ github.sha }}.md" \
+            --endpoint-url "https://storage.googleapis.com" \
+            --content-type "text/markdown"
+
+      - name: Post benchmark summary
+        if: always() && hashFiles('benchmark-summary.md') != ''
+        run: |
+          BODY=$(cat benchmark-summary.md)
           gh pr comment ${{ github.event.pull_request.number }} \
             --body "$BODY" \
             --edit-last \
