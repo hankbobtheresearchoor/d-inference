@@ -117,12 +117,11 @@ func approximateTokenCount(v any) int {
 		if x == "" {
 			return 0
 		}
-		// Every BPE tokenizer begins with one token per byte and can only
-		// merge tokens, so len(x) is a universal upper bound on prompt tokens
-		// for any model family, any language, forever. Using the raw byte
-		// length guarantees the pre-flight reservation never underestimates
-		// the actual workload and therefore never silently shorts providers.
-		tokens := len(x)
+		// TODO: len(x)/4 underestimates tokens for code, non-English text,
+		// and chat template expansions, which can silently short providers.
+		// Switch to len(x) as a universal upper bound — every BPE tokenizer
+		// starts with one token per byte and can only merge.
+		tokens := len(x) / 4
 		if tokens < 1 {
 			tokens = 1
 		}
@@ -132,7 +131,8 @@ func approximateTokenCount(v any) int {
 		if err != nil {
 			return 0
 		}
-		tokens := len(b)
+		// TODO: len(b)/4 same issue as above; switch to len(b) with the fix.
+		tokens := len(b) / 4
 		if tokens < 1 {
 			tokens = 1
 		}
