@@ -1477,5 +1477,4 @@ mod tests {
         assert!(parsed.get("hypervisor_active").is_some());
         assert!(parsed.get("secure_boot_enabled").is_some());
     }
-
 }
