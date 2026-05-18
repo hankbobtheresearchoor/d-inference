@@ -1122,8 +1122,6 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 				s.ddCount("billing.provider_credits_micro_usd", providerPayout, []string{"model:" + pr.Model, "type:account"})
 			}
 		}
-			}
-		}
 
 		// Record platform fee, distributing referral rewards if applicable.
 		platformFee := payments.PlatformFee(totalCost)

@@ -478,28 +478,22 @@ func providerHasPayoutDestination(provider *registry.Provider) bool {
 	}
 	provider.Mu().Lock()
 	defer provider.Mu().Unlock()
-	return provider.AccountID != "" || provider.WalletAddress != ""
+	return provider.AccountID != ""
 }
 
-func providerPricingKeys(provider *registry.Provider) (accountID, walletAddress string) {
+func providerPricingKeys(provider *registry.Provider) string {
 	if provider == nil {
-		return "", ""
+		return ""
 	}
 	provider.Mu().Lock()
 	defer provider.Mu().Unlock()
-	return provider.AccountID, provider.WalletAddress
+	return provider.AccountID
 }
 
 func (s *Server) providerReservationCost(provider *registry.Provider, model string, promptTokens, maxTokens int) int64 {
-	accountID, wallet := providerPricingKeys(provider)
+	accountID := providerPricingKeys(provider)
 	if accountID != "" {
 		customIn, customOut, hasCustom := s.store.GetModelPrice(accountID, model)
-		if hasCustom {
-			return payments.CalculateCostWithOverrides(model, promptTokens, maxTokens, customIn, customOut, true)
-		}
-	}
-	if wallet != "" {
-		customIn, customOut, hasCustom := s.store.GetModelPrice(wallet, model)
 		if hasCustom {
 			return payments.CalculateCostWithOverrides(model, promptTokens, maxTokens, customIn, customOut, true)
 		}

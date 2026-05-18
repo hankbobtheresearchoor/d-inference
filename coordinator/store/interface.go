@@ -494,10 +494,10 @@ type ModelPrice struct {
 
 // User represents a consumer account linked to a Privy identity.
 type User struct {
-	AccountID           string    `json:"account_id"`            // internal account ID (used in ledger)
-	PrivyUserID         string    `json:"privy_user_id"`         // Privy DID (e.g. "did:privy:abc123")
-	Email               string    `json:"email,omitempty"`       // from Privy linked accounts
-	CreatedAt           time.Time `json:"created_at"`
+	AccountID   string    `json:"account_id"`      // internal account ID (used in ledger)
+	PrivyUserID string    `json:"privy_user_id"`   // Privy DID (e.g. "did:privy:abc123")
+	Email       string    `json:"email,omitempty"` // from Privy linked accounts
+	CreatedAt   time.Time `json:"created_at"`
 
 	// Stripe Connect Express — for bank/card payouts via Stripe.
 	// StripeAccountStatus mirrors the readiness of payouts on the connected
