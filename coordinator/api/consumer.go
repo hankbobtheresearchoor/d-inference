@@ -289,6 +289,10 @@ func approximateTokenCount(v any) int {
 		if x == "" {
 			return 0
 		}
+		// TODO: len(x)/4 underestimates tokens for code, non-English text,
+		// and chat template expansions, which can silently short providers.
+		// Switch to len(x) as a universal upper bound — every BPE tokenizer
+		// starts with one token per byte and can only merge.
 		tokens := len(x) / 4
 		if tokens < 1 {
 			tokens = 1
@@ -299,6 +303,7 @@ func approximateTokenCount(v any) int {
 		if err != nil {
 			return 0
 		}
+		// TODO: len(b)/4 same issue as above; switch to len(b) with the fix.
 		tokens := len(b) / 4
 		if tokens < 1 {
 			tokens = 1
