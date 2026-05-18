@@ -1008,7 +1008,7 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 	// then hardcoded defaults.
 	providerAccountForPricing := ""
 	if p := s.registry.GetProvider(providerID); p != nil {
-		providerAccountForPricing = p.AccountID
+		providerAccountForPricing = providerPricingKeys(p)
 	}
 	customIn, customOut, hasCustom := s.store.GetModelPrice(providerAccountForPricing, pr.Model)
 	if !hasCustom {

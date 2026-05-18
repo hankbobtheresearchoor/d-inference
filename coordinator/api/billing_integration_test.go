@@ -494,7 +494,7 @@ func TestIntegration_ReservationRefundedOnCommittedProviderError(t *testing.T) {
 }
 
 func TestIntegration_SuccessfulInferenceCreditsProviderAccount(t *testing.T) {
-	srv, _, _ := billingTestServer(t)
+	srv, st, _ := billingTestServer(t)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -526,7 +526,11 @@ func TestIntegration_SuccessfulInferenceCreditsProviderAccount(t *testing.T) {
 	<-providerDone
 	time.Sleep(300 * time.Millisecond)
 
-	_ = accountID // used for provider identification via AccountID (not wallet)
+	// Verify provider account was credited with 95% of the inference cost.
+	expectedPayout := payments.ProviderPayout(payments.CalculateCost(model, usage.PromptTokens, usage.CompletionTokens))
+	if got := st.GetBalance(accountID); got != expectedPayout {
+		t.Errorf("provider account balance = %d, want %d", got, expectedPayout)
+	}
 }
 
 func TestIntegration_ProviderCustomPricePaidWithoutReservationClamp(t *testing.T) {
@@ -764,8 +768,17 @@ func TestIntegration_ReferralRewardDistribution(t *testing.T) {
 	}
 
 	model := "referral-test-model"
-	conn, _, pubKey := setupProviderForBilling(t, ctx, ts, srv.registry, model)
+	conn, providerID, pubKey := setupProviderForBilling(t, ctx, ts, srv.registry, model)
 	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	// Get the provider's account ID for payout verification.
+	p := srv.registry.GetProvider(providerID)
+	if p == nil {
+		t.Fatal("provider not found")
+	}
+	p.Mu().Lock()
+	providerAccountID := p.AccountID
+	p.Mu().Unlock()
 
 	// Provider serves one inference request.
 	usage := protocol.UsageInfo{PromptTokens: 1000, CompletionTokens: 500}
@@ -795,19 +808,12 @@ func TestIntegration_ReferralRewardDistribution(t *testing.T) {
 		t.Errorf("consumer balance = %d, want %d (charged %d)", actualConsumerBalance, expectedConsumerBalance, totalCost)
 	}
 
-	// Verify provider got 95% of the charge.
-	// The provider in this test has no account linkage (connected via connectProvider),
-	// so payout goes to the provider address. Since connectProvider does not set a
-	// provider address, let's check the ledger's pending payouts instead.
-	// Provider without AccountID and without provider address won't receive payout
-	// via CreditProviderAccount. But the cost flow is:
-	// handleComplete checks p.AccountID first, then provider address.
-	// connectProvider doesn't set either, so no provider credit occurs.
-	// Verify the math is correct by checking the provider payout calculation.
-	if expectedProviderPayout != payments.ProviderPayout(totalCost) {
-		t.Errorf("provider payout calculation mismatch")
+	// Verify provider got 95% of the charge credited to their account.
+	// setupProviderForBilling links the provider to an account via test-account-<id>.
+	if got := st.GetBalance(providerAccountID); got != expectedProviderPayout {
+		t.Errorf("provider account balance = %d, want %d (95%% of totalCost %d)",
+			got, expectedProviderPayout, totalCost)
 	}
-	_ = expectedProviderPayout // used in fee split check below
 
 	// Verify referrer got their share.
 	referrerBalance := st.GetBalance(referrerAccountID)

@@ -240,6 +240,14 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			PRIMARY KEY (account_id, model)
 		)`,
 
+		// Clean up wallet-keyed custom prices: with the removal of wallet-based
+		// payouts, model_prices rows keyed by Solana wallet addresses are unreachable.
+		// Providers must re-enter custom prices under their Stripe Connect account ID.
+		`DO $$ BEGIN
+			DELETE FROM model_prices WHERE account_id NOT IN (SELECT account_id FROM users);
+		EXCEPTION WHEN others THEN NULL;
+		END $$`,
+
 		// Users — Privy identity → internal account mapping
 		`CREATE TABLE IF NOT EXISTS users (
 			account_id TEXT PRIMARY KEY,
