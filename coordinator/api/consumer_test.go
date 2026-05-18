@@ -1066,9 +1066,25 @@ func TestChatCompletionToResponses(t *testing.T) {
 	if call["type"] != "function_call" || call["call_id"] != "call_123" {
 		t.Fatalf("function call output = %#v", call)
 	}
-	usage := got.Usage.(types.ResponsesUsage)
+	usage := got.Usage
 	if usage.InputTokens != 10 || usage.OutputTokens != 5 {
 		t.Fatalf("usage = %#v", usage)
+	}
+
+	// Verify wire format preserves zero-valued fields.
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	wire := string(b)
+	if !strings.Contains(wire, `"incomplete_details"`) {
+		t.Errorf("wire output missing incomplete_details field: %s", wire)
+	}
+	if !strings.Contains(wire, `"cached_tokens"`) {
+		t.Errorf("wire output missing cached_tokens in usage details: %s", wire)
+	}
+	if !strings.Contains(wire, `"reasoning_tokens"`) {
+		t.Errorf("wire output missing reasoning_tokens in usage details: %s", wire)
 	}
 }
 

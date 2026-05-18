@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -2239,7 +2240,6 @@ func writeResponsesStreamOutput(w http.ResponseWriter, flusher http.Flusher, pr 
 
 // handleNonStreamingResponseWithFirstChunk collects all chunks from the
 // provider and assembles them into a single OpenAI-compatible JSON response.
-
 // If firstChunk is non-empty, it is prepended to the collected chunks.
 func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter, r *http.Request, pr *registry.PendingRequest, firstChunk string) {
 	ctx, cancel := context.WithTimeout(r.Context(), inferenceTimeout)
@@ -2296,8 +2296,17 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 								normalizeCompleteChatResponse(obj, pr.Model)
 								if pr.IsResponsesAPI {
 									var chatResp types.ChatCompletionResponse
-									b, _ := json.Marshal(obj)
-									json.Unmarshal(b, &chatResp)
+									b, err := json.Marshal(obj)
+									if err != nil {
+										log.Printf("WARN: failed to marshal chat response for Responses API conversion: %v", err)
+										writeJSON(w, http.StatusBadGateway, errorResponse("provider_error", "invalid provider response"))
+										return
+									}
+									if err := json.Unmarshal(b, &chatResp); err != nil {
+										log.Printf("WARN: failed to unmarshal chat response into typed struct: %v", err)
+										writeJSON(w, http.StatusBadGateway, errorResponse("provider_error", "invalid provider response"))
+										return
+									}
 									respObj := chatCompletionToResponses(chatResp, pr.Model, pr.SESignature, pr.ResponseHash)
 									writeJSON(w, http.StatusOK, respObj)
 									return
@@ -2676,12 +2685,12 @@ func buildResponsesUsage(promptTokens, completionTokens uint64, reasoningTokens 
 	}
 }
 
-func buildResponsesIncompleteDetails(finishReason string) any {
+func buildResponsesIncompleteDetails(finishReason string) *types.ResponsesIncompleteDetail {
 	switch finishReason {
 	case "length":
-		return types.ResponsesIncompleteDetail{Reason: "max_output_tokens"}
+		return &types.ResponsesIncompleteDetail{Reason: "max_output_tokens"}
 	case "content_filter":
-		return types.ResponsesIncompleteDetail{Reason: "content_filter"}
+		return &types.ResponsesIncompleteDetail{Reason: "content_filter"}
 	default:
 		return nil
 	}

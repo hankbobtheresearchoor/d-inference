@@ -51,8 +51,8 @@ type ChatCompletionResponse struct {
 
 // ResponsesUsageDetail holds token breakdown details.
 type ResponsesUsageDetail struct {
-	CachedTokens    int `json:"cached_tokens,omitempty"`
-	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+	CachedTokens    int `json:"cached_tokens"`
+	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
 // ResponsesUsage is the usage object in a Responses API response.
@@ -70,15 +70,15 @@ type ResponsesIncompleteDetail struct {
 
 // ResponsesResponse is an OpenAI-compatible Responses API response.
 type ResponsesResponse struct {
-	ID               string `json:"id"`
-	Object           string `json:"object"`
-	CreatedAt        int64  `json:"created_at"`
-	Model            string `json:"model"`
-	Output           []any  `json:"output"`
-	Usage            any    `json:"usage"`
-	IncompleteDetail any    `json:"incomplete_details,omitempty"`
-	SESignature      string `json:"se_signature,omitempty"`
-	ResponseHash     string `json:"response_hash,omitempty"`
+	ID               string                     `json:"id"`
+	Object           string                     `json:"object"`
+	CreatedAt        int64                      `json:"created_at"`
+	Model            string                     `json:"model"`
+	Output           []any                      `json:"output"`
+	Usage            ResponsesUsage             `json:"usage"`
+	IncompleteDetail *ResponsesIncompleteDetail `json:"incomplete_details"`
+	SESignature      string                     `json:"se_signature,omitempty"`
+	ResponseHash     string                     `json:"response_hash,omitempty"`
 }
 
 // ── GET /v1/models ───────────────────────────────────────────────────
