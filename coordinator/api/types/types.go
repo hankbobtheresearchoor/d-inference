@@ -99,6 +99,9 @@ type ModelMetadata struct {
 	TrustLevel        string            `json:"trust_level"`
 	Attestation       *ModelAttestation `json:"attestation,omitempty"`
 	DisplayName       string            `json:"display_name,omitempty"`
+	RoutableProviders int               `json:"routable_providers"`
+	WarmProviders     int               `json:"warm_providers"`
+	CanAccept         bool              `json:"can_accept"`
 }
 
 // ModelEntry is a single model entry in the /v1/models response.
