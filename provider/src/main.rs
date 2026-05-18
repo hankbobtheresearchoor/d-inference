@@ -7202,7 +7202,6 @@ async fn cmd_logout() -> Result<()> {
 
     delete_auth_token()?;
     println!("Logged out. This machine is no longer linked to an account.");
-    println!("Provider earnings will use the local wallet until you log in again.");
     Ok(())
 }
 
