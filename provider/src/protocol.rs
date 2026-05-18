@@ -25,6 +25,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
 /// Messages sent from provider to coordinator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -259,6 +263,21 @@ pub struct BackendSlotCapacity {
     pub active_tokens: i64,
     /// Sum of max_tokens across running requests (worst-case future growth).
     pub max_tokens_potential: i64,
+    /// EWMA of measured per-request decode TPS (0 = not reported).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_decode_tps: Option<f64>,
+    /// Tokens reserved by active requests (prompt + max_output). 0 = not reported.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub active_token_budget_used: i64,
+    /// Maximum token budget for this slot. 0 = not reported.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub active_token_budget_max: i64,
+    /// Tokens reserved by queued requests. 0 = not reported.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub queued_token_budget: i64,
+    /// Per-token KV cache memory cost in bytes (0 = unknown/not reported).
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub kv_bytes_per_token: i64,
 }
 
 /// Aggregate backend capacity across all slots on a provider. Reported in
@@ -710,6 +729,11 @@ mod tests {
                     num_waiting: 1,
                     active_tokens: 5000,
                     max_tokens_potential: 12000,
+                    observed_decode_tps: None,
+                    active_token_budget_used: 0,
+                    active_token_budget_max: 0,
+                    queued_token_budget: 0,
+                    kv_bytes_per_token: 0,
                 },
                 BackendSlotCapacity {
                     model: "mlx-community/Gemma-4-27B-4bit".to_string(),
@@ -718,6 +742,11 @@ mod tests {
                     num_waiting: 0,
                     active_tokens: 0,
                     max_tokens_potential: 0,
+                    observed_decode_tps: None,
+                    active_token_budget_used: 0,
+                    active_token_budget_max: 0,
+                    queued_token_budget: 0,
+                    kv_bytes_per_token: 0,
                 },
             ],
             gpu_memory_active_gb: 45.2,
@@ -759,6 +788,11 @@ mod tests {
                     num_waiting: 0,
                     active_tokens: 3000,
                     max_tokens_potential: 8000,
+                    observed_decode_tps: None,
+                    active_token_budget_used: 0,
+                    active_token_budget_max: 0,
+                    queued_token_budget: 0,
+                    kv_bytes_per_token: 0,
                 }],
                 gpu_memory_active_gb: 25.5,
                 gpu_memory_peak_gb: 30.0,
