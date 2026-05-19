@@ -291,8 +291,15 @@ func approximateTokenCount(v any) int {
 		}
 		// TODO: len(x)/4 underestimates tokens for code, non-English text,
 		// and chat template expansions, which can silently short providers.
-		// Switch to len(x) as a universal upper bound — every BPE tokenizer
-		// starts with one token per byte and can only merge.
+		// Options, ordered by precision/effort:
+		// 1. len(x) — universal upper bound; every BPE tokenizer starts with
+		//    one token per byte and can only merge. Conservative, trivial.
+		// 2. Model-family ratio — classify the model to identify the
+		//    tokenizer family, then apply an appropriate chars/token ratio
+		//    (e.g. ~3.5 for English LLaMA, ~2.5 for code-heavy inputs).
+		//    Better precision than raw len(x) with low overhead.
+		// 3. Run the actual tokenizer for exact count (most precise,
+		//    highest overhead; worth it when the cost delta matters).
 		tokens := len(x) / 4
 		if tokens < 1 {
 			tokens = 1
@@ -303,7 +310,8 @@ func approximateTokenCount(v any) int {
 		if err != nil {
 			return 0
 		}
-		// TODO: len(b)/4 same issue as above; switch to len(b) with the fix.
+		// TODO: len(b)/4 same issue as above; see the string-branch
+		// comment for the three options (len(b), model-family ratio, tokenizer).
 		tokens := len(b) / 4
 		if tokens < 1 {
 			tokens = 1
