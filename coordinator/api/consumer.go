@@ -227,12 +227,12 @@ func (s *Server) dispatchOneProvider(
 		return nil, nil, decision, "failed to encrypt request", http.StatusInternalServerError
 	}
 
-	wireMsg := map[string]any{
-		"type":       protocol.TypeInferenceRequest,
-		"request_id": requestID,
-		"encrypted_body": map[string]string{
-			"ephemeral_public_key": encrypted.EphemeralPublicKey,
-			"ciphertext":           encrypted.Ciphertext,
+	wireMsg := protocol.InferenceRequestMessage{
+		Type:      protocol.TypeInferenceRequest,
+		RequestID: requestID,
+		EncryptedBody: &protocol.EncryptedPayload{
+			EphemeralPublicKey: encrypted.EphemeralPublicKey,
+			Ciphertext:         encrypted.Ciphertext,
 		},
 	}
 
