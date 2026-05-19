@@ -2877,6 +2877,12 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	datacenters := []types.DatacenterDetail{
+		{ID: "darkbloom-us-west", Name: "Darkbloom Edge", Location: "US West", LatencyMs: 25},
+	}
+	samplingParams := []string{"temperature", "top_p", "top_k", "max_tokens", "stop", "frequency_penalty", "presence_penalty"}
+	supportedFeatures := []string{"tools", "json_mode", "streaming"}
+
 	data := make([]types.ModelEntry, 0, len(models))
 	for _, m := range models {
 		cm, inCatalog := catalogByID[m.ID]
@@ -2910,48 +2916,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		if inCatalog && cm.DisplayName != "" {
 			metadata.DisplayName = cm.DisplayName
 		}
-		data = append(data, types.ModelEntry{
-			ID:       m.ID,
-			Object:   "model",
-			Created:  0,
-			OwnedBy:  "eigeninference",
-			Metadata: metadata,
-		})
-	}
-
-	writeJSON(w, http.StatusOK, types.ModelListResponse{
-		Object: "list",
-		Data:   data,
-	})
-}
-
-// handleListOpenRouterModels handles GET /v1/openrouter/models.
-func (s *Server) handleListOpenRouterModels(w http.ResponseWriter, r *http.Request) {
-	models := s.registry.ListModels()
-	capacities := s.registry.ModelCapacitySnapshot()
-	capByModel := make(map[string]*registry.ModelCapacity, len(capacities))
-	for i := range capacities {
-		capByModel[capacities[i].ModelID] = &capacities[i]
-	}
-	catalogModels := s.store.ListSupportedModels()
-	catalogByID := make(map[string]store.SupportedModel, len(catalogModels))
-	for _, cm := range catalogModels {
-		if cm.Active && !IsRetiredProviderModel(cm) {
-			catalogByID[cm.ID] = cm
-		}
-	}
-	datacenters := []types.OpenRouterDatacenter{
-		{ID: "darkbloom-us-west", Name: "Darkbloom Edge", Location: "US West", LatencyMs: 25},
-	}
-	samplingParams := []string{"temperature", "top_p", "top_k", "max_tokens", "stop", "frequency_penalty", "presence_penalty"}
-	supportedFeatures := []string{"tools", "json_mode", "streaming"}
-	providerMeta := &types.OpenRouterProviderMeta{SupportedParameters: samplingParams}
-	data := make([]types.OpenRouterModelEntry, 0, len(models))
-	for _, m := range models {
-		cm, inCatalog := catalogByID[m.ID]
-		if len(catalogByID) > 0 && !inCatalog {
-			continue
-		}
+		// Compute extended metadata fields.
 		name := m.ID
 		description := ""
 		if inCatalog {
@@ -2962,7 +2927,7 @@ func (s *Server) handleListOpenRouterModels(w http.ResponseWriter, r *http.Reque
 		}
 		contextLen := modelContextLength(m.ID)
 		maxOutputLen := modelMaxOutputLength(m.ID)
-		pricing := buildOpenRouterPricing(m.ID)
+		pricing := buildPricing(m.ID)
 		inputMods, outputMods := modelModalities(m.ModelType)
 		isReady := false
 		if cap, ok := capByModel[m.ID]; ok && cap.CanAccept {
@@ -2971,10 +2936,14 @@ func (s *Server) handleListOpenRouterModels(w http.ResponseWriter, r *http.Reque
 		if m.AttestedProviders == 0 {
 			isReady = false
 		}
-		entry := types.OpenRouterModelEntry{
+
+		data = append(data, types.ModelEntry{
 			ID:                          m.ID,
-			Name:                        name,
+			Object:                      "model",
 			Created:                     0,
+			OwnedBy:                     "eigeninference",
+			Metadata:                    metadata,
+			Name:                        name,
 			Description:                 description,
 			ContextLength:               contextLen,
 			MaxOutputLength:             maxOutputLen,
@@ -2986,13 +2955,13 @@ func (s *Server) handleListOpenRouterModels(w http.ResponseWriter, r *http.Reque
 			SupportedFeatures:           supportedFeatures,
 			HuggingFaceID:               m.ID,
 			IsReady:                     isReady,
-			OpenRouter:                  providerMeta,
 			Datacenters:                 datacenters,
-		}
-		data = append(data, entry)
+		})
 	}
-	writeJSON(w, http.StatusOK, types.OpenRouterModelListResponse{
-		Data: data,
+
+	writeJSON(w, http.StatusOK, types.ModelListResponse{
+		Object: "list",
+		Data:   data,
 	})
 }
 
@@ -3039,10 +3008,10 @@ func modelModalities(modelType string) ([]string, []string) {
 	}
 }
 
-func buildOpenRouterPricing(modelID string) []types.OpenRouterPricingTier {
+func buildPricing(modelID string) []types.PricingTier {
 	inMicro := payments.InputPricePerMillion(modelID)
 	outMicro := payments.OutputPricePerMillion(modelID)
-	return []types.OpenRouterPricingTier{
+	return []types.PricingTier{
 		{
 			Prompt:         microToUSDString(inMicro),
 			Completion:     microToUSDString(outMicro),
