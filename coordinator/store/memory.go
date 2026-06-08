@@ -12,7 +12,6 @@ package store
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -27,11 +26,23 @@ import (
 // Compile-time check that MemoryStore implements Store.
 var _ Store = (*MemoryStore)(nil)
 
+// keySpend tracks per-key spend for cap enforcement. Day buckets (UTC date →
+// micro-USD) let us answer daily/weekly/monthly windowed queries cheaply
+// (≤31 buckets retained); lifetime is a running total. Buckets older than the
+// retention horizon are pruned lazily on write.
+type keySpend struct {
+	lifetime int64
+	days     map[string]int64 // "2006-01-02" (UTC) → micro-USD
+}
+
+const keySpendRetentionDays = 40
+
 // MemoryStore manages API keys, usage records, payments, and balances in memory.
 type MemoryStore struct {
 	mu            sync.RWMutex
-	keys          map[string]bool   // key → valid
-	keyAccounts   map[string]string // key → accountID (owner)
+	keyRecords    map[string]*APIKey // raw key → record (metadata + limits)
+	keysByID      map[string]string  // public key ID → raw key
+	keySpend      map[string]*keySpend
 	usage         []UsageRecord
 	payments      []PaymentRecord
 	balances      map[string]int64 // accountID → micro-USD
@@ -51,8 +62,14 @@ type MemoryStore struct {
 	// Custom pricing
 	modelPrices map[string]ModelPrice // "accountID:model" → price
 
-	// Supported models (admin-managed catalog)
-	supportedModels map[string]*SupportedModel // modelID → model
+	// Model registry (manifest-backed catalog)
+	modelRegistry      map[string]*ModelRegistryEntry
+	modelVersions      map[string]*ModelVersion // modelID:version → version
+	modelVersionByID   map[int64]*ModelVersion
+	modelVersionFiles  map[int64][]ModelVersionFile
+	activeModelVersion map[string]int64 // modelID → modelVersionID
+	modelVersionSeq    int64
+	publishingAPIKeys  map[string]*PublishingAPIKey
 
 	// Users (Privy)
 	usersByPrivyID         map[string]*User // privyUserID → user
@@ -93,16 +110,22 @@ type MemoryStore struct {
 	reputationRecords  map[string]*ReputationRecord // providerID → reputation
 	serialToProviderID map[string]string            // serialNumber → providerID
 
-	// Telemetry ring buffer (bounded at memTelemetryCap)
-	telemetryEvents []TelemetryEventRecord
+	// Provider log reports
+	logReports   []LogReport
+	logReportSeq int64
+
+	// Provider sessions (connect→disconnect uptime history)
+	providerSessions   []ProviderSession
+	providerSessionSeq int64
 }
 
 // NewMemory creates a new MemoryStore. If adminKey is non-empty it is
 // pre-seeded as a valid API key for bootstrapping.
-func NewMemory(adminKey string) *MemoryStore {
+func NewMemory(scfg Config) *MemoryStore {
 	s := &MemoryStore{
-		keys:                          make(map[string]bool),
-		keyAccounts:                   make(map[string]string),
+		keyRecords:                    make(map[string]*APIKey),
+		keysByID:                      make(map[string]string),
+		keySpend:                      make(map[string]*keySpend),
 		usage:                         make([]UsageRecord, 0),
 		payments:                      make([]PaymentRecord, 0),
 		balances:                      make(map[string]int64),
@@ -114,7 +137,12 @@ func NewMemory(adminKey string) *MemoryStore {
 		referralCounts:                make(map[string]int),
 		billingSessions:               make(map[string]*BillingSession),
 		modelPrices:                   make(map[string]ModelPrice),
-		supportedModels:               make(map[string]*SupportedModel),
+		modelRegistry:                 make(map[string]*ModelRegistryEntry),
+		modelVersions:                 make(map[string]*ModelVersion),
+		modelVersionByID:              make(map[int64]*ModelVersion),
+		modelVersionFiles:             make(map[int64][]ModelVersionFile),
+		activeModelVersion:            make(map[string]int64),
+		publishingAPIKeys:             make(map[string]*PublishingAPIKey),
 		usersByPrivyID:                make(map[string]*User),
 		usersByAccountID:              make(map[string]*User),
 		usersByStripeAccountID:        make(map[string]*User),
@@ -134,10 +162,16 @@ func NewMemory(adminKey string) *MemoryStore {
 		providerRecords:               make(map[string]*ProviderRecord),
 		reputationRecords:             make(map[string]*ReputationRecord),
 		serialToProviderID:            make(map[string]string),
-		telemetryEvents:               make([]TelemetryEventRecord, 0, memTelemetryCap),
 	}
-	if adminKey != "" {
-		s.keys[adminKey] = true
+	if scfg.AdminKey != "" {
+		s.keyRecords[scfg.AdminKey] = &APIKey{
+			ID:         "key_admin_seed",
+			Name:       "admin",
+			Label:      KeyLabel(scfg.AdminKey),
+			LimitReset: KeyResetNone,
+			CreatedAt:  time.Now(),
+		}
+		s.keysByID["key_admin_seed"] = scfg.AdminKey
 	}
 	return s
 }
@@ -177,6 +211,12 @@ func (s *MemoryStore) Prune(maxEntries int) {
 	if n := len(s.providerPayouts); n > maxEntries {
 		s.providerPayouts = append([]ProviderPayout(nil), s.providerPayouts[n-maxEntries:]...)
 	}
+	if n := len(s.providerSessions); n > maxEntries {
+		s.providerSessions = append([]ProviderSession(nil), s.providerSessions[n-maxEntries:]...)
+	}
+	if n := len(s.logReports); n > maxEntries {
+		s.logReports = append([]LogReport(nil), s.logReports[n-maxEntries:]...)
+	}
 
 	// Expired device codes can be dropped outright.
 	now := time.Now()
@@ -189,60 +229,276 @@ func (s *MemoryStore) Prune(maxEntries int) {
 }
 
 // CreateKey generates a cryptographically random API key, stores it, and
-// returns it.
+// returns it. The key is unlinked to any account (legacy bootstrap helper).
 func (s *MemoryStore) CreateKey() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	key := "eigeninference-" + hex.EncodeToString(b)
-
-	s.mu.Lock()
-	s.keys[key] = true
-	s.mu.Unlock()
-
-	return key, nil
+	raw, _, err := s.CreateAPIKey("", APIKeyCreate{})
+	return raw, err
 }
 
 // CreateKeyForAccount generates a new API key linked to a specific account.
 func (s *MemoryStore) CreateKeyForAccount(accountID string) (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	key := "eigeninference-" + hex.EncodeToString(b)
-
-	s.mu.Lock()
-	s.keys[key] = true
-	s.keyAccounts[key] = accountID
-	s.mu.Unlock()
-
-	return key, nil
+	raw, _, err := s.CreateAPIKey(accountID, APIKeyCreate{})
+	return raw, err
 }
 
-// ValidateKey returns true if the given key exists and is valid.
+// CreateAPIKey mints a new API key with optional per-key limits.
+func (s *MemoryStore) CreateAPIKey(accountID string, opts APIKeyCreate) (string, *APIKey, error) {
+	raw, err := GenerateRawKey()
+	if err != nil {
+		return "", nil, err
+	}
+	id, err := GenerateKeyID()
+	if err != nil {
+		return "", nil, err
+	}
+	rec := &APIKey{
+		ID:             id,
+		OwnerAccountID: accountID,
+		Name:           opts.Name,
+		Label:          KeyLabel(raw),
+		KeyHash:        sha256Hex(raw),
+		LimitMicroUSD:  cloneInt64Ptr(opts.LimitMicroUSD),
+		LimitReset:     NormalizeResetWindow(opts.LimitReset),
+		RPMLimit:       cloneInt64Ptr(opts.RPMLimit),
+		ITPMLimit:      cloneInt64Ptr(opts.ITPMLimit),
+		OTPMLimit:      cloneInt64Ptr(opts.OTPMLimit),
+		AllowedModels:  append([]string(nil), opts.AllowedModels...),
+		SelfRouteOnly:  opts.SelfRouteOnly,
+		ExpiresAt:      cloneTimePtr(opts.ExpiresAt),
+		CreatedAt:      time.Now().UTC(),
+	}
+	s.mu.Lock()
+	s.keyRecords[raw] = rec
+	s.keysByID[id] = raw
+	s.mu.Unlock()
+	out := *rec
+	return raw, &out, nil
+}
+
+// ValidateKey returns true if the given key exists, is active, and is not
+// expired. Expiry is enforced here (not just in AuthenticateKey) so callers
+// like telemetry attribution don't treat an expired key as a live account.
 func (s *MemoryStore) ValidateKey(key string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.keys[key]
+	rec, ok := s.keyRecords[key]
+	if !ok || rec.Disabled {
+		return false
+	}
+	if rec.ExpiresAt != nil && time.Now().After(*rec.ExpiresAt) {
+		return false
+	}
+	return true
 }
 
 // GetKeyAccount returns the account ID that owns this key, or "" if unlinked.
 func (s *MemoryStore) GetKeyAccount(key string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.keyAccounts[key]
+	if rec, ok := s.keyRecords[key]; ok {
+		return rec.OwnerAccountID
+	}
+	return ""
 }
 
-// RevokeKey removes a key from the store. Returns true if the key existed.
+// ValidateKeyFull returns the active status and owner account ID for an
+// API key in a single lookup. Returns an error if the key does not exist.
+func (s *MemoryStore) ValidateKeyFull(key string) (bool, string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rec, ok := s.keyRecords[key]
+	if !ok {
+		return false, "", fmt.Errorf("key not found")
+	}
+	return !rec.Disabled, rec.OwnerAccountID, nil
+}
+
+// AuthenticateKey resolves a raw key to its active record for request auth.
+func (s *MemoryStore) AuthenticateKey(rawKey string) (*APIKey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rec, ok := s.keyRecords[rawKey]
+	if !ok {
+		return nil, fmt.Errorf("key not found")
+	}
+	if rec.Disabled {
+		return nil, fmt.Errorf("key disabled")
+	}
+	if rec.ExpiresAt != nil && time.Now().After(*rec.ExpiresAt) {
+		return nil, fmt.Errorf("key expired")
+	}
+	out := cloneAPIKey(rec)
+	return out, nil
+}
+
+// RevokeKey deactivates a key (soft-disable), matching PostgresStore semantics
+// and the Store interface contract ("deactivates a key"). The record is kept so
+// it still appears in ListAPIKeys as disabled. Returns true only if the key
+// existed AND was active (a second revoke returns false). By-ID deletion
+// (RevokeAPIKeyByID) is the hard-delete path.
 func (s *MemoryStore) RevokeKey(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.keys[key] {
-		delete(s.keys, key)
-		return true
+	rec, ok := s.keyRecords[key]
+	if !ok || rec.Disabled {
+		return false
 	}
-	return false
+	rec.Disabled = true
+	return true
+}
+
+// ListAPIKeys returns all keys owned by an account, newest first.
+func (s *MemoryStore) ListAPIKeys(accountID string) ([]APIKey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]APIKey, 0)
+	for _, rec := range s.keyRecords {
+		if rec.OwnerAccountID != accountID || rec.ID == "" {
+			continue
+		}
+		out = append(out, *cloneAPIKey(rec))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// GetAPIKeyByID returns a single key by ID, scoped to the owner.
+func (s *MemoryStore) GetAPIKeyByID(accountID, id string) (*APIKey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	raw, ok := s.keysByID[id]
+	if !ok {
+		return nil, fmt.Errorf("key not found")
+	}
+	rec, ok := s.keyRecords[raw]
+	if !ok || rec.OwnerAccountID != accountID {
+		return nil, fmt.Errorf("key not found")
+	}
+	return cloneAPIKey(rec), nil
+}
+
+// UpdateAPIKey overwrites mutable fields of a key, scoped to the owner.
+func (s *MemoryStore) UpdateAPIKey(accountID, id string, mutable APIKey) (*APIKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	raw, ok := s.keysByID[id]
+	if !ok {
+		return nil, fmt.Errorf("key not found")
+	}
+	rec, ok := s.keyRecords[raw]
+	if !ok || rec.OwnerAccountID != accountID {
+		return nil, fmt.Errorf("key not found")
+	}
+	rec.Name = mutable.Name
+	rec.Disabled = mutable.Disabled
+	rec.LimitMicroUSD = cloneInt64Ptr(mutable.LimitMicroUSD)
+	rec.LimitReset = NormalizeResetWindow(mutable.LimitReset)
+	rec.RPMLimit = cloneInt64Ptr(mutable.RPMLimit)
+	rec.ITPMLimit = cloneInt64Ptr(mutable.ITPMLimit)
+	rec.OTPMLimit = cloneInt64Ptr(mutable.OTPMLimit)
+	rec.AllowedModels = append([]string(nil), mutable.AllowedModels...)
+	rec.SelfRouteOnly = mutable.SelfRouteOnly
+	rec.ExpiresAt = cloneTimePtr(mutable.ExpiresAt)
+	return cloneAPIKey(rec), nil
+}
+
+// RevokeAPIKeyByID permanently deletes a key by ID, scoped to the owner.
+func (s *MemoryStore) RevokeAPIKeyByID(accountID, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	raw, ok := s.keysByID[id]
+	if !ok {
+		return fmt.Errorf("key not found")
+	}
+	rec, ok := s.keyRecords[raw]
+	if !ok || rec.OwnerAccountID != accountID {
+		return fmt.Errorf("key not found")
+	}
+	delete(s.keyRecords, raw)
+	delete(s.keysByID, id)
+	return nil
+}
+
+// RotateAPIKey atomically replaces a key (see Store interface).
+func (s *MemoryStore) RotateAPIKey(accountID, id string) (string, *APIKey, error) {
+	raw, err := GenerateRawKey()
+	if err != nil {
+		return "", nil, err
+	}
+	newID, err := GenerateKeyID()
+	if err != nil {
+		return "", nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldRaw, ok := s.keysByID[id]
+	if !ok {
+		return "", nil, fmt.Errorf("key not found")
+	}
+	old, ok := s.keyRecords[oldRaw]
+	if !ok || old.OwnerAccountID != accountID {
+		return "", nil, fmt.Errorf("key not found")
+	}
+	rec := &APIKey{
+		ID:             newID,
+		OwnerAccountID: accountID,
+		Name:           old.Name,
+		Label:          KeyLabel(raw),
+		KeyHash:        sha256Hex(raw),
+		Disabled:       old.Disabled,
+		LimitMicroUSD:  cloneInt64Ptr(old.LimitMicroUSD),
+		LimitReset:     NormalizeResetWindow(old.LimitReset),
+		RPMLimit:       cloneInt64Ptr(old.RPMLimit),
+		ITPMLimit:      cloneInt64Ptr(old.ITPMLimit),
+		OTPMLimit:      cloneInt64Ptr(old.OTPMLimit),
+		AllowedModels:  append([]string(nil), old.AllowedModels...),
+		SelfRouteOnly:  old.SelfRouteOnly,
+		ExpiresAt:      cloneTimePtr(old.ExpiresAt),
+		CreatedAt:      time.Now().UTC(),
+	}
+	delete(s.keyRecords, oldRaw)
+	delete(s.keysByID, id)
+	s.keyRecords[raw] = rec
+	s.keysByID[newID] = raw
+	return raw, cloneAPIKey(rec), nil
+}
+
+// TouchAPIKey records that a key was used at the given time.
+func (s *MemoryStore) TouchAPIKey(id string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	raw, ok := s.keysByID[id]
+	if !ok {
+		return
+	}
+	if rec, ok := s.keyRecords[raw]; ok {
+		t := at.UTC()
+		rec.LastUsedAt = &t
+	}
+}
+
+// KeySpendSince returns total micro-USD charged to a key since `since` (UTC).
+func (s *MemoryStore) KeySpendSince(keyID string, since time.Time) int64 {
+	if keyID == "" {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ks, ok := s.keySpend[keyID]
+	if !ok {
+		return 0
+	}
+	if since.IsZero() {
+		return ks.lifetime
+	}
+	startDay := since.UTC().Format("2006-01-02")
+	var total int64
+	for day, amt := range ks.days {
+		if day >= startDay {
+			total += amt
+		}
+	}
+	return total
 }
 
 // RecordUsage appends a usage record to the in-memory log.
@@ -291,7 +547,70 @@ func (s *MemoryStore) UsageRecords() []UsageRecord {
 	defer s.mu.RUnlock()
 	out := make([]UsageRecord, len(s.usage))
 	copy(out, s.usage)
+	for i := range out {
+		if out[i].RequestLocation != nil {
+			loc := *out[i].RequestLocation
+			out[i].RequestLocation = &loc
+		}
+	}
 	return out
+}
+
+// UsageRecordsSince returns usage records created at or after the given time.
+func (s *MemoryStore) UsageRecordsSince(since time.Time) []UsageRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if since.IsZero() {
+		out := make([]UsageRecord, len(s.usage))
+		copy(out, s.usage)
+		for i := range out {
+			if out[i].RequestLocation != nil {
+				loc := *out[i].RequestLocation
+				out[i].RequestLocation = &loc
+			}
+		}
+		return out
+	}
+	var out []UsageRecord
+	for _, r := range s.usage {
+		ts := r.Timestamp
+		if ts.IsZero() {
+			ts = r.CreatedAt
+		}
+		if ts.Before(since) {
+			continue
+		}
+		cp := r
+		if cp.RequestLocation != nil {
+			loc := *cp.RequestLocation
+			cp.RequestLocation = &loc
+		}
+		out = append(out, cp)
+	}
+	if out == nil {
+		return []UsageRecord{}
+	}
+	return out
+}
+
+// UsageCountSince returns the number of usage records created at or after the given time.
+func (s *MemoryStore) UsageCountSince(since time.Time) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if since.IsZero() {
+		return int64(len(s.usage))
+	}
+	var count int64
+	for _, r := range s.usage {
+		ts := r.Timestamp
+		if ts.IsZero() {
+			ts = r.CreatedAt
+		}
+		if !ts.Before(since) {
+			count++
+		}
+	}
+	return count
 }
 
 // UsageTotals returns aggregated lifetime totals.
@@ -421,25 +740,250 @@ func (s *MemoryStore) UsageByConsumer(consumerKey string) []UsageRecord {
 
 // RecordUsageWithCost logs a usage event with request ID and cost (in-memory).
 func (s *MemoryStore) RecordUsageWithCost(providerID, consumerKey, model, requestID string, promptTokens, completionTokens int, costMicroUSD int64) {
+	s.RecordUsageWithCostAndLocation(providerID, consumerKey, model, requestID, promptTokens, completionTokens, costMicroUSD, nil)
+}
+
+// RecordUsageWithCostAndLocation logs a usage event with request location (in-memory).
+func (s *MemoryStore) RecordUsageWithCostAndLocation(providerID, consumerKey, model, requestID string, promptTokens, completionTokens int, costMicroUSD int64, requestLocation *ProviderLocation) {
+	s.RecordUsageFull(providerID, consumerKey, "", model, requestID, promptTokens, completionTokens, costMicroUSD, requestLocation)
+}
+
+// RecordUsageFull logs a usage event with full attribution (incl. API key ID)
+// and updates the per-key spend accumulator used for cap enforcement.
+func (s *MemoryStore) RecordUsageFull(providerID, consumerKey, keyID, model, requestID string, promptTokens, completionTokens int, costMicroUSD int64, requestLocation *ProviderLocation) {
+	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var locCopy *ProviderLocation
+	if requestLocation != nil {
+		cp := *requestLocation
+		locCopy = &cp
+	}
 	s.usage = append(s.usage, UsageRecord{
 		ProviderID:       providerID,
 		ConsumerKey:      consumerKey,
+		KeyID:            keyID,
 		Model:            model,
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
-		Timestamp:        time.Now(),
+		RequestLocation:  locCopy,
+		Timestamp:        now,
 		RequestID:        requestID,
 		CostMicroUSD:     costMicroUSD,
 	})
+	if keyID != "" && costMicroUSD > 0 {
+		s.addKeySpendLocked(keyID, costMicroUSD, now)
+	}
+}
+
+// addKeySpendLocked increments the per-key spend accumulator. Caller holds s.mu.
+func (s *MemoryStore) addKeySpendLocked(keyID string, amount int64, at time.Time) {
+	ks, ok := s.keySpend[keyID]
+	if !ok {
+		ks = &keySpend{days: make(map[string]int64)}
+		s.keySpend[keyID] = ks
+	}
+	ks.lifetime += amount
+	day := at.UTC().Format("2006-01-02")
+	ks.days[day] += amount
+	// Prune buckets older than the retention horizon to bound memory.
+	if len(ks.days) > keySpendRetentionDays {
+		cutoff := at.UTC().AddDate(0, 0, -keySpendRetentionDays).Format("2006-01-02")
+		for d := range ks.days {
+			if d < cutoff {
+				delete(ks.days, d)
+			}
+		}
+	}
+}
+
+// UsageLocationBuckets returns approximate request-origin aggregates (in-memory).
+func (s *MemoryStore) UsageLocationBuckets(since time.Time) []UsageLocationBucket {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	type bucketKey struct {
+		City        string
+		Region      string
+		RegionCode  string
+		Country     string
+		CountryCode string
+	}
+	type agg struct {
+		key                              bucketKey
+		latSum, lngSum                   float64
+		coordCount                       int
+		requests, promptTok, completeTok int64
+		providers                        map[string]struct{}
+	}
+	buckets := make(map[bucketKey]*agg)
+	for _, r := range s.usage {
+		ts := r.Timestamp
+		if ts.IsZero() {
+			ts = r.CreatedAt
+		}
+		if !since.IsZero() && ts.Before(since) {
+			continue
+		}
+		if r.RequestLocation == nil {
+			continue
+		}
+		loc := r.RequestLocation
+		k := bucketKey{
+			City:        loc.City,
+			Region:      loc.Region,
+			RegionCode:  loc.RegionCode,
+			Country:     loc.Country,
+			CountryCode: loc.CountryCode,
+		}
+		b, ok := buckets[k]
+		if !ok {
+			b = &agg{key: k, providers: make(map[string]struct{})}
+			buckets[k] = b
+		}
+		b.requests++
+		b.promptTok += int64(r.PromptTokens)
+		b.completeTok += int64(r.CompletionTokens)
+		if loc.Latitude != 0 || loc.Longitude != 0 {
+			b.latSum += loc.Latitude
+			b.lngSum += loc.Longitude
+			b.coordCount++
+		}
+		if r.ProviderID != "" {
+			b.providers[r.ProviderID] = struct{}{}
+		}
+	}
+	out := make([]UsageLocationBucket, 0, len(buckets))
+	for _, b := range buckets {
+		var lat, lng float64
+		if b.coordCount > 0 {
+			lat = b.latSum / float64(b.coordCount)
+			lng = b.lngSum / float64(b.coordCount)
+		}
+		out = append(out, UsageLocationBucket{
+			City:             b.key.City,
+			Region:           b.key.Region,
+			RegionCode:       b.key.RegionCode,
+			Country:          b.key.Country,
+			CountryCode:      b.key.CountryCode,
+			Latitude:         lat,
+			Longitude:        lng,
+			Requests:         b.requests,
+			PromptTokens:     b.promptTok,
+			CompletionTokens: b.completeTok,
+			Providers:        len(b.providers),
+		})
+	}
+	return out
+}
+
+// UsageFlowBuckets aggregates directional consumer→provider flows in memory.
+// providerLocs supplies live provider locations from the registry; the store's
+// own providerRecords are used as a fallback for disconnected providers.
+func (s *MemoryStore) UsageFlowBuckets(since time.Time, providerLocs map[string]*ProviderLocation) []UsageFlowBucket {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	type flowKey struct {
+		cCity, cRegion, cCountry string
+		pCity, pRegion, pCountry string
+	}
+	type agg struct {
+		b         UsageFlowBucket
+		cLatSum   float64
+		cLngSum   float64
+		cCoordCnt int
+		pLatSum   float64
+		pLngSum   float64
+		pCoordCnt int
+	}
+
+	// Resolve provider location: prefer live registry, fall back to stored records.
+	resolveProviderLoc := func(providerID string) *ProviderLocation {
+		if loc, ok := providerLocs[providerID]; ok && loc != nil {
+			return loc
+		}
+		if rec, ok := s.providerRecords[providerID]; ok {
+			return rec.Location
+		}
+		return nil
+	}
+
+	flows := make(map[flowKey]*agg)
+	for _, r := range s.usage {
+		ts := r.Timestamp
+		if ts.IsZero() {
+			ts = r.CreatedAt
+		}
+		if !since.IsZero() && ts.Before(since) {
+			continue
+		}
+		if r.RequestLocation == nil {
+			continue
+		}
+		pLoc := resolveProviderLoc(r.ProviderID)
+		if pLoc == nil {
+			continue
+		}
+		cLoc := r.RequestLocation
+		k := flowKey{
+			cCity: cLoc.City, cRegion: cLoc.RegionCode, cCountry: cLoc.CountryCode,
+			pCity: pLoc.City, pRegion: pLoc.RegionCode, pCountry: pLoc.CountryCode,
+		}
+		fa, ok := flows[k]
+		if !ok {
+			fa = &agg{b: UsageFlowBucket{
+				ConsumerCity: cLoc.City, ConsumerRegion: cLoc.Region,
+				ConsumerRegionCode: cLoc.RegionCode, ConsumerCountry: cLoc.Country,
+				ConsumerCountryCode: cLoc.CountryCode,
+				ProviderCity:        pLoc.City, ProviderRegion: pLoc.Region,
+				ProviderRegionCode: pLoc.RegionCode, ProviderCountry: pLoc.Country,
+				ProviderCountryCode: pLoc.CountryCode,
+			}}
+			flows[k] = fa
+		}
+		fa.b.Requests++
+		fa.b.PromptTokens += int64(r.PromptTokens)
+		fa.b.CompletionTokens += int64(r.CompletionTokens)
+		if cLoc.Latitude != 0 || cLoc.Longitude != 0 {
+			fa.cLatSum += cLoc.Latitude
+			fa.cLngSum += cLoc.Longitude
+			fa.cCoordCnt++
+		}
+		if pLoc.Latitude != 0 || pLoc.Longitude != 0 {
+			fa.pLatSum += pLoc.Latitude
+			fa.pLngSum += pLoc.Longitude
+			fa.pCoordCnt++
+		}
+	}
+
+	out := make([]UsageFlowBucket, 0, len(flows))
+	for _, fa := range flows {
+		b := fa.b
+		if fa.cCoordCnt > 0 {
+			b.ConsumerLatitude = fa.cLatSum / float64(fa.cCoordCnt)
+			b.ConsumerLongitude = fa.cLngSum / float64(fa.cCoordCnt)
+		}
+		if fa.pCoordCnt > 0 {
+			b.ProviderLatitude = fa.pLatSum / float64(fa.pCoordCnt)
+			b.ProviderLongitude = fa.pLngSum / float64(fa.pCoordCnt)
+		}
+		out = append(out, b)
+	}
+	return out
 }
 
 // KeyCount returns the number of active API keys.
 func (s *MemoryStore) KeyCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.keys)
+	n := 0
+	for _, rec := range s.keyRecords {
+		if !rec.Disabled {
+			n++
+		}
+	}
+	return n
 }
 
 // GetBalance returns the current balance in micro-USD for an account.
@@ -454,6 +998,13 @@ func (s *MemoryStore) GetWithdrawableBalance(accountID string) int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.withdrawable[accountID]
+}
+
+// GetBalanceWithWithdrawable returns both balances under a single lock.
+func (s *MemoryStore) GetBalanceWithWithdrawable(accountID string) (int64, int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.balances[accountID], s.withdrawable[accountID]
 }
 
 // Credit adds micro-USD to an account and records a ledger entry.
@@ -503,13 +1054,14 @@ func (s *MemoryStore) DebitWithdrawable(accountID string, amountMicroUSD int64, 
 	return nil
 }
 
-// Debit subtracts micro-USD from an account. Returns error if insufficient funds.
+// Debit subtracts micro-USD from an account. Returns ErrInsufficientBalance
+// if the account has insufficient funds.
 func (s *MemoryStore) Debit(accountID string, amountMicroUSD int64, entryType LedgerEntryType, reference string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.balances[accountID] < amountMicroUSD {
-		return fmt.Errorf("insufficient balance: have %d, need %d micro-USD", s.balances[accountID], amountMicroUSD)
+		return ErrInsufficientBalance
 	}
 
 	s.balances[accountID] -= amountMicroUSD
@@ -527,6 +1079,51 @@ func (s *MemoryStore) Debit(accountID string, amountMicroUSD int64, entryType Le
 		CreatedAt:      time.Now(),
 	})
 	return nil
+}
+
+// MigrateAccountBalance moves the full balance (and its withdrawable subset)
+// from one account ID to another, atomically under the store lock.
+func (s *MemoryStore) MigrateAccountBalance(from, to string) (bool, error) {
+	if from == "" || to == "" || from == to {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bal := s.balances[from]
+	wdr := s.withdrawable[from]
+	if bal == 0 && wdr == 0 {
+		return false, nil
+	}
+	now := time.Now()
+
+	// Debit the source to zero and credit the destination, recording both legs.
+	s.balances[from] = 0
+	s.withdrawable[from] = 0
+	s.ledgerSeq++
+	s.ledgerEntries = append(s.ledgerEntries, LedgerEntry{
+		ID:             s.ledgerSeq,
+		AccountID:      from,
+		Type:           LedgerMigration,
+		AmountMicroUSD: -bal,
+		BalanceAfter:   0,
+		Reference:      "migrate:out",
+		CreatedAt:      now,
+	})
+
+	s.balances[to] += bal
+	s.withdrawable[to] += wdr
+	s.ledgerSeq++
+	s.ledgerEntries = append(s.ledgerEntries, LedgerEntry{
+		ID:             s.ledgerSeq,
+		AccountID:      to,
+		Type:           LedgerMigration,
+		AmountMicroUSD: bal,
+		BalanceAfter:   s.balances[to],
+		Reference:      "migrate:in",
+		CreatedAt:      now,
+	})
+	return true, nil
 }
 
 // LedgerHistory returns ledger entries for an account, newest first.
@@ -775,45 +1372,300 @@ func (s *MemoryStore) DeleteModelPrice(accountID, model string) error {
 	return nil
 }
 
-// --- Supported Models ---
+// --- Model Registry ---
 
-func (s *MemoryStore) SetSupportedModel(model *SupportedModel) error {
+func (s *MemoryStore) UpsertModelRegistryEntry(entry *ModelRegistryEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cp := *model
-	s.supportedModels[model.ID] = &cp
+	now := time.Now()
+	cp := cloneModelRegistryEntry(entry)
+	if existing, ok := s.modelRegistry[entry.ID]; ok && !existing.CreatedAt.IsZero() {
+		cp.CreatedAt = existing.CreatedAt
+		cp.Status = existing.Status
+	} else if cp.CreatedAt.IsZero() {
+		cp.CreatedAt = now
+	}
+	if cp.UpdatedAt.IsZero() {
+		cp.UpdatedAt = now
+	}
+	s.modelRegistry[entry.ID] = &cp
 	return nil
 }
 
-func (s *MemoryStore) ListSupportedModels() []SupportedModel {
+func (s *MemoryStore) SetModelVersion(entry *ModelRegistryEntry, version *ModelVersion, files []ModelVersionFile) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	entryCopy := cloneModelRegistryEntry(entry)
+	if existing, ok := s.modelRegistry[entry.ID]; ok && !existing.CreatedAt.IsZero() {
+		entryCopy.CreatedAt = existing.CreatedAt
+		entryCopy.Status = existing.Status
+	} else if entryCopy.CreatedAt.IsZero() {
+		entryCopy.CreatedAt = now
+	}
+	if entryCopy.UpdatedAt.IsZero() {
+		entryCopy.UpdatedAt = now
+	}
+	s.modelRegistry[entry.ID] = &entryCopy
+
+	key := modelVersionKey(version.ModelID, version.Version)
+	versionCopy := cloneModelVersion(version)
+	if existing, ok := s.modelVersions[key]; ok {
+		versionCopy.ID = existing.ID
+		if versionCopy.UploadedAt.IsZero() {
+			versionCopy.UploadedAt = existing.UploadedAt
+		}
+		versionCopy.PromotedAt = cloneTimePtr(existing.PromotedAt)
+	} else {
+		s.modelVersionSeq++
+		versionCopy.ID = s.modelVersionSeq
+	}
+	if versionCopy.UploadedAt.IsZero() {
+		versionCopy.UploadedAt = now
+	}
+	s.modelVersions[key] = &versionCopy
+	s.modelVersionByID[versionCopy.ID] = &versionCopy
+	version.ID = versionCopy.ID
+	version.UploadedAt = versionCopy.UploadedAt
+
+	fileCopies := make([]ModelVersionFile, len(files))
+	for i := range files {
+		fileCopies[i] = files[i]
+		fileCopies[i].ID = int64(i + 1)
+		fileCopies[i].ModelVersionID = versionCopy.ID
+	}
+	s.modelVersionFiles[versionCopy.ID] = fileCopies
+	return nil
+}
+
+func (s *MemoryStore) PromoteModelVersion(modelID, version string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	v, ok := s.modelVersions[modelVersionKey(modelID, version)]
+	if !ok {
+		return fmt.Errorf("model version %q %q not found", modelID, version)
+	}
+	now := time.Now()
+	v.PromotedAt = &now
+	s.activeModelVersion[modelID] = v.ID
+	return nil
+}
+
+func (s *MemoryStore) SetModelStatus(modelID, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry, ok := s.modelRegistry[modelID]
+	if !ok {
+		return fmt.Errorf("model %q not found", modelID)
+	}
+	entry.Status = status
+	entry.UpdatedAt = time.Now()
+	return nil
+}
+
+func (s *MemoryStore) ListActiveModelRegistry() []ModelRegistryRecord {
+	records, _ := s.ListActiveModelRegistryWithError()
+	return records
+}
+
+func (s *MemoryStore) ListActiveModelRegistryWithError() ([]ModelRegistryRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	models := make([]SupportedModel, 0, len(s.supportedModels))
-	for _, m := range s.supportedModels {
-		models = append(models, *m)
-	}
-	// Sort by MinRAMGB ascending
-	for i := 0; i < len(models); i++ {
-		for j := i + 1; j < len(models); j++ {
-			if models[j].MinRAMGB < models[i].MinRAMGB {
-				models[i], models[j] = models[j], models[i]
-			}
+	records := make([]ModelRegistryRecord, 0, len(s.activeModelVersion))
+	for modelID := range s.activeModelVersion {
+		if rec := s.modelRegistryRecordLocked(modelID); rec != nil {
+			records = append(records, *rec)
 		}
 	}
-	return models
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].MinRAMGB == records[j].MinRAMGB {
+			return records[i].ID < records[j].ID
+		}
+		return records[i].MinRAMGB < records[j].MinRAMGB
+	})
+	return records, nil
 }
 
-func (s *MemoryStore) DeleteSupportedModel(modelID string) error {
+func (s *MemoryStore) GetModelRegistryRecord(modelID string) (*ModelRegistryRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rec := s.modelRegistryRecordLocked(modelID)
+	if rec == nil {
+		return nil, fmt.Errorf("model %q not found", modelID)
+	}
+	return rec, nil
+}
+
+func (s *MemoryStore) GetModelManifest(modelID string) (*ModelManifest, error) {
+	rec, err := s.GetModelRegistryRecord(modelID)
+	if err != nil {
+		return nil, err
+	}
+	return manifestFromRecord(rec), nil
+}
+
+func (s *MemoryStore) UpsertPublishingAPIKey(key *PublishingAPIKey) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.supportedModels[modelID]; !ok {
-		return fmt.Errorf("model %q not found", modelID)
+	cp := *key
+	if cp.CreatedAt.IsZero() {
+		cp.CreatedAt = time.Now()
 	}
-	delete(s.supportedModels, modelID)
+	cp.LastUsedAt = cloneTimePtr(key.LastUsedAt)
+	s.publishingAPIKeys[key.ID] = &cp
 	return nil
+}
+
+func (s *MemoryStore) FindPublishingAPIKeys() []PublishingAPIKey {
+	keys, _ := s.FindPublishingAPIKeysWithError()
+	return keys
+}
+
+func (s *MemoryStore) FindPublishingAPIKeysWithError() ([]PublishingAPIKey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	keys := make([]PublishingAPIKey, 0, len(s.publishingAPIKeys))
+	for _, key := range s.publishingAPIKeys {
+		cp := *key
+		cp.LastUsedAt = cloneTimePtr(key.LastUsedAt)
+		keys = append(keys, cp)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].CreatedAt.Before(keys[j].CreatedAt) })
+	return keys, nil
+}
+
+func (s *MemoryStore) MarkPublishingAPIKeyUsed(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key, ok := s.publishingAPIKeys[id]
+	if !ok {
+		return fmt.Errorf("publishing API key %q not found", id)
+	}
+	now := time.Now()
+	key.LastUsedAt = &now
+	return nil
+}
+
+func (s *MemoryStore) modelRegistryRecordLocked(modelID string) *ModelRegistryRecord {
+	entry, ok := s.modelRegistry[modelID]
+	if !ok || (entry.Status != "active" && entry.Status != "beta") {
+		return nil
+	}
+	versionID, ok := s.activeModelVersion[modelID]
+	if !ok {
+		return nil
+	}
+	version, ok := s.modelVersionByID[versionID]
+	if !ok || version.Status != "ready" {
+		return nil
+	}
+	entryCopy := cloneModelRegistryEntry(entry)
+	versionCopy := cloneModelVersion(version)
+	files := append([]ModelVersionFile(nil), s.modelVersionFiles[versionID]...)
+	return &ModelRegistryRecord{ModelRegistryEntry: entryCopy, ActiveVersion: &versionCopy, Files: files}
+}
+
+func modelVersionKey(modelID, version string) string {
+	return modelID + "\x00" + version
+}
+
+func cloneModelRegistryEntry(entry *ModelRegistryEntry) ModelRegistryEntry {
+	if entry == nil {
+		return ModelRegistryEntry{}
+	}
+	cp := *entry
+	cp.Capabilities = append([]string(nil), entry.Capabilities...)
+	cp.RuntimeParameters = cloneMetadata(entry.RuntimeParameters)
+	cp.Metadata = cloneMetadata(entry.Metadata)
+	return cp
+}
+
+func cloneModelVersion(version *ModelVersion) ModelVersion {
+	if version == nil {
+		return ModelVersion{}
+	}
+	cp := *version
+	cp.PromotedAt = cloneTimePtr(version.PromotedAt)
+	cp.Metadata = cloneMetadata(version.Metadata)
+	return cp
+}
+
+func cloneMetadata(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return map[string]any{}
+	}
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		return map[string]any{}
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+func cloneTimePtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	cp := *t
+	return &cp
+}
+
+func cloneInt64Ptr(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	cp := *v
+	return &cp
+}
+
+// cloneAPIKey returns a deep copy of a key record so callers can never mutate
+// the store's internal state through the returned pointer.
+func cloneAPIKey(rec *APIKey) *APIKey {
+	if rec == nil {
+		return nil
+	}
+	cp := *rec
+	cp.LimitMicroUSD = cloneInt64Ptr(rec.LimitMicroUSD)
+	cp.RPMLimit = cloneInt64Ptr(rec.RPMLimit)
+	cp.ITPMLimit = cloneInt64Ptr(rec.ITPMLimit)
+	cp.OTPMLimit = cloneInt64Ptr(rec.OTPMLimit)
+	cp.ExpiresAt = cloneTimePtr(rec.ExpiresAt)
+	cp.LastUsedAt = cloneTimePtr(rec.LastUsedAt)
+	cp.AllowedModels = append([]string(nil), rec.AllowedModels...)
+	return &cp
+}
+
+func manifestFromRecord(rec *ModelRegistryRecord) *ModelManifest {
+	if rec == nil || rec.ActiveVersion == nil {
+		return nil
+	}
+	files := make([]ManifestFile, len(rec.Files))
+	for i, f := range rec.Files {
+		files[i] = ManifestFile{Path: f.Path, SizeBytes: f.SizeBytes, SHA256: f.SHA256, Role: f.Role}
+	}
+	return &ModelManifest{
+		SchemaVersion:   1,
+		ModelID:         rec.ID,
+		Version:         rec.ActiveVersion.Version,
+		R2Prefix:        rec.ActiveVersion.R2Prefix,
+		AggregateSHA256: rec.ActiveVersion.AggregateSHA256,
+		TotalSizeBytes:  rec.ActiveVersion.TotalSizeBytes,
+		FileCount:       rec.ActiveVersion.FileCount,
+		Files:           files,
+		CreatedAt:       rec.ActiveVersion.UploadedAt,
+	}
 }
 
 // --- Users (Privy) ---
@@ -916,6 +1768,37 @@ func (s *MemoryStore) GetUserByEmail(email string) (*User, error) {
 		}
 	}
 	return nil, fmt.Errorf("user with email %q not found", email)
+}
+
+// SetUserRole sets the account role on a user record.
+func (s *MemoryStore) SetUserRole(accountID, role string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.usersByAccountID[accountID]
+	if !ok {
+		return fmt.Errorf("user with account ID %q not found", accountID)
+	}
+	u.Role = role
+	return nil
+}
+
+// SetUserPlatformFeePercent sets (or clears, when nil) the per-account
+// platform fee override. A fresh pointer is allocated so stored state is never
+// aliased by the caller.
+func (s *MemoryStore) SetUserPlatformFeePercent(accountID string, feePercent *int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.usersByAccountID[accountID]
+	if !ok {
+		return fmt.Errorf("user with account ID %q not found", accountID)
+	}
+	if feePercent == nil {
+		u.PlatformFeePercent = nil
+	} else {
+		v := *feePercent
+		u.PlatformFeePercent = &v
+	}
+	return nil
 }
 
 // --- Stripe Withdrawals ---
@@ -1523,6 +2406,10 @@ func (s *MemoryStore) UpsertProvider(_ context.Context, p ProviderRecord) error 
 	}
 
 	cp := p
+	if p.Location != nil {
+		loc := *p.Location
+		cp.Location = &loc
+	}
 	s.providerRecords[p.ID] = &cp
 	return nil
 }
@@ -1536,6 +2423,10 @@ func (s *MemoryStore) GetProviderRecord(_ context.Context, id string) (*Provider
 		return nil, fmt.Errorf("provider %q not found", id)
 	}
 	cp := *p
+	if p.Location != nil {
+		loc := *p.Location
+		cp.Location = &loc
+	}
 	return &cp, nil
 }
 
@@ -1552,6 +2443,10 @@ func (s *MemoryStore) GetProviderBySerial(_ context.Context, serial string) (*Pr
 		return nil, fmt.Errorf("provider %q not found (stale serial index)", id)
 	}
 	cp := *p
+	if p.Location != nil {
+		loc := *p.Location
+		cp.Location = &loc
+	}
 	return &cp, nil
 }
 
@@ -1561,7 +2456,12 @@ func (s *MemoryStore) ListProviderRecords(_ context.Context) ([]ProviderRecord, 
 
 	records := make([]ProviderRecord, 0, len(s.providerRecords))
 	for _, p := range s.providerRecords {
-		records = append(records, *p)
+		cp := *p
+		if p.Location != nil {
+			loc := *p.Location
+			cp.Location = &loc
+		}
+		records = append(records, cp)
 	}
 	return records, nil
 }
@@ -1577,7 +2477,12 @@ func (s *MemoryStore) ListProvidersByAccount(_ context.Context, accountID string
 	records := make([]ProviderRecord, 0)
 	for _, p := range s.providerRecords {
 		if p.AccountID == accountID {
-			records = append(records, *p)
+			cp := *p
+			if p.Location != nil {
+				loc := *p.Location
+				cp.Location = &loc
+			}
+			records = append(records, cp)
 		}
 	}
 	sort.Slice(records, func(i, j int) bool {
@@ -1660,6 +2565,185 @@ func (s *MemoryStore) GetReputation(_ context.Context, providerID string) (*Repu
 	}
 	cp := *rep
 	return &cp, nil
+}
+
+// --- Provider Log Reports ---
+
+func (s *MemoryStore) StoreLogReport(serialNumber, providerID, accountID string, logData []byte) error {
+	const maxSize = 10 << 20 // 10 MB
+	if len(logData) > maxSize {
+		logData = logData[:maxSize]
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.logReportSeq++
+	cp := make([]byte, len(logData))
+	copy(cp, logData)
+	s.logReports = append(s.logReports, LogReport{
+		ID:           s.logReportSeq,
+		SerialNumber: serialNumber,
+		ProviderID:   providerID,
+		AccountID:    accountID,
+		LogSizeBytes: int64(len(cp)),
+		LogData:      cp,
+		CreatedAt:    time.Now(),
+	})
+	return nil
+}
+
+func (s *MemoryStore) GetLogReports(serialNumber string, limit int) ([]LogReport, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var reports []LogReport
+	for i := len(s.logReports) - 1; i >= 0; i-- {
+		r := s.logReports[i]
+		if r.SerialNumber != serialNumber {
+			continue
+		}
+		// Return without log data for list queries.
+		reports = append(reports, LogReport{
+			ID:           r.ID,
+			SerialNumber: r.SerialNumber,
+			ProviderID:   r.ProviderID,
+			AccountID:    r.AccountID,
+			LogSizeBytes: r.LogSizeBytes,
+			CreatedAt:    r.CreatedAt,
+		})
+		if len(reports) >= limit {
+			break
+		}
+	}
+	if reports == nil {
+		return []LogReport{}, nil
+	}
+	return reports, nil
+}
+
+func (s *MemoryStore) GetLogReport(id int64) (*LogReport, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for i := range s.logReports {
+		if s.logReports[i].ID == id {
+			r := s.logReports[i]
+			cp := LogReport{
+				ID:           r.ID,
+				SerialNumber: r.SerialNumber,
+				ProviderID:   r.ProviderID,
+				AccountID:    r.AccountID,
+				LogSizeBytes: r.LogSizeBytes,
+				CreatedAt:    r.CreatedAt,
+				LogData:      make([]byte, len(r.LogData)),
+			}
+			copy(cp.LogData, r.LogData)
+			return &cp, nil
+		}
+	}
+	return nil, fmt.Errorf("log report %d not found", id)
+}
+
+// OpenProviderSession records the start of a provider connection. Idempotent
+// (mirrors the postgres ON CONFLICT DO NOTHING): if a row for sessionID already
+// exists — duplicate register, or open racing behind a close — it does nothing.
+func (s *MemoryStore) OpenProviderSession(_ context.Context, sessionID, serial, accountID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.providerSessions {
+		if s.providerSessions[i].SessionID == sessionID {
+			return nil
+		}
+	}
+	now := time.Now()
+	s.providerSessionSeq++
+	s.providerSessions = append(s.providerSessions, ProviderSession{
+		ID:           s.providerSessionSeq,
+		SessionID:    sessionID,
+		SerialNumber: serial,
+		AccountID:    accountID,
+		ConnectedAt:  now,
+		LastSeen:     now,
+	})
+	return nil
+}
+
+// TouchProviderSession updates the open session's last_seen and backfills
+// serial/account if they were unknown at open time.
+func (s *MemoryStore) TouchProviderSession(_ context.Context, sessionID, serial, accountID string, lastSeen time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.providerSessions {
+		ps := &s.providerSessions[i]
+		if ps.SessionID == sessionID && ps.DisconnectedAt == nil {
+			ps.LastSeen = lastSeen
+			if ps.SerialNumber == "" {
+				ps.SerialNumber = serial
+			}
+			if ps.AccountID == "" {
+				ps.AccountID = accountID
+			}
+			// At most one open row per sessionID (OpenProviderSession
+			// guarantees it), so stop scanning once matched.
+			return nil
+		}
+	}
+	return nil
+}
+
+// CloseProviderSession marks the session for sessionID as ended. Upsert
+// semantics (mirrors postgres): closes an open row; leaves an already-closed row
+// untouched; and if the row is missing (close raced ahead of open) inserts an
+// already-closed row so no permanently-open session can be orphaned.
+func (s *MemoryStore) CloseProviderSession(_ context.Context, sessionID, reason string, when time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.providerSessions {
+		ps := &s.providerSessions[i]
+		if ps.SessionID == sessionID {
+			if ps.DisconnectedAt == nil {
+				t := when
+				ps.DisconnectedAt = &t
+				ps.DisconnectReason = reason
+			}
+			return nil
+		}
+	}
+	t := when
+	s.providerSessionSeq++
+	s.providerSessions = append(s.providerSessions, ProviderSession{
+		ID:               s.providerSessionSeq,
+		SessionID:        sessionID,
+		ConnectedAt:      when,
+		LastSeen:         when,
+		DisconnectedAt:   &t,
+		DisconnectReason: reason,
+	})
+	return nil
+}
+
+// CloseOpenProviderSessions closes any sessions still open, setting
+// disconnected_at to the last heartbeat (startup reconcile).
+func (s *MemoryStore) CloseOpenProviderSessions(_ context.Context, staleBefore time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for i := range s.providerSessions {
+		ps := &s.providerSessions[i]
+		// Only close genuinely-orphaned sessions (last heartbeat older than the
+		// staleness fence); a session still touched by another live instance
+		// during a blue-green deploy stays fresh and is left open.
+		if ps.DisconnectedAt == nil && ps.LastSeen.Before(staleBefore) {
+			t := ps.LastSeen
+			ps.DisconnectedAt = &t
+			ps.DisconnectReason = "coordinator_restart"
+			n++
+		}
+	}
+	return n, nil
 }
 
 // sha256Hex returns the hex-encoded SHA-256 digest of s.

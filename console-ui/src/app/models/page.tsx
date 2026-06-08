@@ -13,13 +13,14 @@ import {
   TrendingDown,
 } from "lucide-react";
 
-// Competitor pricing for comparison — static since these are external
-const competitorPricing: Record<string, { output: number; name: string; competitor: string; unit?: string }> = {
-  "qwen3.5-27b-claude-opus-8bit": { output: 1_560_000, name: "Qwen3.5 27B Claude Opus", competitor: "OpenRouter" },
-  "mlx-community/Trinity-Mini-8bit": { output: 150_000, name: "Trinity Mini", competitor: "OpenRouter" },
-  "mlx-community/gemma-4-26b-a4b-it-8bit": { output: 400_000, name: "Gemma 4 26B", competitor: "OpenRouter" },
-  "mlx-community/Qwen3.5-122B-A10B-8bit": { output: 2_080_000, name: "Qwen3.5 122B", competitor: "OpenRouter" },
-  "mlx-community/MiniMax-M2.5-8bit": { output: 1_000_000, name: "MiniMax M2.5", competitor: "OpenRouter" },
+// Optional display-only market references. The catalog rows always come from
+// the coordinator; entries here only enable a comparison when IDs match.
+const baselinePricing: Record<string, { output: number; baseline: string; unit?: string }> = {
+  // Typical hosted-API list output prices (micro-USD per 1M tokens). Darkbloom
+  // targets ~50% of these, so the comparison reads "50% lower" once platform
+  // pricing is set. Update if those baseline rates change.
+  "gemma-4-26b": { output: 330_000, baseline: "typical APIs" },
+  "gpt-oss-20b": { output: 140_000, baseline: "typical APIs" },
 };
 
 // Build a unified pricing lookup from the coordinator's response
@@ -47,6 +48,12 @@ function formatBytes(bytes: number): string {
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
   if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`;
   return `${bytes} B`;
+}
+
+function formatContextLength(tokens?: number): string {
+  if (!tokens || tokens <= 0) return "";
+  if (tokens >= 1000) return `${Math.round(tokens / 1000)}K`;
+  return `${tokens}`;
 }
 
 function TrustIndicator({ level }: { level?: string }) {
@@ -87,6 +94,12 @@ export default function ModelsPage() {
   }, []);
 
   const eigenPricing = buildPricingLookup(pricing);
+  const modelNames = Object.fromEntries(
+    models.map((model) => [model.id, model.display_name || model.id.split("/").pop() || model.id])
+  );
+  const comparisonRows = models
+    .map((model) => ({ id: model.id, eigen: eigenPricing[model.id], baseline: baselinePricing[model.id] }))
+    .filter((row): row is { id: string; eigen: { input: number; output: number; unit?: string }; baseline: { output: number; baseline: string; unit?: string } } => Boolean(row.eigen && row.baseline));
 
   return (
     <div className="flex flex-col h-full">
@@ -169,6 +182,11 @@ export default function ModelsPage() {
                           {formatBytes(model.size_bytes)}
                         </span>
                       )}
+                      {(model.context_length ?? model.max_context_length) ? (
+                        <span className="px-2 py-0.5 rounded bg-bg-elevated text-xs font-mono text-text-tertiary shadow-sm">
+                          {formatContextLength(model.context_length ?? model.max_context_length)} ctx
+                        </span>
+                      ) : null}
                     </div>
 
                     {/* Pricing */}
@@ -184,13 +202,13 @@ export default function ModelsPage() {
                             {eigenPricing[model.id].unit ?? "per 1M tokens"}
                           </span>
                         </div>
-                        {competitorPricing[model.id] && (
+                        {baselinePricing[model.id] && (
                           <div className="flex items-center gap-1.5 mt-1">
                             <TrendingDown size={10} className="text-accent-green" />
                             <span className="text-xs font-medium text-accent-green">
-                              {savingsPercent(eigenPricing[model.id].output, competitorPricing[model.id].output)}% cheaper
+                              {savingsPercent(eigenPricing[model.id].output, baselinePricing[model.id].output)}% cheaper
                             </span>
-                            <span className="text-xs text-text-tertiary opacity-50">vs {competitorPricing[model.id].competitor}</span>
+                            <span className="text-xs text-text-tertiary opacity-50">vs {baselinePricing[model.id].baseline}</span>
                           </div>
                         )}
                       </div>
@@ -224,10 +242,10 @@ export default function ModelsPage() {
           <div className="mt-12 mb-8">
             <div className="mb-4">
               <h2 className="text-2xl font-semibold text-ink mb-1">
-                Pricing vs Competitors
+                Pricing vs Baseline
               </h2>
               <p className="text-sm text-text-tertiary">
-                Darkbloom runs on idle Apple Silicon hardware — 50% cheaper than centralized providers.
+                Darkbloom runs on idle Apple Silicon hardware, benchmarked against common market pricing.
               </p>
             </div>
 
@@ -237,21 +255,18 @@ export default function ModelsPage() {
                   <tr className="border-b border-border-dim">
                     <th className="text-left px-4 py-3 text-xs font-medium text-text-tertiary uppercase tracking-wider">Model</th>
                     <th>Darkbloom</th>
-                    <th className="text-right px-4 py-3 text-xs font-medium text-text-tertiary uppercase tracking-wider">Competitor</th>
+                    <th className="text-right px-4 py-3 text-xs font-medium text-text-tertiary uppercase tracking-wider">Baseline</th>
                     <th className="text-right px-4 py-3 text-xs font-medium text-text-tertiary uppercase tracking-wider">Savings</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {Object.entries(eigenPricing)
-                    .filter(([id]) => competitorPricing[id])
-                    .map(([id, eigen]) => {
-                      const comp = competitorPricing[id];
-                      const savings = savingsPercent(eigen.output, comp.output);
+                  {comparisonRows.map(({ id, eigen, baseline }) => {
+                      const savings = savingsPercent(eigen.output, baseline.output);
                       const unit = eigen.unit ?? "per 1M tokens";
                       return (
                         <tr key={id} className="border-b border-border-dim/50 hover:bg-bg-tertiary transition-colors">
                           <td className="px-4 py-3">
-                            <span className="font-medium text-text-primary">{comp.name}</span>
+                            <span className="font-medium text-text-primary">{modelNames[id] ?? id}</span>
                             <span className="ml-2 text-xs text-text-tertiary">{unit}</span>
                           </td>
                           <td className="px-4 py-3 text-right font-mono text-text-secondary">
@@ -261,9 +276,9 @@ export default function ModelsPage() {
                           </td>
                           <td className="px-4 py-3 text-right font-mono text-text-tertiary">
                             <span className="line-through opacity-60">
-                              {microUsdToDisplay(comp.output)}
+                              {microUsdToDisplay(baseline.output)}
                             </span>
-                            <span className="block text-xs opacity-50">{comp.competitor}</span>
+                            <span className="block text-xs opacity-50">{baseline.baseline}</span>
                           </td>
                           <td className="px-4 py-3 text-right">
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-accent-green-dim/30 text-accent-green text-xs font-medium">
@@ -277,7 +292,7 @@ export default function ModelsPage() {
                 </tbody>
               </table>
               <div className="px-4 py-2 text-xs text-text-tertiary bg-bg-tertiary/50">
-                Competitor prices from OpenRouter as of April 2026.
+                Baseline prices reflect typical hosted-API list rates as of April 2026.
               </div>
             </div>
           </div>

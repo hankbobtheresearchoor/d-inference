@@ -27,6 +27,14 @@ function proxyHeaders(extra?: Record<string, string>): Record<string, string> {
   };
 }
 
+export interface ModelPricing {
+  prompt: string;
+  completion: string;
+  image?: string;
+  request?: string;
+  input_cache_read?: string;
+}
+
 export interface Model {
   id: string;
   object: string;
@@ -38,6 +46,24 @@ export interface Model {
   attested?: boolean;
   trust_level?: string;
   display_name?: string;
+  size_gb?: number;
+  min_ram_gb?: number;
+  max_context_length?: number;
+  max_output_length?: number;
+  architecture?: string;
+  family?: string;
+  capabilities?: string[];
+  // OpenRouter provider schema fields (from the enriched /v1/models endpoint).
+  name?: string;
+  hugging_face_id?: string;
+  created?: number;
+  description?: string;
+  context_length?: number;
+  pricing?: ModelPricing;
+  input_modalities?: string[];
+  output_modalities?: string[];
+  supported_features?: string[];
+  supported_sampling_parameters?: string[];
 }
 
 export interface BalanceResponse {
@@ -94,7 +120,13 @@ export async function fetchModels(): Promise<Model[]> {
   const res = await fetch("/api/models", { headers: proxyHeaders() });
   if (!res.ok) throw new Error(`Failed to fetch models: ${res.status}`);
   const data = await res.json();
-  const raw = data.data || data;
+  const raw = Array.isArray(data)
+    ? data
+    : Array.isArray(data.data)
+      ? data.data
+      : Array.isArray(data.models)
+        ? data.models
+        : [];
   // Flatten metadata into top-level fields for the UI
   return raw.map((m: Record<string, unknown>) => {
     const meta = (m.metadata || {}) as Record<string, unknown>;
@@ -106,6 +138,25 @@ export async function fetchModels(): Promise<Model[]> {
       trust_level: m.trust_level || meta.trust_level,
       attested: m.attested ?? (meta.attested_providers as number) > 0,
       display_name: m.display_name || meta.display_name,
+      size_bytes: m.size_bytes ?? meta.size_bytes,
+      size_gb: m.size_gb ?? meta.size_gb,
+      min_ram_gb: m.min_ram_gb ?? meta.min_ram_gb,
+      max_context_length: m.max_context_length ?? meta.max_context_length,
+      max_output_length: m.max_output_length ?? meta.max_output_length,
+      architecture: m.architecture ?? meta.architecture,
+      family: m.family ?? meta.family,
+      capabilities: m.capabilities ?? meta.capabilities,
+      // OpenRouter provider schema fields.
+      name: m.name ?? meta.display_name,
+      hugging_face_id: m.hugging_face_id ?? m.id,
+      created: m.created,
+      description: m.description ?? meta.description,
+      context_length: m.context_length ?? m.max_context_length ?? meta.max_context_length,
+      pricing: m.pricing,
+      input_modalities: m.input_modalities,
+      output_modalities: m.output_modalities,
+      supported_features: m.supported_features,
+      supported_sampling_parameters: m.supported_sampling_parameters,
     };
   });
 }
@@ -296,19 +347,148 @@ export async function healthCheck(): Promise<{ status: string; providers: number
   return res.json();
 }
 
+// --- API key management (multi-key) ---
+//
+// These are account-management calls, NOT inference calls. They authenticate
+// with the Privy access token (Authorization: Bearer <token>) and go through
+// the /api/keys proxy routes, which forward to the coordinator's /v1/keys
+// endpoints. They never use the localStorage inference key.
+//
+// Money fields are USD floats. The plaintext secret is returned ONLY by
+// createApiKey / rotateApiKey and never again afterwards.
+
+export type KeyResetWindow = "none" | "daily" | "weekly" | "monthly";
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  label: string; // masked, e.g. "sk-db-1a2b...c3d4"
+  disabled: boolean;
+  limit_usd?: number; // spend cap; omitted if unlimited
+  limit_reset: KeyResetWindow;
+  usage_usd: number; // spend in the current window
+  remaining_usd?: number; // omitted if unlimited
+  rpm_limit?: number;
+  itpm_limit?: number;
+  otpm_limit?: number;
+  allowed_models?: string[]; // empty/omitted = all models
+  self_route_only?: boolean; // hard ceiling: only routes to the owner's machine, free
+  expires_at?: string; // RFC3339 UTC
+  created_at: string;
+  last_used_at?: string;
+}
+
+// Create body. Nullable fields are omitted on create; sending an explicit
+// null on update CLEARS the field.
+export interface CreateKeyBody {
+  name?: string;
+  limit_usd?: number | null;
+  limit_reset?: KeyResetWindow;
+  rpm_limit?: number | null;
+  itpm_limit?: number | null;
+  otpm_limit?: number | null;
+  allowed_models?: string[] | null;
+  self_route_only?: boolean;
+  expires_at?: string | null; // RFC3339
+}
+
+// Update body is any subset of CreateKeyBody plus `disabled`.
+export type UpdateKeyBody = CreateKeyBody & { disabled?: boolean };
+
+// Returned by create + rotate: the once-only plaintext secret plus metadata.
+export interface CreatedKey {
+  key: string; // "sk-db-<secret>" — shown once
+  data: ApiKey;
+}
+
+function managementHeaders(token: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+  };
+}
+
+async function keyError(res: Response, fallback: string): Promise<Error> {
+  const data = await res.json().catch(() => null);
+  if (data && typeof data === "object") {
+    const err = (data as Record<string, unknown>).error;
+    if (typeof err === "string" && err) return new Error(err);
+    if (err && typeof err === "object") {
+      const message = (err as Record<string, unknown>).message;
+      if (typeof message === "string" && message) return new Error(message);
+    }
+    const message = (data as Record<string, unknown>).message;
+    if (typeof message === "string" && message) return new Error(message);
+  }
+  return new Error(`${fallback} (${res.status})`);
+}
+
+export async function listApiKeys(token: string): Promise<ApiKey[]> {
+  const res = await fetch("/api/keys", { headers: managementHeaders(token) });
+  if (!res.ok) throw await keyError(res, "Failed to load API keys");
+  const data = await res.json();
+  return Array.isArray(data?.data) ? (data.data as ApiKey[]) : [];
+}
+
+export async function createApiKey(token: string, body: CreateKeyBody): Promise<CreatedKey> {
+  const res = await fetch("/api/keys", {
+    method: "POST",
+    headers: managementHeaders(token),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await keyError(res, "Failed to create API key");
+  return res.json();
+}
+
+export async function updateApiKey(token: string, id: string, body: UpdateKeyBody): Promise<ApiKey> {
+  const res = await fetch(`/api/keys/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: managementHeaders(token),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await keyError(res, "Failed to update API key");
+  return res.json();
+}
+
+export async function deleteApiKey(token: string, id: string): Promise<void> {
+  const res = await fetch(`/api/keys/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: managementHeaders(token),
+  });
+  if (!res.ok) throw await keyError(res, "Failed to revoke API key");
+}
+
+export async function rotateApiKey(token: string, id: string): Promise<CreatedKey> {
+  const res = await fetch(`/api/keys/${encodeURIComponent(id)}/rotate`, {
+    method: "POST",
+    headers: managementHeaders(token),
+  });
+  if (!res.ok) throw await keyError(res, "Failed to rotate API key");
+  return res.json();
+}
+
 export async function streamChat(
   messages: ChatMessage[],
   model: string,
   callbacks: StreamCallbacks,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  opts?: { selfRoute?: boolean }
 ): Promise<void> {
   // Optional sender→coordinator encryption. Defaults off so plaintext SDK
   // and curl flows keep working unchanged. When enabled we NaCl-Box-seal the
   // outgoing body to the coordinator's published X25519 pubkey, then decrypt
   // each SSE event on the way back.
   const requestBody = { model, messages, stream: true };
+  // "Use my machine": the chat composer toggle prioritizes the caller's own
+  // provider (free when it serves) but falls back to the paid fleet when their
+  // machine can't — so the toggle is never a dead end. That's the `prefer`
+  // intent; the strict free-only ceiling lives on the API key (self_route_only).
+  // Carried as a header so it never enters the (optionally sealed) body.
+  const selfRouteHeader: Record<string, string> = opts?.selfRoute
+    ? { "X-Darkbloom-Route": "prefer" }
+    : {};
   let sealCtx: { ephemPriv: Uint8Array; coordPub: Uint8Array } | null = null;
-  let fetchHeaders = proxyHeaders();
+  let fetchHeaders = proxyHeaders(selfRouteHeader);
   let fetchBody: string;
 
   if (isEncryptionEnabled()) {
@@ -316,7 +496,7 @@ export async function streamChat(
       const coordKey = await getCoordinatorKey();
       const sealed = sealRequest(requestBody, coordKey);
       fetchBody = sealed.envelopeJson;
-      fetchHeaders = proxyHeaders({ "Content-Type": SEALED_CONTENT_TYPE });
+      fetchHeaders = proxyHeaders({ "Content-Type": SEALED_CONTENT_TYPE, ...selfRouteHeader });
       sealCtx = {
         ephemPriv: sealed.ephemeralPrivateKey,
         coordPub: coordKey.publicKey,
@@ -382,7 +562,20 @@ export async function streamChat(
     try {
       const errData = JSON.parse(text);
       const msg = errData?.error?.message || text;
-      if (res.status === 503 && msg.includes("queue timeout")) {
+      // Strict free-only self-route errors (from a `self_route_only` API key)
+      // map to actionable copy. These only occur on the exclusive free-only
+      // path, which never falls back to paid providers — the "My Machine" chat
+      // toggle uses `prefer` and falls back, so it won't produce these codes.
+      const code = errData?.error?.code as string | undefined;
+      if (code === "no_linked_machine") {
+        callbacks.onError("No machine linked to your account — run `darkbloom login` on your Mac, then try again.");
+      } else if (code === "machine_offline") {
+        callbacks.onError("Your machine is offline — start your Darkbloom node and try again. (Free-only self-route won't fall back to the paid network.)");
+      } else if (code === "model_not_loaded") {
+        callbacks.onError("This model isn't loaded on your machine — load it on your node, then try again.");
+      } else if (code === "machine_busy") {
+        callbacks.onError("Your machine is busy — try again in a moment.");
+      } else if (res.status === 503 && msg.includes("queue timeout")) {
         callbacks.onError("All providers are busy — please try again in a moment");
       } else if (res.status === 402) {
         callbacks.onError("Insufficient credits — buy credits in Billing to continue");

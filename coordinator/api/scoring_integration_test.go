@@ -21,9 +21,9 @@ import (
 // and is no longer routable via FindProvider.
 func TestIntegration_ProviderEvictionRemovesFromRouting(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 200 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())
@@ -170,25 +170,25 @@ func TestIntegration_SSEChunkNormalization(t *testing.T) {
 			},
 		},
 		{
-			name:  "reasoning_content renamed to reasoning",
+			name:  "reasoning_content emits both reasoning and reasoning_content",
 			input: `data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}`,
 			check: func(t *testing.T, result string) {
-				if strings.Contains(result, `"reasoning_content"`) {
-					t.Error("reasoning_content should be renamed to reasoning")
+				if !strings.Contains(result, `"reasoning_content":"thinking..."`) {
+					t.Error("reasoning_content should be preserved for AI SDK compatibility")
 				}
 				if !strings.Contains(result, `"reasoning":"thinking..."`) {
-					t.Error("reasoning should contain the original reasoning_content value")
+					t.Error("reasoning alias should be added for other clients")
 				}
 			},
 		},
 		{
-			name:  "both reasoning and reasoning_content deduplicates",
+			name:  "both reasoning and reasoning_content are preserved",
 			input: `data: {"choices":[{"delta":{"reasoning":"thought","reasoning_content":"thought"}}]}`,
 			check: func(t *testing.T, result string) {
-				if strings.Contains(result, `"reasoning_content"`) {
-					t.Error("reasoning_content should be removed when reasoning is present")
+				if !strings.Contains(result, `"reasoning_content"`) {
+					t.Error("reasoning_content should be preserved")
 				}
-				if !strings.Contains(result, `"reasoning":"thought"`) {
+				if !strings.Contains(result, `"reasoning"`) {
 					t.Error("reasoning should be preserved")
 				}
 			},

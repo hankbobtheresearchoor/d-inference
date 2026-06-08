@@ -54,19 +54,25 @@ public struct BackendSettings: Sendable, Equatable, Codable {
     /// Minutes of inactivity before the backend is shut down to free GPU memory.
     /// 0 = never shut down. Default: 60 (1 hour).
     public var idleTimeoutMins: UInt64
+    /// Maximum number of models to keep resident at once. This bounds
+    /// coordinator-driven preloads so advertised model count cannot become a
+    /// memory-unbounded slot cap.
+    public var maxModelSlots: UInt64
 
     public init(
         port: UInt16 = 8100,
         model: String? = nil,
         continuousBatching: Bool = true,
         enabledModels: [String] = [],
-        idleTimeoutMins: UInt64 = 60
+        idleTimeoutMins: UInt64 = 60,
+        maxModelSlots: UInt64 = 3
     ) {
         self.port = port
         self.model = model
         self.continuousBatching = continuousBatching
         self.enabledModels = enabledModels
         self.idleTimeoutMins = idleTimeoutMins
+        self.maxModelSlots = maxModelSlots
     }
 
     enum CodingKeys: String, CodingKey {
@@ -75,6 +81,7 @@ public struct BackendSettings: Sendable, Equatable, Codable {
         case continuousBatching = "continuous_batching"
         case enabledModels = "enabled_models"
         case idleTimeoutMins = "idle_timeout_mins"
+        case maxModelSlots = "max_model_slots"
     }
 
     public init(from decoder: Decoder) throws {
@@ -84,27 +91,35 @@ public struct BackendSettings: Sendable, Equatable, Codable {
         self.continuousBatching = try container.decodeIfPresent(Bool.self, forKey: .continuousBatching) ?? true
         self.enabledModels = try container.decodeIfPresent([String].self, forKey: .enabledModels) ?? []
         self.idleTimeoutMins = try container.decodeIfPresent(UInt64.self, forKey: .idleTimeoutMins) ?? 60
+        self.maxModelSlots = try container.decodeIfPresent(UInt64.self, forKey: .maxModelSlots) ?? 3
     }
 }
 
 public struct CoordinatorSettings: Sendable, Equatable, Codable {
     public var url: String
     public var heartbeatIntervalSecs: UInt64
+    /// When true, register this machine as private-only: the coordinator serves
+    /// it exclusively to the owner's own ("My Machine") requests, never the
+    /// public fleet. Set `private_only = true` under `[coordinator]` in config.
+    public var privateOnly: Bool
 
-    public init(url: String = "ws://localhost:8080/ws/provider", heartbeatIntervalSecs: UInt64 = 5) {
+    public init(url: String = "wss://api.darkbloom.dev/ws/provider", heartbeatIntervalSecs: UInt64 = 5, privateOnly: Bool = false) {
         self.url = url
         self.heartbeatIntervalSecs = heartbeatIntervalSecs
+        self.privateOnly = privateOnly
     }
 
     enum CodingKeys: String, CodingKey {
         case url
         case heartbeatIntervalSecs = "heartbeat_interval_secs"
+        case privateOnly = "private_only"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.url = try container.decodeIfPresent(String.self, forKey: .url) ?? "ws://localhost:8080/ws/provider"
+        self.url = try container.decodeIfPresent(String.self, forKey: .url) ?? "wss://api.darkbloom.dev/ws/provider"
         self.heartbeatIntervalSecs = try container.decodeIfPresent(UInt64.self, forKey: .heartbeatIntervalSecs) ?? 5
+        self.privateOnly = try container.decodeIfPresent(Bool.self, forKey: .privateOnly) ?? false
     }
 }
 
@@ -154,10 +169,11 @@ public struct ProviderConfig: Sendable, Equatable, Codable {
                 model: nil,
                 continuousBatching: true,
                 enabledModels: [],
-                idleTimeoutMins: 60
+                idleTimeoutMins: 60,
+                maxModelSlots: 3
             ),
             coordinator: CoordinatorSettings(
-                url: "ws://localhost:8080/ws/provider",
+                url: "wss://api.darkbloom.dev/ws/provider",
                 heartbeatIntervalSecs: 5
             ),
             schedule: nil
@@ -193,7 +209,7 @@ public enum ConfigManager: Sendable {
     ///
     /// 1. `~/.config/darkbloom/provider.toml`  (canonical, new installs)
     /// 2. `~/Library/Application Support/darkbloom/provider.toml`
-    /// 3. `~/.config/eigeninference/provider.toml`  (legacy, Rust-CLI era)
+    /// 3. `~/.config/eigeninference/provider.toml`  (legacy install path)
     /// 4. `~/Library/Application Support/eigeninference/provider.toml`
     ///
     /// If none of those files exist yet, we return path #1 so first-time
@@ -298,7 +314,7 @@ public enum ConfigManager: Sendable {
         }
     }
 
-    /// Serialize a ProviderConfig to TOML matching the Rust CLI format.
+    /// Serialize a ProviderConfig to the provider's TOML config format.
     public static func serialize(_ config: ProviderConfig) -> String {
         do {
             return try TOMLEncoder().encode(config)

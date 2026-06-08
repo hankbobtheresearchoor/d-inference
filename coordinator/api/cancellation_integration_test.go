@@ -108,7 +108,7 @@ func connectProviderWithAttestation(t *testing.T, ctx context.Context, tsURL str
 			MemoryGB:     64,
 		},
 		Models:                  models,
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               publicKey,
 		Attestation:             attestation,
 		EncryptedResponseChunks: true,
@@ -151,9 +151,9 @@ func waitForChallenge(t *testing.T, ctx context.Context, conn *websocket.Conn, p
 func setupTestServer(t *testing.T) (*Server, *registry.Registry, store.Store, *httptest.Server) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 200 * time.Millisecond
 	ts := httptest.NewServer(srv.Handler())
 	return srv, reg, st, ts

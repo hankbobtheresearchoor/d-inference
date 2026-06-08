@@ -132,7 +132,7 @@ func makeRoutableProvider(t *testing.T, reg *registry.Registry, id, model string
 		Models: []protocol.ModelInfo{
 			{ID: model, SizeBytes: 5_000_000_000, ModelType: "chat", Quantization: "4bit"},
 		},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               "fX6XYH7p2hmM3ogeXaAsY+p8M6UKD1df/LJUN9Nj9Nw=",
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities: &protocol.PrivacyCapabilities{
@@ -176,7 +176,7 @@ func TestRoutingMetrics_SelectedEmitsDecisionAndCost(t *testing.T) {
 	defer collector.Close()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 
 	model := "test-routing-model"
@@ -192,7 +192,7 @@ func TestRoutingMetrics_SelectedEmitsDecisionAndCost(t *testing.T) {
 		ErrorCh:               make(chan protocol.InferenceErrorMessage, 1),
 	}
 
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	ddClient := newTestDD(t, collector)
 	defer ddClient.Close()
 	srv.SetDatadog(ddClient)
@@ -234,10 +234,10 @@ func TestRoutingMetrics_NoProviderEmitsNoProvider(t *testing.T) {
 	defer collector.Close()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	ddClient := newTestDD(t, collector)
 	defer ddClient.Close()
 	srv.SetDatadog(ddClient)
@@ -279,7 +279,7 @@ func TestRoutingMetrics_OverCapacityOutcome(t *testing.T) {
 	defer collector.Close()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 
 	model := "big-model"
@@ -290,7 +290,7 @@ func TestRoutingMetrics_OverCapacityOutcome(t *testing.T) {
 	p.BackendCapacity.Slots[0].State = "idle_shutdown"
 	p.Mu().Unlock()
 
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	ddClient := newTestDD(t, collector)
 	defer ddClient.Close()
 	srv.SetDatadog(ddClient)
@@ -309,8 +309,23 @@ func TestRoutingMetrics_OverCapacityOutcome(t *testing.T) {
 		t.Fatal("expected nil — 64GB provider can't fit 128GB model")
 	}
 
+	// A model that can never fit must be classified as model_too_large, NOT
+	// over_capacity. over_capacity emits a 429 + Retry-After telling the client
+	// to retry, which is pointless when the model will never fit on this box —
+	// the client would retry forever. The absolute-fit gate reports it via
+	// ModelTooLargeRejections (permanent), separate from CapacityRejections
+	// (transient: full now, retry later).
+	if decision.ModelTooLargeRejections == 0 {
+		t.Fatalf("expected ModelTooLargeRejections > 0 for a 128GB model on a 64GB provider; decision=%+v", decision)
+	}
+	if decision.CapacityRejections != 0 {
+		t.Fatalf("a too-large model must not count as transient capacity pressure; got CapacityRejections=%d", decision.CapacityRejections)
+	}
+
 	outcome := "no_provider"
-	if decision.CapacityRejections > 0 && decision.CandidateCount == 0 {
+	if decision.ModelTooLargeRejections > 0 && decision.CandidateCount == 0 {
+		outcome = "model_too_large"
+	} else if decision.CapacityRejections > 0 && decision.CandidateCount == 0 {
 		outcome = "over_capacity"
 	}
 	srv.ddIncr("routing.decisions", []string{"model:" + model, "outcome:" + outcome})
@@ -318,8 +333,8 @@ func TestRoutingMetrics_OverCapacityOutcome(t *testing.T) {
 	_ = ddClient.Statsd.Flush()
 	packets := collector.drain()
 
-	if !hasMetric(packets, "outcome:over_capacity") {
-		t.Errorf("expected over_capacity outcome when provider too small; got packets: %v", packets)
+	if !hasMetric(packets, "outcome:model_too_large") {
+		t.Errorf("expected model_too_large outcome when provider too small; got packets: %v", packets)
 	}
 }
 
@@ -328,10 +343,10 @@ func TestRateLimitMetrics_ConsumerRejectionEmitsCounter(t *testing.T) {
 	defer collector.Close()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	ddClient := newTestDD(t, collector)
 	defer ddClient.Close()
 	srv.SetDatadog(ddClient)
@@ -371,10 +386,10 @@ func TestRateLimitMetrics_FinancialTierTag(t *testing.T) {
 	defer collector.Close()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	ddClient := newTestDD(t, collector)
 	defer ddClient.Close()
 	srv.SetDatadog(ddClient)
@@ -407,10 +422,10 @@ func TestAttestationMetrics_AllOutcomes(t *testing.T) {
 	defer collector.Close()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	ddClient := newTestDD(t, collector)
 	defer ddClient.Close()
 	srv.SetDatadog(ddClient)
@@ -438,10 +453,10 @@ func TestInferenceMetrics_CompletionCounters(t *testing.T) {
 	defer collector.Close()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	ddClient := newTestDD(t, collector)
 	defer ddClient.Close()
 	srv.SetDatadog(ddClient)
@@ -477,13 +492,13 @@ func TestRoutingMetrics_AllTagsOnSelection(t *testing.T) {
 	defer collector.Close()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 
 	model := "tag-check-model"
 	p := makeRoutableProvider(t, reg, "tag-provider", model)
 
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	ddClient := newTestDD(t, collector)
 	defer ddClient.Close()
 	srv.SetDatadog(ddClient)

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eigeninference/d-inference/coordinator/api/types"
 	"github.com/eigeninference/d-inference/coordinator/internal/e2e"
 	"github.com/eigeninference/d-inference/coordinator/protocol"
 	"github.com/eigeninference/d-inference/coordinator/registry"
@@ -26,9 +27,9 @@ import (
 func testServer(t *testing.T) (*Server, *store.MemoryStore) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	return srv, st
 }
 
@@ -212,6 +213,51 @@ func TestCORSPreflight(t *testing.T) {
 	}
 }
 
+// TestCORSPublicEndpointsAllowAnyOrigin verifies the public, non-credentialed
+// read endpoints (consumed by the marketing site) are readable cross-origin via
+// a wildcard, while credentialed endpoints stay locked to a single origin.
+func TestCORSPublicEndpointsAllowAnyOrigin(t *testing.T) {
+	srv, _ := testServer(t)
+
+	for _, path := range []string{"/v1/models/catalog", "/v1/pricing"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+			t.Errorf("%s: Access-Control-Allow-Origin = %q, want \"*\"", path, got)
+		}
+		// A wildcard origin must never be paired with credentials.
+		if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+			t.Errorf("%s: Access-Control-Allow-Credentials = %q, want empty", path, got)
+		}
+	}
+
+	// A non-public endpoint keeps the locked single origin (never wildcard).
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got == "*" || got == "" {
+		t.Errorf("/health: Access-Control-Allow-Origin = %q, want a specific origin", got)
+	}
+
+	// /v1/pricing also serves authenticated PUT/DELETE. A preflight for a
+	// non-GET method must keep the credentialed, single-origin CORS (not the
+	// wildcard public GET headers) so the mutation's preflight is accepted.
+	preflight := httptest.NewRequest(http.MethodOptions, "/v1/pricing", nil)
+	preflight.Header.Set("Access-Control-Request-Method", http.MethodDelete)
+	pw := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(pw, preflight)
+	if got := pw.Header().Get("Access-Control-Allow-Origin"); got == "*" || got == "" {
+		t.Errorf("DELETE /v1/pricing preflight: Allow-Origin = %q, want the configured origin (not wildcard)", got)
+	}
+	if got := pw.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Errorf("DELETE /v1/pricing preflight: Allow-Credentials = %q, want \"true\"", got)
+	}
+	if got := pw.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, PUT, DELETE, OPTIONS" {
+		t.Errorf("DELETE /v1/pricing preflight: Allow-Methods = %q, want the credentialed method set", got)
+	}
+}
+
 type testProviderKeyPair struct {
 	public  [32]byte
 	private [32]byte
@@ -294,9 +340,9 @@ func writeEncryptedTestChunk(t *testing.T, ctx context.Context, conn *websocket.
 // provider connected via WebSocket.
 func TestStreamingE2E(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	// Start an httptest server.
 	ts := httptest.NewServer(srv.Handler())
@@ -325,7 +371,7 @@ func TestStreamingE2E(t *testing.T) {
 		Models: []protocol.ModelInfo{
 			{ID: "test-model", SizeBytes: 1000, ModelType: "test", Quantization: "4bit"},
 		},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -367,7 +413,7 @@ func TestStreamingE2E(t *testing.T) {
 					conn.Write(ctx, websocket.MessageText, respData)
 					continue
 				}
-				if msgType == protocol.TypeRuntimeStatus {
+				if msgType == protocol.TypeRuntimeStatus || msgType == protocol.TypeTrustStatus {
 					continue
 				}
 			}
@@ -452,9 +498,9 @@ func TestStreamingE2E(t *testing.T) {
 // TestNonStreamingE2E tests a non-streaming completion request.
 func TestNonStreamingE2E(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -475,7 +521,7 @@ func TestNonStreamingE2E(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "test-model", ModelType: "test", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -567,9 +613,9 @@ func TestNonStreamingE2E(t *testing.T) {
 
 func TestChatCompletionsRetriesAcceptedProviderErrorBeforeFirstChunk(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -594,7 +640,7 @@ func TestChatCompletionsRetriesAcceptedProviderErrorBeforeFirstChunk(t *testing.
 			Type:                    protocol.TypeRegister,
 			Hardware:                protocol.Hardware{ChipName: "M3 Max", MemoryGB: 64},
 			Models:                  []protocol.ModelInfo{{ID: "retry-model", ModelType: "test", Quantization: "4bit"}},
-			Backend:                 "inprocess-mlx",
+			Backend:                 "mlx-swift",
 			PublicKey:               pubKey,
 			EncryptedResponseChunks: true,
 			PrivacyCapabilities:     testPrivacyCaps(),
@@ -831,10 +877,11 @@ func TestNormalizeSSEChunk(t *testing.T) {
 				if !strings.Contains(got, `"tool_calls":[]`) {
 					t.Errorf("expected tool_calls to be empty array, got: %s", got)
 				}
-				// reasoning_content should be removed (merged into reasoning)
-				// to avoid ForgeCode serde duplicate-field errors.
-				if strings.Contains(got, `"reasoning_content"`) {
-					t.Errorf("expected reasoning_content to be removed (deduped into reasoning), got: %s", got)
+				// Both reasoning and reasoning_content should be present:
+				// reasoning_content for AI SDK compatibility, reasoning
+				// for ForgeCode and other clients.
+				if !strings.Contains(got, `"reasoning_content"`) {
+					t.Errorf("expected reasoning_content to be preserved for AI SDK, got: %s", got)
 				}
 			},
 		},
@@ -1023,42 +1070,41 @@ func TestResponsesInputToolTranscriptToChatMessages(t *testing.T) {
 }
 
 func TestChatCompletionToResponses(t *testing.T) {
-	chat := map[string]any{
-		"id":      "chatcmpl-test",
-		"object":  "chat.completion",
-		"created": float64(123),
-		"model":   "local-path",
-		"choices": []any{
-			map[string]any{
-				"finish_reason": "tool_calls",
-				"message": map[string]any{
-					"role":      "assistant",
-					"content":   "",
-					"reasoning": "need weather",
-					"tool_calls": []any{
-						map[string]any{
-							"id":   "call_123",
-							"type": "function",
-							"function": map[string]any{
-								"name":      "get_current_weather",
-								"arguments": `{"city":"Paris"}`,
-							},
+	chat := types.ChatCompletionResponse{
+		ID:      "chatcmpl-test",
+		Object:  "chat.completion",
+		Created: 123,
+		Model:   "local-path",
+		Choices: []types.ChatCompletionChoice{{
+			FinishReason: "tool_calls",
+			Message: types.ChatCompletionMessage{
+				Role:      "assistant",
+				Content:   "",
+				Reasoning: "need weather",
+				ToolCalls: []map[string]any{
+					{
+						"id":   "call_123",
+						"type": "function",
+						"function": map[string]any{
+							"name":      "get_current_weather",
+							"arguments": `{"city":"Paris"}`,
 						},
 					},
 				},
 			},
-		},
-		"usage": map[string]any{
-			"prompt_tokens":     float64(10),
-			"completion_tokens": float64(5),
+		}},
+		Usage: types.ChatCompletionUsage{
+			PromptTokens:     10,
+			CompletionTokens: 5,
+			TotalTokens:      15,
 		},
 	}
 
 	got := chatCompletionToResponses(chat, "mlx-community/gemma-4-26b-a4b-it-8bit", "", "")
-	if got["object"] != "response" || got["model"] != "mlx-community/gemma-4-26b-a4b-it-8bit" {
+	if got.Object != "response" || got.Model != "mlx-community/gemma-4-26b-a4b-it-8bit" {
 		t.Fatalf("response metadata = %#v", got)
 	}
-	output := got["output"].([]any)
+	output := got.Output
 	if output[0].(map[string]any)["type"] != "reasoning" {
 		t.Fatalf("first output = %#v", output[0])
 	}
@@ -1066,9 +1112,25 @@ func TestChatCompletionToResponses(t *testing.T) {
 	if call["type"] != "function_call" || call["call_id"] != "call_123" {
 		t.Fatalf("function call output = %#v", call)
 	}
-	usage := got["usage"].(map[string]any)
-	if usage["input_tokens"] != uint64(10) || usage["output_tokens"] != uint64(5) {
+	usage := got.Usage
+	if usage.InputTokens != 10 || usage.OutputTokens != 5 {
 		t.Fatalf("usage = %#v", usage)
+	}
+
+	// Verify wire format preserves zero-valued fields.
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	wire := string(b)
+	if !strings.Contains(wire, `"incomplete_details"`) {
+		t.Errorf("wire output missing incomplete_details field: %s", wire)
+	}
+	if !strings.Contains(wire, `"cached_tokens"`) {
+		t.Errorf("wire output missing cached_tokens in usage details: %s", wire)
+	}
+	if !strings.Contains(wire, `"reasoning_tokens"`) {
+		t.Errorf("wire output missing reasoning_tokens in usage details: %s", wire)
 	}
 }
 
@@ -1124,10 +1186,6 @@ func TestProviderEarningsEndpoint(t *testing.T) {
 	var resp map[string]any
 	json.Unmarshal(w.Body.Bytes(), &resp)
 
-	if resp["wallet_address"] != providerWallet {
-		t.Errorf("wallet_address = %v, want %v", resp["wallet_address"], providerWallet)
-	}
-
 	// Balance should be 450,000 + 900,000 = 1,350,000 micro-USD
 	balance := resp["balance_micro_usd"].(float64)
 	if balance != 1_350_000 {
@@ -1150,8 +1208,13 @@ func TestProviderEarningsUsesStoredPayoutRecords(t *testing.T) {
 	srv, _ := testServer(t)
 
 	wallet := "0xStoredPayoutWallet1234567890abcdef1234"
-	if err := srv.ledger.CreditProvider(wallet, 250_000, "qwen3.5-9b", "job-stored"); err != nil {
-		t.Fatalf("CreditProvider: %v", err)
+	if err := srv.store.CreditProviderWallet(&store.ProviderPayout{
+		ProviderAddress: wallet,
+		AmountMicroUSD:  250_000,
+		Model:           "qwen3.5-9b",
+		JobID:           "job-stored",
+	}); err != nil {
+		t.Fatalf("CreditProviderWallet: %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/provider/earnings?wallet="+wallet, nil)
@@ -1275,5 +1338,249 @@ func TestProviderEarningsEmptyWallet(t *testing.T) {
 	}
 	if resp["total_jobs"].(float64) != 0 {
 		t.Errorf("total_jobs = %v, want 0", resp["total_jobs"])
+	}
+}
+
+// TestApproximateTokenCount verifies the len/4 routing heuristic.
+func TestApproximateTokenCount(t *testing.T) {
+	tests := []struct {
+		name  string
+		input any
+		want  int
+	}{
+		{"nil", nil, 0},
+		{"empty string", "", 0},
+		{"single char", "a", 1},
+		{"short ASCII", "hello", 1},                        // 5/4 = 1
+		{"english prose", "The quick brown fox jumps.", 6}, // 26/4 = 6
+		{"16 bytes", "0123456789abcdef", 4},                // 16/4 = 4
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := approximateTokenCount(tt.input)
+			if got != tt.want {
+				t.Errorf("approximateTokenCount(%v) = %d, want %d", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestApproximateTokenCountUpperBound verifies that the billing upper bound
+// returns len(text) — guaranteed >= actual BPE tokens for any tokenizer.
+func TestApproximateTokenCountUpperBound(t *testing.T) {
+	tests := []struct {
+		name  string
+		input any
+		want  int
+	}{
+		{"nil", nil, 0},
+		{"empty string", "", 0},
+		{"single char", "a", 1},
+		{"short ASCII", "hello", 5},
+		{"english prose", "The quick brown fox jumps over the lazy dog.", 44},
+		{"code snippet", "func main() { fmt.Println(\"hello\") }", 36},
+		{"multibyte UTF-8", "こんにちは世界", 21}, // 7 chars × 3 bytes each
+		{"emoji", "👋🌍", 8},                 // 2 emoji × 4 bytes each
+		{"chat template tags", "<|im_start|>system\nYou are helpful.<|im_end|>", 45},
+		{"json object", map[string]string{"role": "user", "content": "hi"}, len(`{"content":"hi","role":"user"}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := approximateTokenCountUpperBound(tt.input)
+			if got != tt.want {
+				t.Errorf("approximateTokenCountUpperBound(%v) = %d, want %d", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBillingEstimateAlwaysGERoutingEstimate confirms that the billing
+// upper bound is always >= the routing heuristic for the same input.
+func TestBillingEstimateAlwaysGERoutingEstimate(t *testing.T) {
+	inputs := []string{
+		"Hello, world!",
+		"def fibonacci(n):\n    if n <= 1:\n        return n\n    return fibonacci(n-1) + fibonacci(n-2)",
+		"SELECT u.id, u.name FROM users u WHERE u.active = true ORDER BY u.created_at DESC LIMIT 10;",
+		"これはテストです。日本語のテキストはトークン数が多くなります。",
+		strings.Repeat("a", 1000),
+	}
+	for _, input := range inputs {
+		routing := approximateTokenCount(input)
+		billing := approximateTokenCountUpperBound(input)
+		if billing < routing {
+			t.Errorf("billing(%d) < routing(%d) for %q", billing, routing, input[:min(20, len(input))])
+		}
+	}
+}
+
+// TestEstimatePromptTokens verifies the routing estimate for different
+// request field layouts.
+func TestEstimatePromptTokens(t *testing.T) {
+	tests := []struct {
+		name  string
+		input map[string]any
+	}{
+		{
+			name:  "messages field",
+			input: map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hello"}}},
+		},
+		{
+			name:  "prompt field",
+			input: map[string]any{"prompt": "Tell me a story"},
+		},
+		{
+			name:  "input field",
+			input: map[string]any{"input": "Translate this"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			routing := estimatePromptTokens(tt.input)
+			billing := estimateBillingPromptTokens(tt.input)
+			if routing < 1 {
+				t.Errorf("estimatePromptTokens() = %d, want >= 1", routing)
+			}
+			if billing < routing {
+				t.Errorf("billing(%d) < routing(%d)", billing, routing)
+			}
+		})
+	}
+}
+
+// TestResolveReasoningTokens covers the precedence between the provider's
+// tokenizer-accurate count and the legacy completion-tokens fallback.
+func TestResolveReasoningTokens(t *testing.T) {
+	cases := []struct {
+		name      string
+		usage     protocol.UsageInfo
+		reasoning string
+		want      uint64
+	}{
+		{
+			name:      "accurate count preferred",
+			usage:     protocol.UsageInfo{CompletionTokens: 100, ReasoningTokens: 42},
+			reasoning: "thinking...",
+			want:      42,
+		},
+		{
+			name:      "fallback to completion tokens for legacy provider",
+			usage:     protocol.UsageInfo{CompletionTokens: 100, ReasoningTokens: 0},
+			reasoning: "thinking...",
+			want:      100,
+		},
+		{
+			name:      "no reasoning content yields zero",
+			usage:     protocol.UsageInfo{CompletionTokens: 100, ReasoningTokens: 0},
+			reasoning: "",
+			want:      0,
+		},
+		{
+			name:      "accurate count wins even without reasoning text",
+			usage:     protocol.UsageInfo{CompletionTokens: 100, ReasoningTokens: 7},
+			reasoning: "",
+			want:      7,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveReasoningTokens(tc.usage, tc.reasoning); got != tc.want {
+				t.Errorf("resolveReasoningTokens = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildNonStreamingResponseReasoningDetails verifies the chat
+// completion usage object carries completion_tokens_details.reasoning_tokens
+// only when there is a reasoning count to report.
+func TestBuildNonStreamingResponseReasoningDetails(t *testing.T) {
+	msg := extractedMessage{Content: "4", Reasoning: "2+2"}
+	usage := protocol.UsageInfo{PromptTokens: 10, CompletionTokens: 20, ReasoningTokens: 8}
+
+	resp := buildNonStreamingResponse("req-1", "gpt-oss-20b", msg, usage, "", "")
+	if resp.Usage.CompletionTokensDetails == nil {
+		t.Fatalf("expected completion_tokens_details, got nil")
+	}
+	if resp.Usage.CompletionTokensDetails.ReasoningTokens != 8 {
+		t.Errorf("reasoning_tokens = %d, want 8", resp.Usage.CompletionTokensDetails.ReasoningTokens)
+	}
+
+	// Wire format must include the nested detail.
+	b, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"completion_tokens_details":{"reasoning_tokens":8}`) {
+		t.Errorf("wire missing reasoning detail: %s", b)
+	}
+
+	// No reasoning content => no details object (omitempty).
+	plain := buildNonStreamingResponse("req-2", "gpt-oss-20b",
+		extractedMessage{Content: "hi"},
+		protocol.UsageInfo{PromptTokens: 3, CompletionTokens: 1}, "", "")
+	if plain.Usage.CompletionTokensDetails != nil {
+		t.Errorf("expected no details for non-reasoning response, got %#v", plain.Usage.CompletionTokensDetails)
+	}
+	pb, _ := json.Marshal(plain)
+	if strings.Contains(string(pb), "completion_tokens_details") {
+		t.Errorf("non-reasoning wire should omit details: %s", pb)
+	}
+}
+
+// TestBuildResponsesResponseReasoningTokens verifies the Responses API
+// uses the accurate count when the provider supplies it.
+func TestBuildResponsesResponseReasoningTokens(t *testing.T) {
+	msg := extractedMessage{Content: "4", Reasoning: "2+2"}
+	usage := protocol.UsageInfo{PromptTokens: 10, CompletionTokens: 20, ReasoningTokens: 8}
+
+	resp := buildResponsesResponse("req-1", "gpt-oss-20b", msg, usage, "", "")
+	if resp.Usage.OutputTokensDetail.ReasoningTokens != 8 {
+		t.Errorf("reasoning_tokens = %d, want 8 (accurate count, not %d completion)",
+			resp.Usage.OutputTokensDetail.ReasoningTokens, usage.CompletionTokens)
+	}
+}
+
+// TestInjectReasoningDetailIntoRawUsage covers the passthrough path: a
+// provider-reported accurate reasoning count is spliced into the raw
+// chat.completion usage object, without overriding an existing value.
+func TestInjectReasoningDetailIntoRawUsage(t *testing.T) {
+	// Adds detail when absent.
+	obj := map[string]any{
+		"object": "chat.completion",
+		"usage": map[string]any{
+			"prompt_tokens":     float64(10),
+			"completion_tokens": float64(30),
+		},
+	}
+	injectReasoningDetailIntoRawUsage(obj, protocol.UsageInfo{CompletionTokens: 30, ReasoningTokens: 12})
+	details := obj["usage"].(map[string]any)["completion_tokens_details"].(map[string]any)
+	if details["reasoning_tokens"] != 12 {
+		t.Errorf("reasoning_tokens = %v, want 12", details["reasoning_tokens"])
+	}
+
+	// No-op when the provider reported no reasoning count.
+	plain := map[string]any{"usage": map[string]any{"completion_tokens": float64(5)}}
+	injectReasoningDetailIntoRawUsage(plain, protocol.UsageInfo{CompletionTokens: 5, ReasoningTokens: 0})
+	if _, ok := plain["usage"].(map[string]any)["completion_tokens_details"]; ok {
+		t.Errorf("expected no details injected for zero reasoning count")
+	}
+
+	// Never overrides an existing detail.
+	existing := map[string]any{
+		"usage": map[string]any{
+			"completion_tokens_details": map[string]any{"reasoning_tokens": float64(99)},
+		},
+	}
+	injectReasoningDetailIntoRawUsage(existing, protocol.UsageInfo{ReasoningTokens: 5})
+	got := existing["usage"].(map[string]any)["completion_tokens_details"].(map[string]any)["reasoning_tokens"]
+	if got != float64(99) {
+		t.Errorf("reasoning_tokens = %v, want 99 (must not override)", got)
+	}
+
+	// No-op when there is no usage object at all.
+	noUsage := map[string]any{"object": "chat.completion"}
+	injectReasoningDetailIntoRawUsage(noUsage, protocol.UsageInfo{ReasoningTokens: 7})
+	if _, ok := noUsage["usage"]; ok {
+		t.Errorf("did not expect a usage object to be created")
 	}
 }

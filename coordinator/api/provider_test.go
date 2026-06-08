@@ -33,9 +33,9 @@ const knownGoodBinaryHashForTest = "0123456789abcdef0123456789abcdef0123456789ab
 
 func TestProviderWebSocketConnect(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -61,7 +61,7 @@ func TestProviderWebSocketConnect(t *testing.T) {
 		Models: []protocol.ModelInfo{
 			{ID: "test-model", SizeBytes: 1000, ModelType: "chat", Quantization: "4bit"},
 		},
-		Backend: "inprocess-mlx",
+		Backend: "mlx-swift",
 	}
 	regData, _ := json.Marshal(regMsg)
 	if err := conn.Write(ctx, websocket.MessageText, regData); err != nil {
@@ -99,9 +99,9 @@ func TestProviderWebSocketConnect(t *testing.T) {
 
 func TestProviderWebSocketMultiple(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -124,7 +124,7 @@ func TestProviderWebSocketMultiple(t *testing.T) {
 			Type:                    protocol.TypeRegister,
 			Hardware:                protocol.Hardware{ChipName: "M3 Max", MemoryGB: 64},
 			Models:                  []protocol.ModelInfo{{ID: "shared-model", ModelType: "chat", Quantization: "4bit"}},
-			Backend:                 "inprocess-mlx",
+			Backend:                 "mlx-swift",
 			PublicKey:               pubKey,
 			EncryptedResponseChunks: true,
 			PrivacyCapabilities:     testPrivacyCaps(),
@@ -156,9 +156,9 @@ func TestProviderWebSocketMultiple(t *testing.T) {
 
 func TestProviderInferenceError(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -178,7 +178,7 @@ func TestProviderInferenceError(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "error-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -236,6 +236,78 @@ func TestProviderInferenceError(t *testing.T) {
 
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", resp.StatusCode)
+	}
+}
+
+// TestHandleInferenceErrorReputationCarveout verifies that capacity rejections
+// (HTTP 503/429, token-budget exhaustion, out-of-memory load rejects) do NOT
+// count against a provider's reputation, while a genuine provider fault (HTTP
+// 500) still records a job failure. It drives handleInferenceError directly so
+// the carve-out is asserted deterministically without the HTTP/WebSocket flow.
+// A registry without a store keeps reputation reads race-free (no async
+// persistence goroutine).
+func TestHandleInferenceErrorReputationCarveout(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	reg := registry.New(logger)
+	srv := &Server{registry: reg, logger: logger}
+
+	regMsg := &protocol.RegisterMessage{
+		Type:     protocol.TypeRegister,
+		Hardware: protocol.Hardware{ChipName: "M3 Max", MemoryGB: 64},
+		Models:   []protocol.ModelInfo{{ID: "cap-model", ModelType: "chat", Quantization: "4bit"}},
+		Backend:  "mlx-swift",
+	}
+	p := reg.Register("prov-reputation", nil, regMsg)
+	if p == nil {
+		t.Fatal("Register returned nil provider")
+	}
+
+	// deliverError registers a fresh pending request and routes a single
+	// inference error through handleInferenceError. Channels are buffered so
+	// the synchronous delivery never blocks.
+	deliverError := func(requestID, errText string, status int) {
+		pr := &registry.PendingRequest{
+			RequestID:  requestID,
+			ProviderID: p.ID,
+			Model:      "cap-model",
+			ChunkCh:    make(chan string, 1),
+			CompleteCh: make(chan protocol.UsageInfo, 1),
+			ErrorCh:    make(chan protocol.InferenceErrorMessage, 1),
+		}
+		p.AddPending(pr)
+		srv.handleInferenceError(p.ID, p, &protocol.InferenceErrorMessage{
+			Type:       protocol.TypeInferenceError,
+			RequestID:  requestID,
+			Error:      errText,
+			StatusCode: status,
+		})
+	}
+
+	// Capacity rejections must NOT be penalised:
+	//   - 503 service unavailable (e.g. provider pre-accept reject)
+	//   - 429 too many requests
+	//   - token_budget_exhausted (carried in the error message, status 200)
+	//   - "insufficient memory" message even on a 500 (case-insensitive)
+	deliverError("req-503", "insufficient memory to load model 'cap-model'", http.StatusServiceUnavailable)
+	deliverError("req-429", "rate limited", http.StatusTooManyRequests)
+	deliverError("req-budget", "token_budget_exhausted", http.StatusOK)
+	deliverError("req-oom-500", "Insufficient memory (78.9 GB free, need 93.7 GB)", http.StatusInternalServerError)
+
+	if got := p.Reputation.FailedJobs; got != 0 {
+		t.Fatalf("after capacity rejections: FailedJobs = %d, want 0 (no reputation penalty)", got)
+	}
+	if got := p.Reputation.TotalJobs; got != 0 {
+		t.Fatalf("after capacity rejections: TotalJobs = %d, want 0", got)
+	}
+
+	// A genuine provider fault (500, no capacity keywords) still penalises.
+	deliverError("req-fault-500", "model crashed during generation", http.StatusInternalServerError)
+
+	if got := p.Reputation.FailedJobs; got != 1 {
+		t.Fatalf("after genuine fault: FailedJobs = %d, want 1", got)
+	}
+	if got := p.Reputation.TotalJobs; got != 1 {
+		t.Fatalf("after genuine fault: TotalJobs = %d, want 1", got)
 	}
 }
 
@@ -367,9 +439,9 @@ func createTestAttestationJSONWithBinaryHash(t *testing.T, encryptionKey, binary
 // with a valid Secure Enclave attestation is marked as attested.
 func TestProviderRegistrationWithValidAttestation(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -391,7 +463,7 @@ func TestProviderRegistrationWithValidAttestation(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "attested-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -423,9 +495,9 @@ func TestProviderRegistrationWithValidAttestation(t *testing.T) {
 
 func TestProviderRegistrationRequiresBinaryHashWhenPolicyConfigured(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.SetKnownBinaryHashes([]string{knownGoodBinaryHashForTest})
 
 	pubKey := testPublicKeyB64()
@@ -433,7 +505,7 @@ func TestProviderRegistrationRequiresBinaryHashWhenPolicyConfigured(t *testing.T
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "missing-binary-hash-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -464,9 +536,9 @@ func TestProviderRegistrationRequiresBinaryHashWhenPolicyConfigured(t *testing.T
 
 func TestProviderRegistrationAcceptsKnownBinaryHash(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.SetKnownBinaryHashes([]string{knownGoodBinaryHashForTest})
 
 	pubKey := testPublicKeyB64()
@@ -474,7 +546,7 @@ func TestProviderRegistrationAcceptsKnownBinaryHash(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "known-binary-hash-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -502,9 +574,9 @@ func TestProviderRegistrationAcceptsKnownBinaryHash(t *testing.T) {
 
 func TestProviderRegistrationRejectsInvalidConfiguredBinaryHash(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.SetKnownBinaryHashes([]string{"not-a-sha256"})
 
 	pubKey := testPublicKeyB64()
@@ -512,7 +584,7 @@ func TestProviderRegistrationRejectsInvalidConfiguredBinaryHash(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "invalid-configured-hash-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -544,9 +616,9 @@ func TestProviderRegistrationRejectsInvalidConfiguredBinaryHash(t *testing.T) {
 
 func TestSyncBinaryHashesRejectsInvalidStoredReleaseHashWithoutFailingOpen(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	if err := st.SetRelease(&store.Release{
 		Version:    "1.0.0",
 		Platform:   "macos-arm64",
@@ -570,9 +642,9 @@ func TestSyncBinaryHashesRejectsInvalidStoredReleaseHashWithoutFailingOpen(t *te
 
 func TestSyncBinaryHashesPreservesAdditionalConfiguredHashes(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	manualHash := strings.Repeat("a", 64)
 	releaseHash := strings.Repeat("b", 64)
@@ -617,9 +689,9 @@ func TestSyncBinaryHashesPreservesAdditionalConfiguredHashes(t *testing.T) {
 
 func TestBinaryHashPolicySnapshotConcurrentSync(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	manualHash := strings.Repeat("a", 64)
 	srv.AddKnownBinaryHashes([]string{manualHash})
 
@@ -671,9 +743,9 @@ func TestBinaryHashPolicySnapshotConcurrentSync(t *testing.T) {
 // with an invalid attestation is still registered but not marked as attested.
 func TestProviderRegistrationWithInvalidAttestation(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -695,7 +767,7 @@ func TestProviderRegistrationWithInvalidAttestation(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "unattested-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               testPublicKeyB64(),
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -721,9 +793,9 @@ func TestProviderRegistrationWithInvalidAttestation(t *testing.T) {
 // without an attestation still works in Open Mode.
 func TestProviderRegistrationWithoutAttestation(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -742,7 +814,7 @@ func TestProviderRegistrationWithoutAttestation(t *testing.T) {
 		Type:     protocol.TypeRegister,
 		Hardware: protocol.Hardware{ChipName: "M3 Max", MemoryGB: 64},
 		Models:   []protocol.ModelInfo{{ID: "open-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:  "inprocess-mlx",
+		Backend:  "mlx-swift",
 		// No attestation — Open Mode
 	}
 	regData, _ := json.Marshal(regMsg)
@@ -768,16 +840,16 @@ func TestProviderRegistrationWithoutAttestation(t *testing.T) {
 // Ported from master's coordinator/internal/api/provider_test.go (PR #99 regression).
 func TestProviderRegistrationWithoutAttestationRejectedWhenBinaryHashPolicyConfigured(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.SetKnownBinaryHashes([]string{knownGoodBinaryHashForTest})
 
 	regMsg := &protocol.RegisterMessage{
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "no-attestation-policy-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
 	}
@@ -805,9 +877,9 @@ func TestProviderRegistrationWithoutAttestationRejectedWhenBinaryHashPolicyConfi
 // attestation metadata.
 func TestListModelsWithAttestationInfo(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -830,7 +902,7 @@ func TestListModelsWithAttestationInfo(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "attested-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -886,9 +958,9 @@ func TestListModelsWithAttestationInfo(t *testing.T) {
 
 func TestAttestationRejectsMissingEncryptionKeyForRegisteredPublicKey(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -909,7 +981,7 @@ func TestAttestationRejectsMissingEncryptionKeyForRegisteredPublicKey(t *testing
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "binding-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -939,9 +1011,9 @@ func TestAttestationRejectsMissingEncryptionKeyForRegisteredPublicKey(t *testing
 
 func TestAttestationRejectsMismatchedEncryptionKey(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -962,7 +1034,7 @@ func TestAttestationRejectsMismatchedEncryptionKey(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "binding-mismatch-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -994,9 +1066,9 @@ func TestAttestationRejectsMismatchedEncryptionKey(t *testing.T) {
 // coordinator sends challenge, provider responds, verification passes.
 func TestChallengeResponseSuccess(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	// Use a very short challenge interval for testing.
 	srv.challengeInterval = 200 * time.Millisecond
 
@@ -1019,7 +1091,7 @@ func TestChallengeResponseSuccess(t *testing.T) {
 		Type:      protocol.TypeRegister,
 		Hardware:  protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:    []protocol.ModelInfo{{ID: "challenge-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:   "inprocess-mlx",
+		Backend:   "mlx-swift",
 		PublicKey: pubKey,
 	}
 	regData, _ := json.Marshal(regMsg)
@@ -1073,9 +1145,9 @@ func TestChallengeResponseSuccess(t *testing.T) {
 
 func TestChallengeResponseAllowsRDMAEnabledWithoutHypervisor(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 200 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())
@@ -1164,9 +1236,9 @@ func TestChallengeResponseAllowsRDMAEnabledWithoutHypervisor(t *testing.T) {
 
 func TestChallengeResponseRequiresBinaryHashWhenPolicyConfigured(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.SetKnownBinaryHashes([]string{knownGoodBinaryHashForTest})
 
 	pubKey := testPublicKeyB64()
@@ -1212,9 +1284,9 @@ func TestChallengeResponseRequiresBinaryHashWhenPolicyConfigured(t *testing.T) {
 
 func TestChallengeResponseRejectsHashChangedFromRegistrationAttestation(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	otherKnownHash := strings.Repeat("f", 64)
 	srv.SetKnownBinaryHashes([]string{knownGoodBinaryHashForTest, otherKnownHash})
 
@@ -1262,9 +1334,9 @@ func TestChallengeResponseRejectsHashChangedFromRegistrationAttestation(t *testi
 
 func TestChallengeResponseAcceptsKnownBinaryHash(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.SetKnownBinaryHashes([]string{knownGoodBinaryHashForTest})
 
 	pubKey := testPublicKeyB64()
@@ -1314,9 +1386,9 @@ func TestChallengeResponseAcceptsKnownBinaryHash(t *testing.T) {
 
 func TestChallengeResponseRejectsMissingSIPStatus(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 200 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())
@@ -1337,7 +1409,7 @@ func TestChallengeResponseRejectsMissingSIPStatus(t *testing.T) {
 		Type:      protocol.TypeRegister,
 		Hardware:  protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:    []protocol.ModelInfo{{ID: "missing-sip-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:   "inprocess-mlx",
+		Backend:   "mlx-swift",
 		PublicKey: pubKey,
 	}
 	regData, _ := json.Marshal(regMsg)
@@ -1400,9 +1472,9 @@ func TestChallengeResponseRejectsMissingSIPStatus(t *testing.T) {
 
 func TestChallengeResponseRejectsUnsignedBinaryHashWhenPolicyConfigured(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.SetKnownBinaryHashes([]string{knownGoodBinaryHashForTest})
 
 	pubKey := testPublicKeyB64()
@@ -1410,7 +1482,7 @@ func TestChallengeResponseRejectsUnsignedBinaryHashWhenPolicyConfigured(t *testi
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "unsigned-challenge-binary-hash-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -1448,9 +1520,9 @@ func TestChallengeResponseRejectsUnsignedBinaryHashWhenPolicyConfigured(t *testi
 
 func TestChallengeResponseMissingSIPClearsExistingRoutingEligibility(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 200 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())
@@ -1471,7 +1543,7 @@ func TestChallengeResponseMissingSIPClearsExistingRoutingEligibility(t *testing.
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "sip-rotation-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -1565,15 +1637,15 @@ func TestChallengeResponseMissingSIPClearsExistingRoutingEligibility(t *testing.
 
 func TestApplyACMETrustRequiresBoundEncryptionAttestation(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	msg := &protocol.RegisterMessage{
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "acme-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               testPublicKeyB64(),
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -1602,9 +1674,9 @@ func TestApplyACMETrustRequiresBoundEncryptionAttestation(t *testing.T) {
 
 func TestApplyACMETrustUpgradesBoundEncryptionAttestation(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	attestationKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
@@ -1618,7 +1690,7 @@ func TestApplyACMETrustUpgradesBoundEncryptionAttestation(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "acme-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               testPublicKeyB64(),
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -1648,9 +1720,9 @@ func TestApplyACMETrustUpgradesBoundEncryptionAttestation(t *testing.T) {
 
 func TestApplyACMETrustRequiresMatchingAttestedSEKey(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	attestationKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey(attestation): %v", err)
@@ -1668,7 +1740,7 @@ func TestApplyACMETrustRequiresMatchingAttestedSEKey(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "acme-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               testPublicKeyB64(),
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -1698,9 +1770,9 @@ func TestApplyACMETrustRequiresMatchingAttestedSEKey(t *testing.T) {
 
 func TestProviderBelowMinVersionStaysHiddenFromModelsAfterChallenge(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 200 * time.Millisecond
 	srv.minProviderVersion = "0.3.9"
 	srv.SetRuntimeManifest(&RuntimeManifest{})
@@ -1723,7 +1795,7 @@ func TestProviderBelowMinVersionStaysHiddenFromModelsAfterChallenge(t *testing.T
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "below-min-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		Version:                 "0.3.8",
 		EncryptedResponseChunks: true,
@@ -1779,9 +1851,9 @@ func TestProviderBelowMinVersionStaysHiddenFromModelsAfterChallenge(t *testing.T
 // TestChallengeResponseWrongKey tests that a response with wrong public key fails.
 func TestChallengeResponseWrongKey(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 200 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())
@@ -1801,7 +1873,7 @@ func TestChallengeResponseWrongKey(t *testing.T) {
 		Type:      protocol.TypeRegister,
 		Hardware:  protocol.Hardware{ChipName: "M3 Max", MemoryGB: 64},
 		Models:    []protocol.ModelInfo{{ID: "wrongkey-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:   "inprocess-mlx",
+		Backend:   "mlx-swift",
 		PublicKey: "Y29ycmVjdGtleQ==",
 	}
 	regData, _ := json.Marshal(regMsg)
@@ -1809,9 +1881,9 @@ func TestChallengeResponseWrongKey(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Answer challenges with the wrong public key repeatedly.
-	// We need MaxFailedChallenges (3) failures for the provider to be marked untrusted.
+	// We need registry.MaxFailedChallenges (3) failures for the provider to be marked untrusted.
 	failCount := 0
-	for failCount < MaxFailedChallenges {
+	for failCount < registry.MaxFailedChallenges {
 		readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
 		_, data, err := conn.Read(readCtx)
 		readCancel()
@@ -1859,9 +1931,9 @@ func TestChallengeResponseWrongKey(t *testing.T) {
 // is included in inference responses.
 func TestTrustLevelInResponseHeaders(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -1882,7 +1954,7 @@ func TestTrustLevelInResponseHeaders(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "trust-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		Attestation:             attestationJSON,
@@ -1908,7 +1980,7 @@ func TestTrustLevelInResponseHeaders(t *testing.T) {
 					conn.Write(ctx, websocket.MessageText, respData)
 					continue
 				}
-				if msgType == protocol.TypeRuntimeStatus {
+				if msgType == protocol.TypeRuntimeStatus || msgType == protocol.TypeTrustStatus {
 					continue
 				}
 			}
@@ -1961,9 +2033,9 @@ func TestTrustLevelInResponseHeaders(t *testing.T) {
 // TestTrustLevelInModelsList verifies that /v1/models includes trust_level.
 func TestTrustLevelInModelsList(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -1984,7 +2056,7 @@ func TestTrustLevelInModelsList(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "trust-list-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -2028,16 +2100,16 @@ func TestTrustLevelInModelsList(t *testing.T) {
 
 func TestHandleChunkDecryptsEncryptedTextChunk(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	providerPublicKey := testPublicKeyB64()
 	provider := reg.Register("provider-1", nil, &protocol.RegisterMessage{
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "test-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               providerPublicKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -2087,16 +2159,16 @@ func TestHandleChunkDecryptsEncryptedTextChunk(t *testing.T) {
 
 func TestHandleChunkRejectsPlaintextTextChunk(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	providerPublicKey := testPublicKeyB64()
 	provider := reg.Register("provider-1", nil, &protocol.RegisterMessage{
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "test-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               providerPublicKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -2158,16 +2230,16 @@ func TestHandleChunkRejectsPlaintextTextChunk(t *testing.T) {
 
 func TestHandleChunkRejectsMixedPlaintextAndEncryptedTextChunk(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	providerPublicKey := testPublicKeyB64()
 	provider := reg.Register("provider-mixed", nil, &protocol.RegisterMessage{
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "test-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               providerPublicKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -2217,14 +2289,105 @@ func TestHandleChunkRejectsMixedPlaintextAndEncryptedTextChunk(t *testing.T) {
 	}
 }
 
+// Issue #239: hitting the failure threshold via missed-challenge timeouts marks
+// the provider untrusted but *recoverable* (the challenge loop keeps probing it).
+func TestHandleChallengeFailureThresholdTransientIsRecoverable(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
+	reg := registry.New(logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
+
+	p := reg.Register("p1", nil, &protocol.RegisterMessage{
+		Type:     protocol.TypeRegister,
+		Hardware: protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
+		Models:   []protocol.ModelInfo{{ID: "test-model", ModelType: "chat", Quantization: "4bit"}},
+		Backend:  "mlx-swift",
+	})
+
+	for range registry.MaxFailedChallenges {
+		srv.handleChallengeFailure("p1", "timeout")
+	}
+
+	if p.Status != registry.StatusUntrusted {
+		t.Fatalf("status = %q, want %q after %d timeouts", p.Status, registry.StatusUntrusted, registry.MaxFailedChallenges)
+	}
+	if p.ChallengeShouldStop() {
+		t.Error("ChallengeShouldStop = true, want false (timeout-threshold deroute must be recoverable)")
+	}
+	if reg.OnlineCount() != 0 {
+		t.Errorf("OnlineCount = %d, want 0", reg.OnlineCount())
+	}
+}
+
+// handleChallengeFailure returns the running consecutive-failure count, which
+// drives the force-reconnect escalation in handleTransientChallengeFailure.
+// A provider whose outbound path is wedged heartbeats forever (never evicted)
+// while failing every challenge; the count is what lets the coordinator cycle
+// the connection. handleTransientChallengeFailure must also tolerate a nil conn.
+func TestHandleChallengeFailureReturnsConsecutiveCountAndNilConnSafe(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
+	reg := registry.New(logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
+
+	reg.Register("p1", nil, &protocol.RegisterMessage{
+		Type:     protocol.TypeRegister,
+		Hardware: protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
+		Models:   []protocol.ModelInfo{{ID: "test-model", ModelType: "chat", Quantization: "4bit"}},
+		Backend:  "mlx-swift",
+	})
+
+	for i := 1; i <= MaxConsecutiveChallengeTimeoutsBeforeReconnect; i++ {
+		got := srv.handleChallengeFailure("p1", "timeout")
+		if got != i {
+			t.Fatalf("handleChallengeFailure call %d returned %d, want %d", i, got, i)
+		}
+	}
+
+	// A nil conn (e.g. provider already torn down) must not panic even though
+	// the count is past the force-reconnect threshold.
+	srv.handleTransientChallengeFailure(nil, "p1", "timeout")
+
+	if got := reg.GetProvider("p1"); got == nil || got.Status != registry.StatusUntrusted {
+		t.Fatalf("provider should be untrusted after repeated timeouts")
+	}
+}
+
+// Issue #239: a non-transient reason at the threshold is a hard deroute — the
+// challenge loop stops and it cannot self-recover.
+func TestHandleChallengeFailureThresholdSecurityIsHard(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
+	reg := registry.New(logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
+
+	p := reg.Register("p1", nil, &protocol.RegisterMessage{
+		Type:     protocol.TypeRegister,
+		Hardware: protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
+		Models:   []protocol.ModelInfo{{ID: "test-model", ModelType: "chat", Quantization: "4bit"}},
+		Backend:  "mlx-swift",
+	})
+
+	for range registry.MaxFailedChallenges {
+		srv.handleChallengeFailure("p1", "nonce mismatch")
+	}
+
+	if p.Status != registry.StatusUntrusted {
+		t.Fatalf("status = %q, want %q", p.Status, registry.StatusUntrusted)
+	}
+	if !p.ChallengeShouldStop() {
+		t.Error("ChallengeShouldStop = false, want true (security-threshold deroute must be hard)")
+	}
+}
+
 // Verification: the coordinator's SSE output for a private text request contains
 // only the decrypted content — no raw ciphertext, no session keys, no encrypted
 // payloads leak into the consumer-visible HTTP response.
 func TestPrivateTextResponseContainsNoEncryptionArtifacts(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -2244,7 +2407,7 @@ func TestPrivateTextResponseContainsNoEncryptionArtifacts(t *testing.T) {
 		Type:                    protocol.TypeRegister,
 		Hardware:                protocol.Hardware{ChipName: "Apple M3 Max", MemoryGB: 64},
 		Models:                  []protocol.ModelInfo{{ID: "leak-model", ModelType: "chat", Quantization: "4bit"}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),

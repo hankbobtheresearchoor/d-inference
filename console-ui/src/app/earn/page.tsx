@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { TopBar } from "@/components/TopBar";
 import { useAuth } from "@/hooks/useAuth";
 import { trackEvent } from "@/lib/google-analytics";
+import { fetchModels, fetchPricing, type Model, type PricingResponse } from "@/lib/api";
 import Link from "next/link";
 import {
   Cpu,
@@ -76,7 +77,7 @@ const MAC_CONFIGS: MacConfig[] = [
 
 const MAC_TYPES = ["MacBook Air", "MacBook Pro", "Mac Mini", "Mac Studio", "Mac Pro"];
 
-/* ─── Model catalog ─── */
+/* ─── Live model catalog ─── */
 
 interface CatalogModel {
   id: string;
@@ -88,13 +89,48 @@ interface CatalogModel {
   outputPriceMicro: number;
 }
 
-const CATALOG_MODELS: CatalogModel[] = [
-  { id: "qwen-27b", name: "Qwen3.5 27B Claude Opus", minRAMGB: 36, activeParamsGB: 27, modelSizeGB: 27, outputPriceMicro: 780_000, demandNote: "High demand — text/chat inference is the primary workload on the network." },
-  { id: "trinity-mini", name: "Trinity Mini", minRAMGB: 48, activeParamsGB: 3, modelSizeGB: 26, outputPriceMicro: 75_000, demandNote: "High demand — fast MoE model popular for agentic and coding tasks." },
-  { id: "gemma-4-26b", name: "Gemma 4 26B", minRAMGB: 36, activeParamsGB: 4, modelSizeGB: 28, outputPriceMicro: 200_000, demandNote: "High demand — Google's latest MoE, strong quality at fast speed." },
-  { id: "qwen-122b", name: "Qwen3.5 122B", minRAMGB: 128, activeParamsGB: 10, modelSizeGB: 122, outputPriceMicro: 1_040_000, demandNote: "High demand — premium quality attracts users willing to pay more per token." },
-  { id: "minimax-m2.5", name: "MiniMax M2.5", minRAMGB: 256, activeParamsGB: 11, modelSizeGB: 243, outputPriceMicro: 500_000, demandNote: "High demand — SOTA coding model, attracts power users and enterprises." },
-];
+const DEFAULT_OUTPUT_PRICE_MICRO_USD = 200_000;
+
+function buildPricingLookup(pricing: PricingResponse | null): Record<string, number> {
+  if (!pricing) return {};
+  return Object.fromEntries(pricing.prices.map((p) => [p.model, p.output_price]));
+}
+
+function modelSizeGB(model: Model): number {
+  if (model.size_gb && model.size_gb > 0) return model.size_gb;
+  if (model.size_bytes && model.size_bytes > 0) return model.size_bytes / 1e9;
+  const match = model.id.match(/(?:^|[^A-Za-z0-9])(\d{1,3})\s*[bB](?:[^A-Za-z0-9]|$)/);
+  return match ? Number(match[1]) : 27;
+}
+
+function activeParamsGB(model: Model, sizeGB: number): number {
+  // Search id, architecture, and description; accept decimal active counts
+  // ("A3.6B" or "3.6B active") before falling back to the size-based estimate.
+  const text = `${model.id} ${model.architecture ?? ""} ${model.description ?? ""}`;
+  const active = text.match(/A(\d{1,3}(?:\.\d+)?)B/i) ?? text.match(/(\d{1,3}(?:\.\d+)?)B\s+active/i);
+  if (active) return Math.max(1, Math.round(Number(active[1])));
+  if (/moe/i.test(text)) return Math.max(3, Math.round(sizeGB * 0.15));
+  return Math.max(1, Math.round(sizeGB));
+}
+
+function buildCatalogModels(models: Model[], pricing: PricingResponse | null): CatalogModel[] {
+  const outputPrices = buildPricingLookup(pricing);
+  return models
+    .map((model) => {
+      const outputPriceMicro = outputPrices[model.id] ?? DEFAULT_OUTPUT_PRICE_MICRO_USD;
+      const size = Math.max(1, Math.round(modelSizeGB(model)));
+      return {
+        id: model.id,
+        name: model.display_name || model.id.split("/").pop() || model.id,
+        minRAMGB: model.min_ram_gb || Math.ceil(size * 1.35),
+        demandNote: "Uses the live coordinator catalog and current/default per-token pricing.",
+        activeParamsGB: activeParamsGB(model, size),
+        modelSizeGB: size,
+        outputPriceMicro,
+      };
+    })
+    .filter((model): model is CatalogModel => Boolean(model));
+}
 
 /* ─── Earnings calculation ─── */
 
@@ -125,9 +161,10 @@ function calculateModelEarnings(
   config: MacConfig,
   ramGB: number,
   hoursPerDay: number,
-  elecCostPerKWh: number
+  elecCostPerKWh: number,
+  loadedModelSizeGB = model.modelSizeGB
 ): ModelEarnings {
-  const freeRAM = ramGB - model.modelSizeGB;
+  const freeRAM = ramGB - loadedModelSizeGB;
   const batchSize = Math.max(1, Math.min(16, Math.floor(freeRAM / 2)));
   const batchEff = batchSize <= 4 ? 0.80 : batchSize <= 8 ? 0.85 : 0.90;
   const { activeParamsGB, outputPriceMicro } = model;
@@ -165,6 +202,66 @@ function calculateModelEarnings(
     outputPriceMicro,
     marginalWatts,
     catalogModel: model,
+  };
+}
+
+interface PortfolioEarnings {
+  modelName: string;
+  selectedModels: ModelEarnings[];
+  selectedModelCount: number;
+  totalModelSizeGB: number;
+  hoursPerModel: number;
+  decodeTokPerSec: number;
+  revenuePerHour: number;
+  elecPerHour: number;
+  netPerHour: number;
+  monthlyRevenue: number;
+  monthlyElec: number;
+  monthlyNet: number;
+  annualNet: number;
+  elecPercent: number;
+}
+
+function calculatePortfolioEarnings(
+  models: CatalogModel[],
+  config: MacConfig,
+  ramGB: number,
+  hoursPerDay: number,
+  elecCostPerKWh: number
+): PortfolioEarnings | null {
+  if (models.length === 0) return null;
+  const totalModelSizeGB = models.reduce((sum, model) => sum + model.modelSizeGB, 0);
+  if (totalModelSizeGB > ramGB) return null;
+
+  const hoursPerModel = hoursPerDay / models.length;
+  const selectedModels = models.map((model) =>
+    calculateModelEarnings(model, config, ramGB, hoursPerModel, elecCostPerKWh, totalModelSizeGB)
+  );
+
+  const monthlyRevenue = selectedModels.reduce((sum, model) => sum + model.monthlyRevenue, 0);
+  const monthlyElec = selectedModels.reduce((sum, model) => sum + model.monthlyElec, 0);
+  const monthlyNet = selectedModels.reduce((sum, model) => sum + model.monthlyNet, 0);
+  const activeHoursPerMonth = Math.max(1, hoursPerDay * 30);
+
+  return {
+    modelName:
+      models.length === 1
+        ? models[0].name
+        : `${models.length} models selected`,
+    selectedModels,
+    selectedModelCount: models.length,
+    totalModelSizeGB,
+    hoursPerModel,
+    decodeTokPerSec:
+      selectedModels.reduce((sum, model) => sum + model.decodeTokPerSec, 0) / selectedModels.length,
+    revenuePerHour: monthlyRevenue / activeHoursPerMonth,
+    elecPerHour: monthlyElec / activeHoursPerMonth,
+    netPerHour: monthlyNet / activeHoursPerMonth,
+    monthlyRevenue,
+    monthlyElec,
+    monthlyNet,
+    annualNet: monthlyNet * 12,
+    elecPercent: monthlyRevenue > 0 ? (monthlyElec / monthlyRevenue) * 100 : 0,
   };
 }
 
@@ -250,9 +347,19 @@ export default function EarnPage() {
   const [selectedRAM, setSelectedRAM] = useState(48);
   const [inferenceHours, setInferenceHours] = useState(18);
   const [elecCost, setElecCost] = useState("0.15");
-  const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
+  const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
+  const [catalogModels, setCatalogModels] = useState<CatalogModel[]>([]);
 
   const elecCostNum = parseFloat(elecCost) || 0;
+
+  useEffect(() => {
+    Promise.all([
+      fetchModels().catch(() => [] as Model[]),
+      fetchPricing().catch(() => null),
+    ]).then(([models, pricing]) => {
+      setCatalogModels(buildCatalogModels(models, pricing));
+    });
+  }, []);
 
   // Derive available chips for selected mac type
   const availableChips = useMemo(() => {
@@ -287,29 +394,51 @@ export default function EarnPage() {
   // Calculate earnings for ALL eligible models
   const rankedModels = useMemo(() => {
     if (!selectedConfig) return [];
-    const eligible = CATALOG_MODELS.filter((m) => m.minRAMGB <= effectiveRAM);
+    const eligible = catalogModels.filter((m) => m.minRAMGB <= effectiveRAM);
     const results = eligible.map((m) =>
       calculateModelEarnings(m, selectedConfig, effectiveRAM, 18, elecCostNum)
     );
     results.sort((a, b) => b.monthlyNet - a.monthlyNet);
     return results;
-  }, [selectedConfig, effectiveRAM, elecCostNum]);
+  }, [selectedConfig, effectiveRAM, elecCostNum, catalogModels]);
 
   // Determine the best model id
   const bestModelId = rankedModels.length > 0 ? rankedModels[0].modelId : null;
 
-  // Effective selected model: use manual selection if it's still in the list, otherwise auto-select best
-  const effectiveModelId =
-    selectedModelId && rankedModels.some((m) => m.modelId === selectedModelId)
-      ? selectedModelId
-      : bestModelId;
+  const eligibleModelIds = useMemo(
+    () => new Set(rankedModels.map((m) => m.modelId)),
+    [rankedModels]
+  );
 
-  // Get the selected model's earnings — recalculated with the slider's hours
-  const selectedCatalogModel = CATALOG_MODELS.find((m) => m.id === effectiveModelId);
+  const effectiveModelIds = useMemo(() => {
+    const validSelected = selectedModelIds.filter((id) => eligibleModelIds.has(id));
+    return validSelected.length > 0 ? validSelected : bestModelId ? [bestModelId] : [];
+  }, [bestModelId, eligibleModelIds, selectedModelIds]);
+
+  const selectedCatalogModels = useMemo(
+    () =>
+      effectiveModelIds
+        .map((id) => catalogModels.find((m) => m.id === id))
+        .filter((m): m is CatalogModel => Boolean(m)),
+    [effectiveModelIds, catalogModels]
+  );
+
+  const selectedModelSizeGB = selectedCatalogModels.reduce(
+    (sum, model) => sum + model.modelSizeGB,
+    0
+  );
+
+  // Get the selected portfolio earnings — selected models split the active hours.
   const result = useMemo(() => {
-    if (!selectedConfig || !selectedCatalogModel) return null;
-    return calculateModelEarnings(selectedCatalogModel, selectedConfig, effectiveRAM, inferenceHours, elecCostNum);
-  }, [selectedConfig, selectedCatalogModel, effectiveRAM, inferenceHours, elecCostNum]);
+    if (!selectedConfig || selectedCatalogModels.length === 0) return null;
+    return calculatePortfolioEarnings(
+      selectedCatalogModels,
+      selectedConfig,
+      effectiveRAM,
+      inferenceHours,
+      elecCostNum
+    );
+  }, [selectedConfig, selectedCatalogModels, effectiveRAM, inferenceHours, elecCostNum]);
 
   const comparisons = useMemo(
     () => (result ? getComparisons(result.monthlyNet) : []),
@@ -319,26 +448,56 @@ export default function EarnPage() {
   // Handlers that cascade selections — reset model choice on hardware change
   const handleMacTypeSelect = (macType: string) => {
     setSelectedMacType(macType);
-    setSelectedModelId(null);
+    setSelectedModelIds([]);
   };
 
   const handleChipSelect = (chip: string) => {
     setSelectedChip(chip);
-    setSelectedModelId(null);
+    setSelectedModelIds([]);
   };
 
   const handleRAMSelect = (ram: number) => {
     setSelectedRAM(ram);
-    setSelectedModelId(null);
+    setSelectedModelIds([]);
   };
 
   if (!selectedConfig) return null;
 
-  let modelSelectorHint = "Auto-selected: most profitable for your hardware";
-  if (rankedModels.length === 0) {
+  const toggleModel = (modelId: string) => {
+    const model = catalogModels.find((m) => m.id === modelId);
+    if (!model) return;
+    setSelectedModelIds((current) => {
+      const validCurrent = current.filter((id) => eligibleModelIds.has(id));
+      if (validCurrent.length === 0) {
+        return [modelId];
+      }
+      const base =
+        validCurrent.length > 0
+          ? validCurrent
+          : bestModelId && eligibleModelIds.has(bestModelId)
+            ? [bestModelId]
+            : [];
+      if (base.includes(modelId)) {
+        const next = base.filter((id) => id !== modelId);
+        return next.length > 0 ? next : base;
+      }
+      const currentSize = base.reduce((sum, id) => {
+        const selected = catalogModels.find((m) => m.id === id);
+        return sum + (selected?.modelSizeGB ?? 0);
+      }, 0);
+      if (currentSize + model.modelSizeGB > effectiveRAM) return [modelId];
+      return [...base, modelId];
+    });
+  };
+
+  let modelSelectorHint = "Auto-selected: most profitable model. Select more models if they fit in memory.";
+  if (catalogModels.length === 0) {
+    modelSelectorHint = "Loading live model catalog, or no priced models are currently available.";
+  } else if (rankedModels.length === 0) {
     modelSelectorHint = "No compatible catalog model for this memory configuration";
-  } else if (selectedModelId !== null) {
-    modelSelectorHint = "Manually selected — change hardware to reset";
+  } else if (selectedModelIds.length > 0) {
+    modelSelectorHint =
+      "Selected models share active inference hours, so earnings are not double-counted.";
   }
 
   return (
@@ -524,32 +683,52 @@ export default function EarnPage() {
               {modelSelectorHint}
             </p>
 
+            {selectedCatalogModels.length > 0 && (
+              <div className="mb-3 flex flex-wrap gap-2">
+                <span className="px-2.5 py-1 rounded bg-bg-tertiary text-xs font-mono text-text-secondary">
+                  {selectedCatalogModels.length} model{selectedCatalogModels.length === 1 ? "" : "s"} selected
+                </span>
+                <span className="px-2.5 py-1 rounded bg-bg-tertiary text-xs font-mono text-text-tertiary">
+                  {selectedModelSizeGB} GB weights / {effectiveRAM} GB RAM
+                </span>
+              </div>
+            )}
+
             <div className="rounded-lg border border-border-dim overflow-hidden">
               {rankedModels.map((m, i) => {
-                const isSelected = m.modelId === effectiveModelId;
+                const isSelected = effectiveModelIds.includes(m.modelId);
                 const isBest = m.modelId === bestModelId;
-                const catalogEntry = CATALOG_MODELS.find((c) => c.id === m.modelId);
+                const catalogEntry = catalogModels.find((c) => c.id === m.modelId);
                 const isUnprofitable = m.monthlyNet < 0;
+                const canAdd =
+                  selectedModelIds.length === 0 ||
+                  isSelected ||
+                  selectedModelSizeGB + (catalogEntry?.modelSizeGB ?? 0) <= effectiveRAM;
                 return (
                   <div key={m.modelId} className={i > 0 ? "border-t border-border-dim" : ""}>
                     <button
-                      onClick={() => setSelectedModelId(m.modelId)}
+                      onClick={() => toggleModel(m.modelId)}
                       className={`w-full flex items-center gap-3 px-4 py-3 text-left transition-colors ${
                         isSelected
                           ? "bg-accent-brand/10 border-l-2 border-l-accent-brand"
                           : "hover:bg-bg-tertiary border-l-2 border-l-transparent"
                       }`}
+                      title={
+                        !canAdd
+                          ? "Not enough memory to add this model; clicking will switch to it instead"
+                          : undefined
+                      }
                     >
-                      {/* Radio indicator */}
+                      {/* Checkbox indicator */}
                       <div
-                        className={`w-4 h-4 rounded-full border-2 flex items-center justify-center shrink-0 ${
+                        className={`w-4 h-4 rounded border-2 flex items-center justify-center shrink-0 ${
                           isSelected
                             ? "border-accent-brand"
                             : "border-text-tertiary/40"
                         }`}
                       >
                         {isSelected && (
-                          <div className="w-2 h-2 rounded-full bg-accent-brand" />
+                          <div className="w-2 h-2 rounded-sm bg-accent-brand" />
                         )}
                       </div>
 
@@ -564,13 +743,12 @@ export default function EarnPage() {
                       <span className={`text-sm font-mono tabular-nums whitespace-nowrap ${
                         m.monthlyNet >= 0 ? "text-accent-green" : "text-accent-red"
                       }`}>
-                        {fmtUSD(m.monthlyNet)}/mo
+                        {fmtUSD(m.monthlyNet)}/mo solo
                       </span>
 
-                      {/* Best badge */}
                       {isBest && m.monthlyNet > 0 && (
                         <span className="px-2 py-0.5 rounded text-xs font-medium bg-accent-green/10 text-accent-green border border-accent-green/20 whitespace-nowrap">
-                          Best
+                          Best solo
                         </span>
                       )}
                     </button>
@@ -590,7 +768,9 @@ export default function EarnPage() {
 
             {rankedModels.length === 0 && (
               <div className="text-center py-6 text-sm text-text-tertiary">
-                No models fit in {effectiveRAM} GB RAM
+                {catalogModels.length === 0
+                  ? "No live priced models available yet"
+                  : `No models fit in ${effectiveRAM} GB RAM`}
               </div>
             )}
           </div>
@@ -669,8 +849,13 @@ export default function EarnPage() {
                       <span className="font-mono text-text-secondary">
                         {result.modelName}
                       </span>{" "}
-                      at {inferenceHours} hrs/day
+                      at {inferenceHours} total active hrs/day
                     </p>
+                    {result.selectedModelCount > 1 && (
+                      <p className="text-xs text-text-tertiary mt-1">
+                        Active time is split across selected models to avoid double-counting bandwidth and compute.
+                      </p>
+                    )}
                   </div>
                 </div>
 
@@ -694,7 +879,7 @@ export default function EarnPage() {
                       Batched decode speed
                     </p>
                     <p className="text-sm font-mono text-text-primary">
-                      {result.decodeTokPerSec.toFixed(1)} tok/s
+                      {result.decodeTokPerSec.toFixed(1)} tok/s avg
                     </p>
                   </div>
                   <div>
@@ -766,28 +951,55 @@ export default function EarnPage() {
                   How this is calculated
                 </h3>
                 <div className="text-xs text-text-tertiary font-mono space-y-1 bg-bg-tertiary rounded-lg p-4 overflow-x-auto">
+                  {result.selectedModelCount > 1 ? (
+                    <>
                       <p>
-                        single_tok/s = ({selectedConfig.bandwidthGBs} GB/s / {result.activeParamsGB} GB) * 0.60 ={" "}
-                        {((selectedConfig.bandwidthGBs / result.activeParamsGB) * 0.6).toFixed(1)} tok/s
+                        loaded_models = {result.selectedModels.map((m) => m.modelName).join(" + ")}
+                      </p>
+                      <p>
+                        model_weights = {result.totalModelSizeGB} GB / {effectiveRAM} GB RAM
+                      </p>
+                      <p>
+                        active_hours/model = {inferenceHours} hrs/day / {result.selectedModelCount} models ={" "}
+                        {result.hoursPerModel.toFixed(1)} hrs/day
+                      </p>
+                      <p>
+                        monthly_revenue = sum(model revenue/hr * {result.hoursPerModel.toFixed(1)} hrs/day * 30) ={" "}
+                        {fmtUSD(result.monthlyRevenue)}
+                      </p>
+                      <p>
+                        monthly_electricity = shared active compute time * ${elecCostNum.toFixed(2)}/kWh ={" "}
+                        {fmtUSD(result.monthlyElec)}
+                      </p>
+                      <p>
+                        monthly_net = {fmtUSD(result.monthlyRevenue)} - {fmtUSD(result.monthlyElec)} ={" "}
+                        {fmtUSD(result.monthlyNet)}
+                      </p>
+                    </>
+                  ) : result.selectedModels[0] ? (
+                    <>
+                      <p>
+                        single_tok/s = ({selectedConfig.bandwidthGBs} GB/s / {result.selectedModels[0].activeParamsGB} GB) * 0.60 ={" "}
+                        {((selectedConfig.bandwidthGBs / result.selectedModels[0].activeParamsGB) * 0.6).toFixed(1)} tok/s
                       </p>
                       <p>
                         batched_tok/s ={" "}
-                        {((selectedConfig.bandwidthGBs / result.activeParamsGB) * 0.6).toFixed(1)} * {result.batchSize} * {result.batchEff} ={" "}
-                        {result.decodeTokPerSec.toFixed(1)} tok/s
+                        {((selectedConfig.bandwidthGBs / result.selectedModels[0].activeParamsGB) * 0.6).toFixed(1)} * {result.selectedModels[0].batchSize} * {result.selectedModels[0].batchEff} ={" "}
+                        {result.selectedModels[0].decodeTokPerSec.toFixed(1)} tok/s
                       </p>
                       <p>
-                        tok/hr = {result.decodeTokPerSec.toFixed(1)} * 3600 ={" "}
-                        {(result.decodeTokPerSec * 3600).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                        tok/hr = {result.selectedModels[0].decodeTokPerSec.toFixed(1)} * 3600 ={" "}
+                        {(result.selectedModels[0].decodeTokPerSec * 3600).toLocaleString(undefined, { maximumFractionDigits: 0 })}
                       </p>
                       <p>
-                        revenue/hr = ({(result.decodeTokPerSec * 3600).toLocaleString(undefined, { maximumFractionDigits: 0 })} / 1M) * $
-                        {(result.outputPriceMicro / 1_000_000).toFixed(6)} = {fmtUSD(result.revenuePerHour, 4)}
+                        revenue/hr = ({(result.selectedModels[0].decodeTokPerSec * 3600).toLocaleString(undefined, { maximumFractionDigits: 0 })} / 1M) * $
+                        {(result.selectedModels[0].outputPriceMicro / 1_000_000).toFixed(6)} = {fmtUSD(result.revenuePerHour, 4)}
                       </p>
                       <p>
-                        marginal_watts = {selectedConfig.inferWatts}W (inference) - {selectedConfig.idleWatts}W (idle) = {result.marginalWatts}W
+                        marginal_watts = {selectedConfig.inferWatts}W (inference) - {selectedConfig.idleWatts}W (idle) = {result.selectedModels[0].marginalWatts}W
                       </p>
                       <p>
-                        elec/hr = ({result.marginalWatts}W / 1000) * ${elecCostNum.toFixed(2)}/kWh = {fmtUSD(result.elecPerHour, 4)}
+                        elec/hr = ({result.selectedModels[0].marginalWatts}W / 1000) * ${elecCostNum.toFixed(2)}/kWh = {fmtUSD(result.elecPerHour, 4)}
                       </p>
                       <p>
                         net/hr = {fmtUSD(result.revenuePerHour, 4)} - {fmtUSD(result.elecPerHour, 4)} = {fmtUSD(result.netPerHour, 4)}
@@ -795,6 +1007,8 @@ export default function EarnPage() {
                       <p>
                         monthly = {fmtUSD(result.netPerHour, 4)} * {inferenceHours} hrs/day * 30 days = {fmtUSD(result.monthlyNet)}
                       </p>
+                    </>
+                  ) : null}
                 </div>
               </div>
 

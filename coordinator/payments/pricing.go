@@ -1,67 +1,62 @@
 package payments
 
+import (
+	"strconv"
+	"strings"
+)
+
 // Pricing model for Darkbloom.
 //
-// Prices are set at 50% of the cheapest major competitor for each model type.
-// Users accept higher latency and lower reliability in exchange for the discount.
-// Providers keep ~90%+ profit margin since marginal electricity on Apple Silicon
-// is negligible ($0.001-0.05 per 1M tokens vs $0.075-1.04 revenue).
+// All model-specific prices are managed via the admin API:
 //
-// All prices are in micro-USD per 1M tokens unless noted.
+//   PUT /v1/admin/pricing  {"model":"...", "input_price":..., "output_price":...}
 //
-//   Model                              Input/1M    Output/1M    Competitor
-//   ────────────────────────────────   ─────────   ──────────   ──────────
-//   Qwen3.5 27B Claude Opus (dense)    $0.100      $0.780       OpenRouter $1.56
-//   Trinity Mini (27B MoE, 3B active)  $0.023      $0.075       OpenRouter $0.15
-//   Gemma 4 26B (MoE, 4B active)       $0.065      $0.200       OpenRouter $0.40
-//   Qwen3.5 122B (MoE, 10B active)     $0.130      $1.040       OpenRouter $2.08
-//   MiniMax M2.5 (239B MoE, 11B act)   $0.060      $0.500       OpenRouter $1.00
+// Prices are stored in the database (model_prices table, account_id="platform").
+// The billing path resolves prices in order:
+//   1. Provider custom price  (store.GetModelPrice(providerAccountID, model))
+//   2. Platform admin price   (store.GetModelPrice("platform", model))
+//   3. Fallback defaults      (constants below)
+//
+// The fallback defaults apply only to models that have not been priced via API.
+// All prices are in micro-USD per 1M tokens.
 
-// Default pricing for unknown models (micro-USD per 1M tokens).
-// Falls back to a mid-range rate comparable to a 7B model.
-const defaultInputPricePerMillion int64 = 50_000   // $0.05 per 1M input tokens
-const defaultOutputPricePerMillion int64 = 200_000 // $0.20 per 1M output tokens
+// DefaultInputPricePerMillion is the fallback input price for models without
+// DB-configured pricing (micro-USD per 1M tokens). $0.05 per 1M tokens.
+const DefaultInputPricePerMillion int64 = 50_000
+
+// DefaultOutputPricePerMillion is the fallback output price for models without
+// DB-configured pricing (micro-USD per 1M tokens). $0.20 per 1M tokens.
+const DefaultOutputPricePerMillion int64 = 200_000
 
 // Minimum charge per inference request in micro-USD ($0.0001).
 const minimumChargeMicroUSD int64 = 100
 
-// Platform fee percentage — Darkbloom retains 5% as a routing fee, provider receives 95%.
-const platformFeePercent int64 = 5
-
-// modelPricing stores input and output prices per model (micro-USD per 1M tokens).
-type modelPrice struct {
-	input  int64
-	output int64
-}
-
-var modelPricing = map[string]modelPrice{
-	// Text generation — 50% of OpenRouter rates
-	"qwen3.5-27b-claude-opus-8bit":          {input: 100_000, output: 780_000},   // $0.10 / $0.78
-	"mlx-community/Trinity-Mini-8bit":       {input: 23_000, output: 75_000},     // $0.023 / $0.075 (50% of OpenRouter)
-	"mlx-community/gemma-4-26b-a4b-it-8bit": {input: 65_000, output: 200_000},    // $0.065 / $0.20 (50% of OpenRouter)
-	"mlx-community/Qwen3.5-122B-A10B-8bit":  {input: 130_000, output: 1_040_000}, // $0.13 / $1.04
-	"mlx-community/MiniMax-M2.5-8bit":       {input: 60_000, output: 500_000},    // $0.06 / $0.50
-}
+// Platform fee percentage — the global default routing fee applied when an
+// account has no per-account override. Set to 0 for the public alpha so
+// providers keep 100% of revenue (matches the README / landing copy). Raise
+// this post-alpha; per-account overrides via PUT /v1/admin/users/platform-fee
+// still apply on top of the default.
+//
+// NOTE: the referral program pays out a share of this platform fee, so while
+// the default is 0 there is no fee pool to distribute (referrals are dormant
+// during the alpha).
+const platformFeePercent int64 = 0
 
 // MinimumCharge returns the minimum charge per inference request in micro-USD.
 func MinimumCharge() int64 {
 	return minimumChargeMicroUSD
 }
 
-// InputPricePerMillion returns the price in micro-USD for 1M input tokens.
-func InputPricePerMillion(model string) int64 {
-	if p, ok := modelPricing[model]; ok {
-		return p.input
-	}
-	return defaultInputPricePerMillion
+// InputPricePerMillion returns the fallback price in micro-USD for 1M input tokens.
+// Callers should check the store for model-specific prices first.
+func InputPricePerMillion(_ string) int64 {
+	return DefaultInputPricePerMillion
 }
 
-// OutputPricePerMillion returns the price in micro-USD for 1M output tokens.
-func OutputPricePerMillion(model string) int64 {
-	if p, ok := modelPricing[model]; ok {
-		return p.output
-	}
-	return defaultOutputPricePerMillion
+// OutputPricePerMillion returns the fallback price in micro-USD for 1M output tokens.
+// Callers should check the store for model-specific prices first.
+func OutputPricePerMillion(_ string) int64 {
+	return DefaultOutputPricePerMillion
 }
 
 // CalculateCost returns the total cost in micro-USD for a completed inference
@@ -82,8 +77,22 @@ func CalculateCost(model string, promptTokens, completionTokens int) int64 {
 }
 
 // CalculateCostWithOverrides is like CalculateCost but uses custom per-account
-// prices if set, falling back to platform defaults.
+// prices if set, falling back to platform defaults. The per-request minimum
+// charge is applied.
 func CalculateCostWithOverrides(model string, promptTokens, completionTokens int, customInput, customOutput int64, hasCustom bool) int64 {
+	return calculateCost(model, promptTokens, completionTokens, customInput, customOutput, hasCustom, true)
+}
+
+// CalculateCostWithOverridesNoMinimum is like CalculateCostWithOverrides but
+// does NOT apply the per-request minimum charge. Used for service/wholesale
+// channels (e.g. OpenRouter) whose advertised pricing is purely per-token
+// (request price = 0), so the actual debit must match prompt*in + completion*out
+// exactly rather than being floored.
+func CalculateCostWithOverridesNoMinimum(model string, promptTokens, completionTokens int, customInput, customOutput int64, hasCustom bool) int64 {
+	return calculateCost(model, promptTokens, completionTokens, customInput, customOutput, hasCustom, false)
+}
+
+func calculateCost(model string, promptTokens, completionTokens int, customInput, customOutput int64, hasCustom, applyMinimum bool) int64 {
 	var inputRate, outputRate int64
 	if hasCustom {
 		inputRate = customInput
@@ -97,27 +106,84 @@ func CalculateCostWithOverrides(model string, promptTokens, completionTokens int
 	outputCost := int64(completionTokens) * outputRate / 1_000_000
 	cost := inputCost + outputCost
 
-	if cost < minimumChargeMicroUSD {
-		cost = minimumChargeMicroUSD
+	if applyMinimum {
+		if cost < minimumChargeMicroUSD {
+			cost = minimumChargeMicroUSD
+		}
+	} else if cost == 0 && (promptTokens > 0 || completionTokens > 0) {
+		// No per-request minimum (service/wholesale channel), but never give
+		// nonzero usage away for free: integer micro-USD rounding can floor a
+		// tiny request to 0, so charge at least 1 micro-USD.
+		cost = 1
 	}
 	return cost
 }
 
-// DefaultPrices returns the platform default pricing table.
-func DefaultPrices() map[string][2]int64 {
-	result := make(map[string][2]int64, len(modelPricing))
-	for model, price := range modelPricing {
-		result[model] = [2]int64{price.input, price.output}
+// DefaultPlatformFeePercent is the global platform routing fee applied when an
+// account has no per-account override.
+const DefaultPlatformFeePercent int64 = platformFeePercent
+
+// resolveFeePercent clamps an optional per-account fee override to [0,100],
+// falling back to the global default when feePercent is nil.
+func resolveFeePercent(feePercent *int64) int64 {
+	pct := platformFeePercent
+	if feePercent != nil {
+		pct = *feePercent
 	}
-	return result
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return pct
 }
 
-// PlatformFee returns Darkbloom's routing fee (5%).
+// PlatformFee returns Darkbloom's routing fee at the global default rate.
 func PlatformFee(totalCost int64) int64 {
-	return totalCost * platformFeePercent / 100
+	return PlatformFeeWithPercent(totalCost, nil)
 }
 
-// ProviderPayout returns the amount the provider receives (95%).
+// ProviderPayout returns the amount the provider receives at the global default
+// fee rate.
 func ProviderPayout(totalCost int64) int64 {
-	return totalCost - PlatformFee(totalCost)
+	return ProviderPayoutWithPercent(totalCost, nil)
+}
+
+// PlatformFeeWithPercent returns Darkbloom's routing fee using a per-account
+// override when provided (nil = global default). A 0% override yields no fee.
+func PlatformFeeWithPercent(totalCost int64, feePercent *int64) int64 {
+	return totalCost * resolveFeePercent(feePercent) / 100
+}
+
+// ProviderPayoutWithPercent returns the amount the provider receives after the
+// (possibly overridden) platform fee.
+func ProviderPayoutWithPercent(totalCost int64, feePercent *int64) int64 {
+	return totalCost - PlatformFeeWithPercent(totalCost, feePercent)
+}
+
+// FormatPerTokenUSD converts a price expressed in micro-USD per 1,000,000
+// tokens into a plain decimal USD-per-single-token string, as required by the
+// OpenRouter provider /v1/models schema (e.g. 50000 -> "0.00000005").
+//
+// micro-USD per 1M tokens / 1e6 (micro->USD) / 1e6 (per-1M->per-token) = value / 1e12.
+// We render with fixed precision and trim trailing zeros, always leaving at
+// least one digit after the decimal point so the value stays a valid number
+// string ("0" stays "0").
+func FormatPerTokenUSD(microUSDPerMillion int64) string {
+	if microUSDPerMillion == 0 {
+		return "0"
+	}
+	// Scale to USD-per-token: divide by 1e12. Use big-enough fixed precision
+	// (12 decimals captures the full micro-USD resolution).
+	s := strconv.FormatFloat(float64(microUSDPerMillion)/1e12, 'f', 12, 64)
+	// Trim trailing zeros but keep a leading integer digit.
+	if strings.Contains(s, ".") {
+		s = strings.TrimRight(s, "0")
+		s = strings.TrimSuffix(s, ".")
+	}
+	if s == "" || s == "-" {
+		return "0"
+	}
+	return s
 }

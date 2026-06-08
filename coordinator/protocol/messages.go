@@ -44,6 +44,7 @@ const (
 	TypeAttestationChallenge = "attestation_challenge"
 	TypeRuntimeStatus        = "runtime_status"
 	TypeLoadModel            = "load_model"
+	TypeTrustStatus          = "trust_status"
 )
 
 // LoadModelStatus is the lifecycle state reported by a provider in response
@@ -100,11 +101,11 @@ type RegisterMessage struct {
 	Version                 string          `json:"version,omitempty"`                   // provider binary version (e.g. "0.2.31")
 	PublicKey               string          `json:"public_key,omitempty"`                // base64-encoded X25519 public key for E2E encryption
 	EncryptedResponseChunks bool            `json:"encrypted_response_chunks,omitempty"` // true when text response chunks are returned encrypted to the coordinator
-	WalletAddress           string          `json:"wallet_address,omitempty"`            // Ethereum-format hex address for Tempo payouts
 	Attestation             json.RawMessage `json:"attestation,omitempty"`               // signed Secure Enclave attestation blob
 	PrefillTPS              float64         `json:"prefill_tps,omitempty"`               // benchmark: prefill tokens per second
 	DecodeTPS               float64         `json:"decode_tps,omitempty"`                // benchmark: decode tokens per second
 	AuthToken               string          `json:"auth_token,omitempty"`                // device-linked provider token (from darkbloom login)
+	PrivateOnly             bool            `json:"private_only,omitempty"`              // when true, this machine serves only its owner's self-route requests, never the public fleet
 
 	// Runtime integrity hashes — used for runtime verification against known-good manifests.
 	PythonHash          string               `json:"python_hash,omitempty"`     // SHA-256 of Python runtime
@@ -140,12 +141,19 @@ type HeartbeatMessage struct {
 // BackendSlotCapacity describes the capacity state of a single backend slot
 // (one vllm-mlx instance serving one model).
 type BackendSlotCapacity struct {
-	Model              string `json:"model"`                // model ID for this slot
-	State              string `json:"state"`                // "running", "idle_shutdown", "crashed", "reloading"
-	NumRunning         int    `json:"num_running"`          // requests actively generating
-	NumWaiting         int    `json:"num_waiting"`          // requests queued in backend scheduler
-	ActiveTokens       int64  `json:"active_tokens"`        // sum of (prompt_tokens + completion_tokens) across running requests
-	MaxTokensPotential int64  `json:"max_tokens_potential"` // sum of max_tokens across running requests (worst-case growth)
+	Model              string `json:"model"`                     // model ID for this slot
+	State              string `json:"state"`                     // "running", "idle_shutdown", "crashed", "reloading"
+	NumRunning         int    `json:"num_running"`               // requests actively generating
+	NumWaiting         int    `json:"num_waiting"`               // requests queued in backend scheduler
+	MaxConcurrency     int    `json:"max_concurrency,omitempty"` // provider-reported concurrent request cap for this slot
+	ActiveTokens       int64  `json:"active_tokens"`             // sum of (prompt_tokens + completion_tokens) across running requests
+	MaxTokensPotential int64  `json:"max_tokens_potential"`      // sum of max_tokens across running requests (worst-case growth)
+
+	ObservedDecodeTPS     float64 `json:"observed_decode_tps,omitempty"`      // EWMA of measured per-request decode TPS
+	ActiveTokenBudgetUsed int64   `json:"active_token_budget_used,omitempty"` // tokens reserved by active requests (prompt + max_output)
+	ActiveTokenBudgetMax  int64   `json:"active_token_budget_max,omitempty"`  // maximum token budget for this slot
+	QueuedTokenBudget     int64   `json:"queued_token_budget,omitempty"`      // tokens reserved by queued requests
+	KVBytesPerToken       int64   `json:"kv_bytes_per_token,omitempty"`       // per-token KV cache memory cost in bytes (provider-side only)
 }
 
 // BackendCapacity describes the aggregate capacity across all backend slots
@@ -195,6 +203,13 @@ type InferenceResponseChunkMessage struct {
 type UsageInfo struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
+	// ReasoningTokens is the subset of CompletionTokens spent on
+	// reasoning/analysis content (gpt-oss analysis channel, <think>
+	// blocks, etc.), counted with the model tokenizer on the provider.
+	// 0 when the response carried no reasoning content. Mirrors
+	// `reasoningTokens` in the Swift UsageInfo. omitempty keeps the wire
+	// shape unchanged for non-reasoning responses and older providers.
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // InferenceCompleteMessage signals the provider finished generating.
@@ -267,9 +282,9 @@ type CancelMessage struct {
 // inbound port required) and reply asynchronously with a
 // LoadModelStatusMessage when the load completes or fails.
 //
-// This is currently sent only to providers running the Swift runtime
-// (`backend == "mlx-swift"`); the legacy Rust provider does not handle
-// it and the coordinator filters accordingly.
+// This is sent only to providers running the Swift runtime
+// (`backend == "mlx-swift"`); the coordinator filters by backend
+// accordingly.
 type LoadModelMessage struct {
 	Type    string `json:"type"`
 	ModelID string `json:"model_id"`
@@ -346,6 +361,16 @@ type RuntimeMismatch struct {
 	Got       string `json:"got"`
 }
 
+// TrustStatusMessage is sent by the coordinator to inform a provider of its
+// current trust level. Providers that learn they are "self_signed" or
+// "untrusted" can auto-report unified logs for troubleshooting.
+type TrustStatusMessage struct {
+	Type       string `json:"type"`
+	TrustLevel string `json:"trust_level"` // "none", "self_signed", "hardware"
+	Status     string `json:"status"`      // "online", "untrusted", etc.
+	Reason     string `json:"reason,omitempty"`
+}
+
 // ---------------------------------------------------------------------------
 // Envelope: generic unmarshalling for provider messages
 // ---------------------------------------------------------------------------
@@ -415,6 +440,13 @@ func (pm *ProviderMessage) UnmarshalJSON(data []byte) error {
 		var msg AttestationResponseMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
 			return fmt.Errorf("protocol: failed to unmarshal attestation_response: %w", err)
+		}
+		pm.Payload = &msg
+
+	case TypeLoadModelStatus:
+		var msg LoadModelStatusMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			return fmt.Errorf("protocol: failed to unmarshal load_model_status: %w", err)
 		}
 		pm.Payload = &msg
 

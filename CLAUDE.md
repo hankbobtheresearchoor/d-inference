@@ -1,56 +1,46 @@
-# EigenInference - Decentralized GPU Inference
+# Darkbloom - Decentralized Private Inference
 
-Decentralized inference network for Apple Silicon Macs. Providers offer GPU compute, consumers send OpenAI-compatible requests, the coordinator matches them.
+Darkbloom is a decentralized private inference network for Apple Silicon Macs. Consumers use OpenAI-compatible APIs, the coordinator handles routing, auth, billing, attestation, and capacity management, and providers run local inference workloads on macOS hardware using MLX-Swift. All inference is end-to-end encrypted -- the coordinator never sees plaintext prompts.
 
 ## Project Structure
 
 ```
-coordinator/          Go — central matchmaking server (runs on EigenCloud in prod)
-├── cmd/coordinator/  entrypoint
-├── cmd/verify-attestation/  attestation blob verification utility
-├── internal/
-│   ├── api/          HTTP + WebSocket handlers (consumer.go, provider.go, billing_handlers.go, device_auth.go, invite_handlers.go, release_handlers.go, enroll.go, stats.go, server.go)
-│   ├── attestation/  Secure Enclave + MDA attestation verification
-│   ├── auth/         Privy JWT verification + user provisioning
-│   ├── billing/      Stripe, Solana USDC deposits, referral system
-│   ├── e2e/          End-to-end encryption (X25519 key exchange)
-│   ├── mdm/          MicroMDM integration for device attestation
-│   ├── payments/     Internal ledger, pricing tables, payout tracking
-│   ├── protocol/     WebSocket message types shared with provider
-│   ├── registry/     Provider registry, scoring, reputation, request queue
-│   └── store/        Persistence (in-memory or Postgres)
+coordinator/          Go control plane (packages live at top level, not internal/)
+├── cmd/coordinator/  main service entrypoint
+├── api/              HTTP + WebSocket handlers (consumer.go, provider.go, billing_handlers.go, device_auth.go, invite_handlers.go, release_handlers.go, enroll.go, stats.go, server.go)
+├── attestation/      Secure Enclave + MDA attestation verification
+├── auth/             Privy JWT verification + user provisioning
+├── billing/          Stripe, Solana USDC deposits, referral system
+├── e2e/              End-to-end encryption (X25519 key exchange)
+├── mdm/              MicroMDM integration for device attestation
+├── payments/         Internal ledger, pricing tables, payout tracking
+├── protocol/         WebSocket message types shared with provider
+├── ratelimit/        Rate limiting
+├── registry/         Provider registry, queueing, routing, reputation, token-budget admission
+├── saferun/          Panic-safe goroutine runners
+├── store/            Persistence (in-memory or Postgres)
+├── telemetry/        Datadog DogStatsD metrics
+├── datadog/          Dev dashboard JSON definitions
+└── internal/e2e/     Coordinator-scoped integration tests
 
-provider/             Rust — runs on Apple Silicon Macs
-├── src/
-│   ├── main.rs       CLI entry (serve, start, stop, models, benchmark, status, doctor, login, etc.)
-│   ├── coordinator.rs WebSocket client with auto-reconnect
-│   ├── proxy.rs      Forwards text requests to local backends
-│   ├── hardware.rs   Apple Silicon detection, system metrics (memory/CPU/thermal)
-│   ├── protocol.rs   Message types (mirrors coordinator/internal/protocol)
-│   ├── backend/      Backend process management (vllm_mlx.rs, health checks)
-│   ├── crypto.rs     X25519 key pair (NaCl), E2E decryption
-│   ├── security.rs   SIP checks, binary self-hash, anti-debug (PT_DENY_ATTACH)
-│   ├── models.rs     Scans ~/.cache/huggingface for available models (fast discovery, on-demand hashing)
-│   ├── config.rs     TOML config + hardware-based defaults
-│   ├── inference.rs  In-process MLX inference (behind "python" feature flag)
-│   ├── server.rs     Local HTTP server (standalone mode without coordinator)
-│   ├── hypervisor.rs Hypervisor.framework memory isolation (Stage 2 page tables)
-│   ├── scheduling.rs Time-based availability windows
-│   ├── service.rs    launchd user agent management
-│   └── wallet.rs     Legacy provider wallet (secp256k1)
-├── stt_server.py     Local speech-to-text server script
+e2e/                  System-level E2E testing framework
+├── integration_test.go  12 E2E tests (streaming, billing, encryption, attestation, etc.)
+├── profile_test.go      latency profiling tests
+├── benchmark_test.go    load benchmarks (posts markdown to PR comments)
+└── testbed/             shared test harness (coordinator/provider lifecycle, load generator, assertions)
 
-provider-swift/       Swift — CLI replacement for the Rust provider (in progress)
-├── Package.swift     SwiftPM manifest, depends on libs/mlx-swift{,-lm}
+provider-swift/       Swift provider CLI for Apple Silicon Macs
 ├── Sources/
-│   ├── ProviderCore/                  shared library (protocol, hardware, crypto, security, inference, coordinator client, scheduling, server, telemetry, models, attestation)
+│   ├── ProviderCore/                  shared library (protocol, hardware, crypto, security, inference, coordinator client, scheduling, server, telemetry, model downloads, attestation)
+│   ├── ProviderCoreFoundation/        Linux-buildable model manifests, scanner, hashing, publish-safe code
 │   ├── darkbloom/                     CLI executable (serve, start, stop, status, doctor, models, login, logout, benchmark, update, verify)
-│   └── darkbloom-enclave-cli/    Secure Enclave attestation/sign helper (replaces the legacy enclave/ FFI bridge)
-└── Tests/ProviderCoreTests/
+│   ├── darkbloom-publish/             registry manifest builder for the publish workflow
+│   └── darkbloom-enclave-cli/         Secure Enclave attestation/sign helper
+└── Tests/
 
-console-ui/           Next.js 16 / React 19 frontend (chat, billing, models, images)
-├── src/app/          Pages: chat (/), billing, images, models, stats, providers, settings, link, api-console, earn
-├── src/app/api/      Proxy routes: chat, models, auth/keys, payments/*, invite, health, pricing
+console-ui/           Next.js 16 / React 19 frontend (chat, billing, models)
+├── src/app/          Pages: chat (/), billing, models, stats, providers, settings, link, api-console, earn
+├── src/app/api/      Proxy routes: chat, images, transcribe, auth/keys, payments/*, invite, models, health, pricing
 ├── src/components/   Chat UI, sidebar, top bar, trust badges, invite banner, verification panel
 ├── src/lib/          API client (api.ts), Zustand store (store.ts)
 ├── src/hooks/        Auth (useAuth.ts), toast notifications (useToast.ts)
@@ -59,22 +49,20 @@ console-ui/           Next.js 16 / React 19 frontend (chat, billing, models, ima
 scripts/
 ├── install.sh        curl one-liner installer (fetches release, verifies SHA-256 + code signature)
 ├── admin.sh          Admin CLI (Privy auth, release mgmt, API calls)
+├── publish-model.sh  Model registry publish workflow
 ├── deploy-acme.sh    nginx/step-ca helper
+├── fetch-metallib.sh MLX metallib fetcher
 ├── smoke-dev.sh      Dev-coordinator smoke test
-├── benchmark-*.py    Benchmark utilities
 └── entitlements.plist Hardened Runtime entitlements (hypervisor, network)
 
-docs/                 Architecture docs, deploy runbook, MDM/ACME notes
-landing/              Static landing page (index.html)
-.github/workflows/    CI (ci.yml) and Swift release automation (release-swift.yml)
-
-.external/            Git-ignored; holds external forks used by the project (NOT part of this repo)
-└── vllm-mlx/         Our fork of vllm-mlx (github.com/Gajesh2007/vllm-mlx)
+docs/                 Architecture docs, deploy runbook, MDM/ACME notes, threat model
+.github/workflows/    CI (ci.yml), integration tests (integration.yml), Swift release (release-swift.yml),
+                      model registration (register-model.yml), threat model review (threat-model-review.yml)
 ```
 
 ### External Dependencies (`.external/`)
 
-The `.external/` directory contains our fork of [vllm-mlx](https://github.com/Gajesh2007/vllm-mlx) — the MLX inference backend that the provider spawns as `vllm-mlx serve <model>`. This is a separate git repo and **must never be committed to d-inference** (it is git-ignored). Changes to vllm-mlx should be made in that repo directly, not here.
+The `.external/` directory is reserved for local external checkouts and **must never be committed to d-inference**. The current Swift provider uses in-process MLX, not a vllm-mlx subprocess.
 
 ## Building & Testing
 
@@ -83,23 +71,10 @@ The `.external/` directory contains our fork of [vllm-mlx](https://github.com/Ga
 cd coordinator
 go test ./...
 # Cross-compile for the EigenCloud container (Linux amd64):
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o eigeninference-coordinator-linux ./cmd/coordinator
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o coordinator-linux ./cmd/coordinator
 ```
 
-### Provider, Rust (legacy, in production)
-```bash
-cd provider
-PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test
-PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo build --release
-```
-The `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` env var is required when local Python version exceeds PyO3's max supported version (e.g. Python 3.14 with PyO3 0.24).
-
-To build without the Python in-process inference feature (needed for the distributed bundle):
-```bash
-cargo build --release --no-default-features
-```
-
-### Provider, Swift (new CLI, replacing Rust at cutover)
+### Provider, Swift
 ```bash
 cd provider-swift
 swift test
@@ -119,12 +94,19 @@ npx eslint src/       # lint check
 npm test              # vitest
 ```
 
+### E2E Integration Tests
+```bash
+# Requires Postgres + Swift provider binary + MLX model downloaded
+go test ./e2e/... -run TestIntegration -v
+go test ./e2e/... -run TestBenchmark -v    # load benchmarks
+```
+
 ## Releases
 
 **Never create a release unless explicitly asked by the user.** When asked:
 
 1. **Squash push**: All local commits since the last tag should be squash-pushed into a single commit on master.
-2. **Bump version**: Update `provider/Cargo.toml` version.
+2. **Bump version**: Update the Swift provider version in `provider-swift/Sources/ProviderCore/ProviderCore.swift`.
 3. **Create annotated tag** with a description summarizing all changes:
    ```bash
    git tag -a v0.X.Y -m "v0.X.Y: one-line summary
@@ -134,7 +116,7 @@ npm test              # vitest
    - ..."
    ```
 4. **Push** the commit and tag: `git push origin master --tags`
-5. The Swift release workflow (`.github/workflows/release-swift.yml`) is triggered by tags shaped `vX.Y.Z-swift[.N]`. While the Rust provider is still in production, ship Rust releases via a separate workflow re-introduced from git history.
+5. The Swift release workflow (`.github/workflows/release-swift.yml`) is triggered by tags shaped `vX.Y.Z-swift[.N]`.
 
 ## Deploying
 
@@ -172,7 +154,7 @@ Shape: GCE Ubuntu VM + Docker + systemd (coordinator + step-ca + MicroMDM need p
 
 ### Provider bundle
 
-CI (`.github/workflows/release-swift.yml`) builds, signs, notarizes, and uploads the Swift CLI bundle to Cloudflare R2 (`s3://d-inf-app/releases/v{VERSION}/eigeninference-bundle-macos-arm64.tar.gz`), then registers the release with the coordinator via `POST /v1/releases`. Providers fetch via `install.sh` served by the coordinator. There is no SSH-to-a-VM step.
+CI (`.github/workflows/release-swift.yml`) builds, signs, notarizes, and uploads the Swift CLI bundle to Cloudflare R2 (`s3://d-inf-app/releases/v{VERSION}/darkbloom-bundle-macos-arm64.tar.gz`), then registers the release with the coordinator via `POST /v1/releases`. Providers fetch via `install.sh` served by the coordinator. There is no SSH-to-a-VM step.
 
 ## Infrastructure
 
@@ -191,21 +173,24 @@ CI (`.github/workflows/release-swift.yml`) builds, signs, notarizes, and uploads
 
 ## Key Design Decisions
 
+- **Token-budget routing**: Providers report real token budget usage (active tokens, max potential, EWMA decode TPS) in heartbeats. Coordinator uses engine-reported capacity for admission, with fleet median TPS as fallback. Speculative TTFT dispatch sends to a backup provider at 50% of the deadline; first token wins, loser is cancelled. Early 429 with Retry-After for OpenRouter compatibility.
 - **Provider scoring**: decode TPS × trust multiplier × reputation × warm model bonus × health factor. Health factor uses live system metrics (memory pressure, CPU usage, thermal state) reported in heartbeats.
-- **Request cancellation**: In-flight inference requests are tracked by request_id with CancellationToken. On coordinator disconnect, all in-flight requests are cancelled and the HTTP connection to vllm-mlx is dropped so it stops generating.
-- **Idle GPU timeout**: Backend (vllm-mlx) process is killed after 1 hour of no requests to free GPU memory. Lazy-reloaded when the next request arrives (cold-start penalty of ~10-30s for model reload).
+- **Continuous batching**: All concurrent requests merged into one batched forward pass per step via MLX-Swift BatchedEngine. Near-linear throughput scaling (B=4/B=1 = 3.8x on Qwen, 2.9x on Gemma MoE). Temperature=0 uses vectorized greedy fast path.
+- **Request cancellation**: In-flight inference requests are tracked by request_id with cancellation state. On coordinator disconnect, in-flight requests are cancelled so generation stops promptly.
+- **Idle GPU timeout**: Loaded model state is released after 1 hour of no requests to free GPU memory. Lazy-reloaded when the next request arrives. Coordinator can also push `load_model` messages to pre-warm providers.
 - **E2E encryption**: Consumer requests encrypted with provider's X25519 public key (NaCl box). Coordinator never sees plaintext prompts. Decryption only inside the hardened provider process.
-- **Attestation chain**: Secure Enclave P-256 key → signs attestation blob → coordinator verifies signature (self_signed) → MDM SecurityInfo cross-check (hardware trust) → Apple Enterprise Attestation Root CA signs device cert chain via MDA (mda_verified). Full chain exposed at `GET /v1/providers/attestation` for user-side verification.
-- **Protocol symmetry**: `provider/src/protocol.rs` and `coordinator/internal/protocol/messages.go` define the same WebSocket message types. Changes to one must be mirrored in the other.
-- **Model catalog**: Coordinator maintains a catalog of supported models. Provider CLI filters local models against this catalog for serving and display. Only catalog models are served.
-- **Billing**: Solana USDC deposits verified on-chain. Coordinator wallet derived from BIP39 mnemonic via SLIP-0010 (m/44'/501'/0'/0'). Stripe wired but inactive. Referral system gives referrers a share of platform fees.
-- **Request queue**: When all providers are busy, requests queue with 120s timeout. Frontend shows "providers are busy" on 503.
+- **Attestation chain**: Secure Enclave P-256 key (persistent, keychain access group bound) → signs attestation blob → coordinator verifies signature (self_signed) → MDM SecurityInfo cross-check (hardware trust) → Apple Enterprise Attestation Root CA signs device cert chain via MDA (mda_verified). Full chain exposed at `GET /v1/providers/attestation` for user-side verification.
+- **Protocol symmetry**: `provider-swift/Sources/ProviderCore/Protocol/` and `coordinator/protocol/messages.go` define the same WebSocket message types. Changes to one must be mirrored in the other.
+- **Model registry**: Coordinator registry data is DB-backed and points to R2 manifests. The Swift provider downloads the files listed in the manifest from `https://models.darkbloom.ai` and verifies per-file plus aggregate SHA-256. Do not reintroduce hardcoded model catalog lists.
+- **Billing**: Solana USDC deposits verified on-chain. Coordinator wallet derived from BIP39 mnemonic via SLIP-0010 (m/44'/501'/0'/0'). Stripe wired for payouts. Referral system gives referrers a share of platform fees.
+- **Request queue**: When all providers are busy, requests queue with 120s timeout. Frontend shows "providers are busy" on 503. 429 with Retry-After returned when fleet is at capacity.
 - **Challenge timing**: Initial attestation challenge sent immediately on provider registration, then every 5 minutes via ticker.
 - **Model scan performance**: `scan_models()` does fast discovery without hashing. Weight hash computed on-demand only for the model being served via `compute_weight_hash()`.
 - **Chat template injection**: Provider auto-injects ChatML template for models missing `chat_template` field (e.g., Qwen3.5 base models).
 - **Hypervisor memory isolation**: Apple Hypervisor.framework creates Stage 2 page tables to protect inference memory from RDMA/DMA attacks. Requires `com.apple.security.hypervisor` entitlement.
 - **Device auth**: RFC 8628 device code flow for linking provider machines to user accounts. Provider runs `login`, gets a code, user enters it on the web.
-- **CI code signing**: GitHub Actions release workflow signs provider binary with Developer ID Application cert, notarizes with Apple, computes SHA-256 hashes after signing.
+- **CI code signing**: GitHub Actions release workflow signs provider binary with Developer ID Application cert, notarizes with Apple, computes SHA-256 hashes after signing. Provisioning profile embedded in .app bundle for persistent SE key.
+- **Observability**: Datadog DogStatsD metrics for attestation, routing, billing, fleet version, provider capacity. X-Timing JSON header decomposes per-request latency (parse, reserve, route, queue, encrypt, dispatch, provider).
 
 ## Problem-Solving Approach
 
@@ -221,21 +206,19 @@ Always think from first principles. When fixing a bug or designing a feature:
 
 5. **Ask "what breaks next?" after every fix.** If you exclude .pyc from hashing, what can an attacker do with .pyc? If you purge before hashing, what regenerates .pyc between purge and the next check? Each fix must not create a new hole.
 
-6. **Pull the thread on every component.** When debugging a failure, map every component in the chain (coordinator → provider → backend → vllm-mlx). Trace the actual flow step by step — look at real logs, real source code, real API responses at each boundary. When you see a specific error (e.g. "422 Unprocessable Entity"), immediately ask "what causes that exact status code in that exact server?" and trace it to the source. Don't theorize about what MIGHT be wrong — verify what IS wrong. Example: warmup was returning 422 for months because the request was missing a required `model` field. The 422 was right there in the logs the whole time. Instead of reading it, we spent time theorizing about timing windows and false positives in health checks. The error message IS the clue — follow it.
+6. **Pull the thread on every component.** When debugging a failure, map every component in the chain (coordinator → provider → inference engine). Trace the actual flow step by step — look at real logs, real source code, real API responses at each boundary. When you see a specific error, immediately ask "what causes that exact status code in that exact server?" and trace it to the source. Don't theorize about what MIGHT be wrong — verify what IS wrong. The error message IS the clue — follow it.
 
 ## Common Pitfalls
 
-- Protocol changes require updating both `provider/src/protocol.rs` (Rust) AND `coordinator/internal/protocol/messages.go` (Go). They must stay in sync.
-- Telemetry wire types are mirrored in three places: `coordinator/internal/protocol/telemetry.go`, `provider/src/telemetry/event.rs`, and `console-ui/src/lib/telemetry-types.ts`. The field allowlist (`coordinator/internal/api/telemetry_handlers.go`) is the privacy backstop — never add prompt/completion fields. See `docs/telemetry.md`.
+- Protocol changes require updating both `provider-swift/Sources/ProviderCore/Protocol/` (Swift) AND `coordinator/protocol/messages.go` (Go). They must stay in sync.
+- Telemetry wire types are mirrored in three places: `coordinator/protocol/telemetry.go`, `provider-swift/Sources/ProviderCore/Telemetry/`, and `console-ui/src/lib/telemetry-types.ts`. The field allowlist (`coordinator/api/telemetry_handlers.go`) is the privacy backstop — never add prompt/completion fields. See `docs/telemetry.md`.
 - Attestation tests need `AuthenticatedRootEnabled: true` in test blobs or the ARV check fails and overwrites earlier error messages (the checks run sequentially, last failure wins).
-- The `python` feature flag in the provider Cargo.toml links PyO3. Use `--no-default-features` when building for distribution to avoid Python linking issues.
 - The coordinator uses in-memory store by default. Provider state is lost on restart. Postgres store exists but is not used in production yet.
-- Binary files like `coordinator/eigeninference-coordinator` and `coordinator/eigeninference-coordinator-linux` should NOT be committed to git (15MB+ each).
+- Binary files like `coordinator/coordinator` should NOT be committed to git. Do not model changes from this built artifact.
 - CI release workflow must compute binary SHA-256 hashes AFTER code signing, not before. Providers verify hashes of the signed binary.
-- Provider bundle semantics span multiple files: `.github/workflows/release-swift.yml`, `scripts/install.sh` (and the embedded copy at `coordinator/internal/api/install.sh`), and `LatestProviderVersion` in `coordinator/internal/api/server.go`. Keep them in sync.
-- Image generation and audio transcription are not supported. The platform serves only text inference; the model catalog filter (`coordinator/internal/api/model_catalog_filter.go`) rejects any `ModelType` other than `text`.
+- Provider bundle semantics span multiple files: `.github/workflows/release-swift.yml`, `scripts/install.sh`, and `LatestProviderVersion` in `coordinator/api/server.go`. Keep them in sync.
+- Model registry changes span coordinator registry schema/endpoints, `provider-swift` manifest download/publish code, `scripts/publish-model.sh`, and the console UI.
 - Device linking changes span coordinator device auth endpoints and provider `login`/`logout` commands.
-- The repo contains mixed payment language: current code implements Privy + Solana + Stripe, but some provider comments still reference Tempo/pathUSD.
 
 ## Testing New Features
 
@@ -250,9 +233,18 @@ Every new feature or non-trivial change must ship with tests. Don't rely on "the
 
 The goal is "next engineer can change this and CI tells them if they broke it," not "it worked on my machine today."
 
+## Code Structure & Modularity
+
+Keep the codebase modular, never monolithic.
+
+- Prefer small, single-responsibility files over large catch-all ones. Split by concern: types, pure helpers, data/IO hooks, UI pieces, and a thin orchestrator that wires them together.
+- Group a feature's files into a dedicated module/folder with a thin entry point. Examples: the coordinator's top-level Go packages (`registry/`, `billing/`, `store/`), and `console-ui/src/components/api-keys/` (`constants`, `format`, `limits`, `Modal`, `KeyForm`, `KeyCard`, a `useApiKeys` data hook, and a thin `ApiKeysManager` orchestrator).
+- One file/component should do one thing. If a file mixes several concerns or grows past a few hundred lines, that's a signal to split it.
+- **At the end of every large piece of work, do a refactor pass to make it modular before calling it done.** Extract helpers/types/hooks into focused files, delete dead code, and keep the public entry point thin. The refactor must be behavior-preserving — build, lint, and tests stay green.
+
 ## Quality Gate
 
-After completing each objective (task, plan phase, or discrete unit of work), spawn **both** reviewers in parallel:
+After completing each objective (task, plan phase, or discrete unit of work), first do a modular refactor pass on any large change (see **Code Structure & Modularity**), then spawn **both** reviewers in parallel:
 
 1. **Codex rescue subagent** (`codex:codex-rescue`) — reviews the diff for correctness, regressions, and build/test pass
 2. **Claude Code subagent** (`Agent` tool, general-purpose) — independently reviews the same diff for correctness, edge cases, and code quality
@@ -262,7 +254,7 @@ Each reviewer should:
 1. Read the diff of all changes made for that objective
 2. Verify correctness: does the implementation actually solve what was asked?
 3. Check for regressions: broken imports, missing protocol symmetry, untested edge cases
-4. Confirm builds/tests pass for affected components (run `go test`, `cargo test`, `npm run build`, etc. as appropriate)
+4. Confirm builds/tests pass for affected components (run `go test`, `swift test`, `npm run build`, etc. as appropriate)
 5. Report a pass/fail verdict with specific issues if any
 
 Only proceed to the next objective after both reviewers pass. If either flags issues, fix them before moving on.
@@ -272,14 +264,13 @@ Only proceed to the next objective after both reviewers pass. If either flags is
 Hooks live in `.githooks/` and are enabled via `git config core.hooksPath .githooks` (already set for this repo).
 
 - **pre-commit**: Checks formatting on staged files only (fast).
-- **pre-push**: Runs formatting + compilation + tests for changed components. Includes `cargo build --no-default-features` to match CI's release build (the `python` feature flag changes compilation).
+- **pre-push**: Runs formatting + compilation + tests for changed components.
 
 | Component | Check | Manual fix |
 |-----------|-------|------------|
 | Go (coordinator/) | `gofmt -l` | `gofmt -w <file>` |
-| Rust (provider/) | `cargo fmt --check` | `cd provider && cargo fmt` |
 | TypeScript (console-ui/) | `npx eslint src/` | `cd console-ui && npx eslint src/ --fix` |
-| Swift (provider-swift/) | skipped | no enforced formatter |
+| Swift (provider-swift/) | skipped | `cd provider-swift && swift test` |
 
 If you clone fresh, activate the hook with:
 ```bash

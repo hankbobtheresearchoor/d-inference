@@ -1,3 +1,5 @@
+@_exported import ProviderCoreFoundation
+
 import Foundation
 import MLX
 import MLXNN
@@ -14,5 +16,5 @@ public enum ProviderCore {
     /// vllm-mlx, ships only `darkbloom` + `darkbloom-enclave` +
     /// `mlx.metallib`. (`eigeninference-enclave` ships as a backward-
     /// compatibility symlink to `darkbloom-enclave`.)
-    public static let version = "0.5.0"
+    public static let version = "0.5.16"
 }

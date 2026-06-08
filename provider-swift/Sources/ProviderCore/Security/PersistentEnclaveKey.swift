@@ -73,7 +73,17 @@ public final class PersistentEnclaveKey: @unchecked Sendable {
     /// does NOT expand $(AppIdentifierPrefix) -- that's Xcode-only.
     public static let defaultAccessGroup = "SLDQ2GJ6TL.io.darkbloom.provider"
 
-    public static let defaultLabel = "io.darkbloom.provider.attestation-signing.v1"
+    /// Legacy v1 label. Keys stored under this label were created with the old
+    /// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` policy, which becomes
+    /// inaccessible while the screen is locked (signing fails with OSStatus
+    /// -25308). `loadOrCreate` migrates them to `defaultLabel` (v2).
+    public static let legacyLabelV1 = "io.darkbloom.provider.attestation-signing.v1"
+
+    /// Current (v2) label. Keys here use
+    /// `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, so background
+    /// challenge signing works while the screen is locked. The presence of a
+    /// key under this label is itself the migration marker.
+    public static let defaultLabel = "io.darkbloom.provider.attestation-signing.v2"
 
     /// Raw P-256 public key (64 bytes: X || Y, without the 0x04 prefix).
     public var publicKeyRaw: Data { _publicKeyRaw }
@@ -107,6 +117,24 @@ public final class PersistentEnclaveKey: @unchecked Sendable {
     // MARK: - Load or Create
 
     /// Load an existing persistent key from the keychain, or create one if not found.
+    ///
+    /// Performs a deterministic, version-stamped migration off the legacy v1
+    /// key. Old keys (`legacyLabelV1`) were created with
+    /// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, which becomes
+    /// inaccessible while the screen is locked — `SecKeyCreateSignature` then
+    /// returns OSStatus -25308 and the provider can no longer answer
+    /// attestation challenges. New keys are created under `defaultLabel` (v2)
+    /// with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.
+    ///
+    /// The migration is independent of lock state: the *presence of a v2 key*
+    /// IS the migration marker — there is no test-sign and no attribute
+    /// probing (the old approach only detected the bad policy while locked,
+    /// which is almost never the case at provider startup). When only a v1 key
+    /// exists, a brand-new v2 key is created under the new label. Creating
+    /// under a *new* label sidesteps the `errSecDuplicateItem` /
+    /// delete-while-locked trap entirely. The v1 key is then deleted on a
+    /// best-effort basis; an orphan left behind because deletion failed while
+    /// locked is harmless — it has a different label and is never used again.
     public static func loadOrCreate(
         accessGroup: String? = nil,
         label: String? = nil
@@ -122,10 +150,81 @@ public final class PersistentEnclaveKey: @unchecked Sendable {
             logger.info("Loaded existing persistent Secure Enclave key")
             return existing
         } catch PersistentEnclaveKeyError.keyLookupFailed(status: errSecItemNotFound) {
-            // No existing key — proceed to creation.
+            // No key under keyLabel — fall through to (migration +) creation.
+        }
+
+        // Migration only applies to the default (v2) label. A custom label
+        // (used by tests) is pure find-or-create with no migration. If a
+        // legacy v1 key exists, mint a fresh v2 key and retire the v1 key.
+        if keyLabel == defaultLabel,
+           (try? findExisting(accessGroup: group, label: legacyLabelV1)) != nil {
+            logger.warning("Found legacy v1 Secure Enclave key — migrating to v2 (AfterFirstUnlock)")
+            let migrated = try createNew(accessGroup: group, label: defaultLabel)
+            // Best-effort cleanup. If the v1 key is locked and cannot be
+            // deleted, the orphan is harmless: different label, never used.
+            try? delete(accessGroup: group, label: legacyLabelV1)
+            return migrated
         }
 
         return try createNew(accessGroup: group, label: keyLabel)
+    }
+
+    // MARK: - Self-test & verified load
+
+    /// errSecInteractionNotAllowed — the key exists but cannot be used right
+    /// now: the data-protection keychain is locked (headless box never unlocked
+    /// since boot) or the key's access policy is too strict (a leftover
+    /// WhenUnlocked v1 key, or a poisoned v2 key).
+    private static let errInteractionNotAllowed: OSStatus = -25308
+
+    /// Signs a fixed probe to prove the key can actually produce a signature.
+    /// Returns nil on success, or the failing OSStatus. A key that *loads* fine
+    /// but fails here is the silent-killer case: the provider would answer every
+    /// attestation challenge with a signing error and be pinned untrusted while
+    /// still heartbeating "online".
+    public func selfTestSign() -> OSStatus? {
+        let probe = Data("darkbloom-se-selftest".utf8)
+        do {
+            _ = try sign(probe)
+            return nil
+        } catch let PersistentEnclaveKeyError.signingFailed(status, _) {
+            return status
+        } catch {
+            return errSecInternalError
+        }
+    }
+
+    /// Like `loadOrCreate`, but proves the key can sign before returning it.
+    /// If the self-test fails, it makes ONE auto-repair attempt — delete the
+    /// key and re-mint it with the AfterFirstUnlock policy — then re-tests. If
+    /// it still cannot sign, it throws so the caller falls back to an ephemeral
+    /// identity (the provider keeps serving at self_signed instead of being
+    /// silently pinned untrusted, e.g. MF4502MM7P: 9/9 -25308, 0 signatures).
+    public static func loadOrCreateVerified(
+        accessGroup: String? = nil,
+        label: String? = nil
+    ) throws -> PersistentEnclaveKey {
+        let key = try loadOrCreate(accessGroup: accessGroup, label: label)
+        guard let status = key.selfTestSign() else {
+            return key
+        }
+        logger.warning("Persistent SE key failed self-test sign (OSStatus \(status)) — attempting auto-repair (delete + re-mint)")
+
+        let group = resolveAccessGroup(accessGroup)
+        let keyLabel = label ?? defaultLabel
+        // Best-effort delete; if the keychain is locked this also fails and the
+        // re-mint below surfaces the same error to the caller's ephemeral
+        // fallback.
+        try? delete(accessGroup: accessGroup, label: label)
+        let fresh = try createNew(accessGroup: group, label: keyLabel)
+        if let reStatus = fresh.selfTestSign() {
+            throw PersistentEnclaveKeyError.signingFailed(
+                status: reStatus,
+                message: "persistent SE key cannot sign after auto-repair (keychain likely locked / headless box not unlocked since boot)"
+            )
+        }
+        logger.info("Persistent SE key auto-repair succeeded — re-minted a working v2 key")
+        return fresh
     }
 
     // MARK: - Find Existing
@@ -180,7 +279,7 @@ public final class PersistentEnclaveKey: @unchecked Sendable {
         var acError: Unmanaged<CFError>?
         guard let accessControl = SecAccessControlCreateWithFlags(
             kCFAllocatorDefault,
-            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             .privateKeyUsage,
             &acError
         ) else {

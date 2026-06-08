@@ -21,9 +21,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"math"
 	"math/rand"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,10 +57,11 @@ const (
 	TrustHardware   TrustLevel = "hardware"    // MDM + MDA + SE key bound to Apple-verified hardware
 )
 
-const (
-	BackendInprocessMLX = "inprocess-mlx"
-	BackendMLXSwift     = "mlx-swift"
-)
+const BackendMLXSwift = "mlx-swift"
+
+// MaxFailedChallenges is the number of consecutive challenge failures before
+// a provider is marked untrusted and fully derouted.
+const MaxFailedChallenges = 3
 
 func BackendUsesSwiftRuntime(backend string) bool {
 	return backend == BackendMLXSwift
@@ -69,6 +73,16 @@ type PendingRequest struct {
 	ProviderID  string
 	Model       string
 	ConsumerKey string
+	// KeyID is the public ID of the API key that originated the request, used
+	// for per-key usage and spend attribution. Empty for account-scoped/legacy
+	// callers (Privy JWT, admin, provider tokens, unlinked keys without an ID).
+	KeyID string
+	// KeyLimitMicroUSD / KeyLimitReset carry the originating key's spend cap so
+	// the per-key cap can be re-enforced when a provider's custom price tops up
+	// the reservation above the platform rate. Nil limit = no per-key cap.
+	KeyLimitMicroUSD *int64
+	KeyLimitReset    string
+	ConsumerLocation *store.ProviderLocation
 	// IsResponsesAPI tracks requests received through /v1/responses so the
 	// coordinator can translate provider chat-completions output back into
 	// Responses API objects for SDK clients.
@@ -77,6 +91,31 @@ type PendingRequest struct {
 	// one of these attested hardware serials. Empty means the request may
 	// route to any eligible provider.
 	AllowedProviderSerials []string
+	// SelfRouteOnly restricts routing to providers owned by OwnerAccountID
+	// (the "use my own machine" path). When set, the scheduler skips every
+	// provider whose AccountID != OwnerAccountID and never falls back to the
+	// public fleet. The owner-match is on the coordinator-stamped AccountID,
+	// never on any client-supplied value.
+	SelfRouteOnly bool
+	// PreferOwner is the "prefer my own machine, but fall back to the paid
+	// fleet" mode. Unlike SelfRouteOnly it does NOT exclude public providers:
+	// the scheduler picks the caller's own machine whenever one can serve, and
+	// only falls back to the public fleet (charged normally) when none can. The
+	// hardware-trust floor is relaxed for the caller's own (possibly un-enrolled)
+	// machine, exactly as for SelfRouteOnly, but never for public providers.
+	// Billing is decided at settlement: free if an owned machine actually served
+	// it, paid otherwise — so a PreferOwner request takes a normal reservation
+	// up front (unlike SelfRouteOnly, which skips it).
+	PreferOwner bool
+	// OwnerAccountID is the authenticated account that must own the serving
+	// provider when SelfRouteOnly or PreferOwner is set. Stamped server-side
+	// from the request's authenticated identity.
+	OwnerAccountID string
+	// FreeSelfRoute marks a request that must settle at zero cost (no charge,
+	// no platform fee, no provider payout) because it is served by a machine
+	// the requesting account owns. handleComplete re-verifies ownership of the
+	// serving provider before honoring this flag.
+	FreeSelfRoute bool
 	// EstimatedPromptTokens is a coordinator-side heuristic used only for
 	// routing and queue admission. It does not need tokenizer-perfect accuracy.
 	EstimatedPromptTokens int
@@ -95,9 +134,45 @@ type PendingRequest struct {
 	// The post-inference charge adjusts for the difference between the
 	// actual cost and this reservation, preventing billing race conditions.
 	ReservedMicroUSD int64
+	// BaseReservedMicroUSD is the shared base reservation (platform price)
+	// charged once per request. ReservedMicroUSD may exceed it after a
+	// provider-specific top-up; the difference (the per-attempt "extra") must
+	// be refunded if this attempt is abandoned (speculative loser, retry,
+	// timeout). The base itself is refunded once globally or settled by the
+	// winning attempt.
+	BaseReservedMicroUSD int64
+	reservationMu        sync.Mutex
+	reservationFinalized bool
 
 	// Timing fields for latency decomposition.
 	Timing *RequestTiming
+}
+
+// MarkReservationFinalized returns true only for the first settlement or refund
+// of a pre-flight balance reservation. It prevents a terminal provider error
+// racing with a late completion from crediting or refunding the same reservation
+// twice.
+func (pr *PendingRequest) MarkReservationFinalized() bool {
+	ok, _ := pr.FinalizeReservation(nil)
+	return ok
+}
+
+// FinalizeReservation runs settle while holding the reservation finalization
+// lock and marks the reservation finalized only if settle succeeds. It returns
+// false when another terminal path already finalized the reservation.
+func (pr *PendingRequest) FinalizeReservation(settle func() error) (bool, error) {
+	pr.reservationMu.Lock()
+	defer pr.reservationMu.Unlock()
+	if pr.reservationFinalized {
+		return false, nil
+	}
+	if settle != nil {
+		if err := settle(); err != nil {
+			return false, err
+		}
+	}
+	pr.reservationFinalized = true
+	return true, nil
 }
 
 type RequestTiming struct {
@@ -117,8 +192,8 @@ type Provider struct {
 	Hardware          protocol.Hardware
 	Models            []protocol.ModelInfo
 	Backend           string
+	Location          *store.ProviderLocation
 	PublicKey         string // base64-encoded X25519 public key for E2E encryption
-	WalletAddress     string // Ethereum-format hex address for Tempo payouts
 	Attested          bool   // true if attestation was verified successfully
 	AttestationResult *attestation.VerificationResult
 	TrustLevel        TrustLevel             // attestation trust level
@@ -135,6 +210,10 @@ type Provider struct {
 
 	// Account linkage (set when provider authenticates via device auth token)
 	AccountID string // internal account ID (from device auth flow)
+
+	// PrivateOnly excludes this machine from the public fleet entirely: it
+	// serves only its owner's self-route requests. Reported at registration.
+	PrivateOnly bool
 
 	// Benchmark data reported at registration
 	PrefillTPS float64 // prefill tokens per second
@@ -173,9 +252,20 @@ type Provider struct {
 	// this is set by the coordinator after independently checking the challenge response.
 	ChallengeVerifiedSIP bool `json:"challenge_verified_sip"`
 
+	// lastPersisted tracks when this provider was last written to the store.
+	// Used by PersistProviderThrottled to avoid hammering Postgres on every heartbeat.
+	lastPersisted time.Time
+
 	// Challenge-response verification state
 	LastChallengeVerified time.Time // last successful challenge verification
 	FailedChallenges      int       // consecutive failed challenges
+
+	// untrustedRecoverable marks an untrust as a *transient* missed-challenge
+	// deroute (timeout / no-response) that may self-recover on the next passing
+	// challenge. It is false for every hard/security deroute. In-memory only —
+	// never persisted, because recoverability is meaningless without a live
+	// WebSocket and a running challenge loop.
+	untrustedRecoverable bool
 
 	mu          sync.Mutex
 	pendingReqs map[string]*PendingRequest
@@ -193,26 +283,25 @@ func providerSupportsPrivateTextLocked(p *Provider) bool {
 	if !p.ChallengeVerifiedSIP {
 		return false
 	}
-	swiftRuntime := BackendUsesSwiftRuntime(p.Backend)
 	caps := p.PrivacyCapabilities
 	if caps == nil {
 		return false
 	}
-	base := caps.TextBackendInprocess &&
+	// Only mlx-swift is routable (enforced by privateTextBackendSupported above).
+	// Python-specific caps (PythonRuntimeLocked, DangerousModulesBlocked) are
+	// retained in the protocol struct for wire backward compat but are no longer
+	// required for routing.
+	return caps.TextBackendInprocess &&
 		caps.TextProxyDisabled &&
 		caps.AntiDebugEnabled &&
 		caps.CoreDumpsDisabled &&
 		caps.EnvScrubbed
-	if swiftRuntime {
-		return base
-	}
-	return base &&
-		caps.PythonRuntimeLocked &&
-		caps.DangerousModulesBlocked
 }
 
 func privateTextBackendSupported(backend string) bool {
-	return backend == BackendInprocessMLX || backend == BackendMLXSwift
+	// Python/legacy inprocess-mlx backend is deprecated and no longer
+	// routable. Only Swift (mlx-swift) providers are admitted.
+	return backend == BackendMLXSwift
 }
 
 // AddPending registers a pending request on this provider.
@@ -291,6 +380,16 @@ func (p *Provider) Mu() *sync.Mutex {
 	return &p.mu
 }
 
+// ChallengeShouldStop reports whether the attestation challenge loop should
+// stop for this provider. It stops only for a *hard* (non-recoverable) untrust;
+// a transiently-untrusted provider keeps being challenged so a later passing
+// challenge can restore it via RecordChallengeSuccess. Thread-safe.
+func (p *Provider) ChallengeShouldStop() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.Status == StatusUntrusted && !p.untrustedRecoverable
+}
+
 // SetAttestationResult stores the parsed attestation result (thread-safe).
 func (p *Provider) SetAttestationResult(result *attestation.VerificationResult) {
 	p.mu.Lock()
@@ -327,6 +426,15 @@ func (p *Provider) MaxConcurrency() int {
 	return p.maxConcurrency()
 }
 
+// MaxConcurrencyForModel returns the concurrency limit for a specific model.
+// A positive provider-reported slot cap wins; zero/missing preserves the
+// legacy provider-level fallback.
+func (p *Provider) MaxConcurrencyForModel(model string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.maxConcurrencyForModelLocked(model)
+}
+
 // maxConcurrency is the lock-free version (caller must hold p.mu).
 //
 // Tier values were lowered in Phase 2 of the routing-algorithm rework
@@ -340,6 +448,15 @@ func (p *Provider) maxConcurrency() int {
 	if p.BackendCapacity == nil {
 		return DefaultMaxConcurrent
 	}
+
+	// Token-budget providers use budget-based admission; the concurrency
+	// cap is just a safety valve.
+	for _, slot := range p.BackendCapacity.Slots {
+		if slot.ActiveTokenBudgetMax > 0 {
+			return 24
+		}
+	}
+
 	// Hardware-based cap using total memory reported by the provider.
 	memGB := p.BackendCapacity.TotalMemoryGB
 	if memGB <= 0 {
@@ -361,6 +478,66 @@ func (p *Provider) maxConcurrency() int {
 	return cap
 }
 
+// maxConcurrencyForModelLocked is the lock-free model-aware concurrency cap.
+// Caller must hold p.mu.
+func (p *Provider) maxConcurrencyForModelLocked(model string) int {
+	if p.BackendCapacity != nil {
+		for _, slot := range p.BackendCapacity.Slots {
+			if slot.Model == model && slot.MaxConcurrency > 0 {
+				return slot.MaxConcurrency
+			}
+		}
+	}
+	return p.maxConcurrency()
+}
+
+func (p *Provider) pendingCountForModelLocked(model string) int {
+	count := 0
+	for _, pr := range p.pendingReqs {
+		if pr.Model == model {
+			count++
+		}
+	}
+	return count
+}
+
+func (p *Provider) hasReportedMaxConcurrencyForModelLocked(model string) bool {
+	if p.BackendCapacity == nil {
+		return false
+	}
+	for _, slot := range p.BackendCapacity.Slots {
+		if slot.Model == model && slot.MaxConcurrency > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Provider) pendingLoadForModelLocked(model string) int {
+	if !p.hasReportedMaxConcurrencyForModelLocked(model) {
+		return p.pendingCount()
+	}
+	load := p.pendingCountForModelLocked(model)
+	if p.BackendCapacity != nil {
+		for _, slot := range p.BackendCapacity.Slots {
+			if slot.Model != model {
+				continue
+			}
+			backendLoad := slot.NumRunning + slot.NumWaiting
+			if backendLoad > load {
+				load = backendLoad
+			}
+			break
+		}
+	}
+	return load
+}
+
+func (p *Provider) hasConcurrencyHeadroomForModelLocked(model string) bool {
+	return p.pendingLoadForModelLocked(model) < p.maxConcurrencyForModelLocked(model) &&
+		p.pendingCount() < p.maxConcurrency()
+}
+
 // Registry holds all connected providers and provides routing.
 type Registry struct {
 	mu        sync.RWMutex
@@ -374,21 +551,37 @@ type Registry struct {
 
 	store store.Store
 
+	tpsRegistry *TPSRegistry
+
 	logger *slog.Logger
 
 	onlineCount      atomic.Int64
 	modelProviders   map[string]*atomic.Int64
 	modelProvidersMu sync.Mutex
+
+	// pendingModelLoads tracks provider-model pairs that have been sent a
+	// load_model command and are awaiting completion. Prevents duplicate
+	// sends across heartbeat cycles.
+	pendingModelLoads map[string]time.Time // key: "providerID:modelID"
+}
+
+const pendingModelLoadTTL = 2 * time.Minute
+
+type modelLoadAction struct {
+	providerID string
+	modelID    string
 }
 
 // New creates a new Registry.
 func New(logger *slog.Logger) *Registry {
 	return &Registry{
-		providers:      make(map[string]*Provider),
-		queue:          NewRequestQueue(10, 120*time.Second),
-		MinTrustLevel:  TrustHardware,
-		modelProviders: make(map[string]*atomic.Int64),
-		logger:         logger,
+		providers:         make(map[string]*Provider),
+		queue:             NewRequestQueue(10, 120*time.Second),
+		MinTrustLevel:     TrustHardware,
+		tpsRegistry:       NewTPSRegistry(),
+		modelProviders:    make(map[string]*atomic.Int64),
+		pendingModelLoads: make(map[string]time.Time),
+		logger:            logger,
 	}
 }
 
@@ -443,9 +636,26 @@ func (r *Registry) RestoreProviderState(p *Provider, rec *store.ProviderRecord) 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Restore trust level (will be re-verified via fresh attestation)
-	p.TrustLevel = TrustLevel(rec.TrustLevel)
-	p.Attested = rec.Attested
+	// Restore trust level, but NEVER above self_signed. Hardware trust must be
+	// re-earned via a fresh live challenge + MDM/ACME on every (re)connection.
+	// Resurrecting a stored "hardware" level would route real traffic to a
+	// provider that has not yet passed a live challenge, and is the source of
+	// the "registry says hardware but the live verdict is self_signed" drift.
+	// The challenge-success path (verifyChallengeResponse) re-upgrades to
+	// hardware once the live legs pass.
+	if r := trustRank(TrustLevel(rec.TrustLevel)); r > trustRank(TrustSelfSigned) {
+		p.TrustLevel = TrustSelfSigned
+	} else {
+		p.TrustLevel = TrustLevel(rec.TrustLevel)
+	}
+	// Do NOT clobber a fresh live attestation: verifyProviderAttestation runs
+	// just before this and may have already set Attested=true (self_signed) from
+	// a passing SE attestation. Only fall back to the stored flag when we don't
+	// already have a fresh one — otherwise consumers/stats would see
+	// X-Provider-Attested:false despite a successful live attestation.
+	if !p.Attested {
+		p.Attested = rec.Attested
+	}
 	p.MDAVerified = rec.MDAVerified
 	p.ACMEVerified = rec.ACMEVerified
 
@@ -454,6 +664,14 @@ func (r *Registry) RestoreProviderState(p *Provider, rec *store.ProviderRecord) 
 		p.LastChallengeVerified = *rec.LastChallengeVerified
 	}
 	p.FailedChallenges = rec.FailedChallenges
+
+	// Restore location only if the provider doesn't already have a fresh one
+	// (attachProviderLocation may have set it from the current request before
+	// RestoreProviderState runs).
+	if rec.Location != nil && p.Location == nil {
+		cp := *rec.Location
+		p.Location = &cp
+	}
 
 	// Restore account linkage
 	if rec.AccountID != "" && p.AccountID == "" {
@@ -496,15 +714,31 @@ func (r *Registry) RestoreProviderState(p *Provider, rec *store.ProviderRecord) 
 	)
 }
 
-// PersistProvider is the public entry point for persisting a provider's state.
-// Called by the API layer after attestation and trust changes.
+// PersistProvider unconditionally persists provider state to the store.
+// Use for critical state changes (attestation, trust level, disconnect).
 func (r *Registry) PersistProvider(p *Provider) {
-	r.persistProvider(p)
+	r.persistProviderNow(p)
 }
 
-// persistProvider saves a provider's current state to the store.
+// PersistProviderThrottled persists provider state at most once per 30 seconds.
+// Use for high-frequency updates (heartbeats) that would otherwise saturate the
+// DB connection pool. Skipped writes are not lost — the next unthrottled persist
+// or the next throttle window will capture the current state.
+func (r *Registry) PersistProviderThrottled(p *Provider) {
+	const minInterval = 30 * time.Second
+	p.mu.Lock()
+	if time.Since(p.lastPersisted) < minInterval {
+		p.mu.Unlock()
+		return
+	}
+	p.lastPersisted = time.Now()
+	p.mu.Unlock()
+	r.persistProviderNow(p)
+}
+
+// persistProviderNow saves a provider's current state to the store.
 // Called asynchronously to avoid blocking the hot path.
-func (r *Registry) persistProvider(p *Provider) {
+func (r *Registry) persistProviderNow(p *Provider) {
 	if r.store == nil {
 		return
 	}
@@ -535,11 +769,18 @@ func (r *Registry) persistProvider(p *Provider) {
 			lastChallenge = &t
 		}
 
+		var locationCopy *store.ProviderLocation
+		if p.Location != nil {
+			lc := *p.Location
+			locationCopy = &lc
+		}
+
 		rec := store.ProviderRecord{
 			ID:                         p.ID,
 			Hardware:                   hardwareJSON,
 			Models:                     modelsJSON,
 			Backend:                    p.Backend,
+			Location:                   locationCopy,
 			TrustLevel:                 string(p.TrustLevel),
 			Attested:                   p.Attested,
 			AttestationResult:          attestJSON,
@@ -566,6 +807,12 @@ func (r *Registry) persistProvider(p *Provider) {
 
 		if err := r.store.UpsertProvider(ctx, rec); err != nil {
 			r.logger.Warn("failed to persist provider", "provider_id", p.ID, "error", err)
+		}
+
+		// Keep this connection's session row fresh and backfill serial/account
+		// once attestation/linking has populated them.
+		if err := r.store.TouchProviderSession(ctx, rec.ID, rec.SerialNumber, rec.AccountID, rec.LastSeen); err != nil {
+			r.logger.Warn("failed to touch provider session", "provider_id", rec.ID, "error", err)
 		}
 	})
 }
@@ -611,15 +858,21 @@ type CatalogEntry struct {
 	ID         string
 	WeightHash string  // expected SHA-256 weight fingerprint (empty = not enforced)
 	SizeGB     float64 // disk/GPU footprint of the model weights (zero = unknown, gate disabled)
+	// MinRAMGB is the catalog's authoritative minimum unified memory (GB) to run
+	// this model — the operator-published requirement. The hardware-fit gate
+	// prefers this over any heuristic multiple of SizeGB. Zero = unknown.
+	MinRAMGB int
 }
 
 // SetModelCatalog updates the set of active models. Only models in this
 // set will be accepted from providers during registration and routable to
-// consumers. Pass nil or empty to disable catalog filtering.
+// consumers. Pass nil to disable catalog filtering for tests/dev flows. Passing
+// an empty non-nil slice configures a deny-all catalog, which is what a fresh
+// DB-backed registry should do until an operator registers and promotes models.
 func (r *Registry) SetModelCatalog(entries []CatalogEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(entries) == 0 {
+	if entries == nil {
 		r.modelCatalog = nil
 		return
 	}
@@ -648,12 +901,12 @@ func (r *Registry) ModelType(model string) string {
 	return "unknown"
 }
 
-// IsModelInCatalog returns true if the model is in the active catalog,
-// or if no catalog is configured (all models allowed).
+// IsModelInCatalog returns true if the model is in the active catalog, or if
+// catalog filtering has been explicitly disabled by setting a nil catalog.
 func (r *Registry) IsModelInCatalog(model string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if len(r.modelCatalog) == 0 {
+	if r.modelCatalog == nil {
 		return true
 	}
 	_, ok := r.modelCatalog[model]
@@ -671,6 +924,32 @@ func (r *Registry) CatalogWeightHash(model string) string {
 	return ""
 }
 
+// modelAllowedByCatalogLocked returns whether a provider-reported model is
+// allowed by the current catalog. Caller must hold r.mu (read or write). A nil
+// catalog disables filtering; an empty non-nil catalog denies all models.
+func (r *Registry) modelAllowedByCatalogLocked(model protocol.ModelInfo) bool {
+	if r.modelCatalog == nil {
+		return true
+	}
+	entry, ok := r.modelCatalog[model.ID]
+	if !ok {
+		return false
+	}
+	return entry.WeightHash == "" || model.WeightHash == "" || model.WeightHash == entry.WeightHash
+}
+
+// providerServesCatalogModelLocked returns true if the provider advertises the
+// model and that model is currently allowed by the catalog. Caller must hold
+// r.mu and p.mu.
+func (r *Registry) providerServesCatalogModelLocked(p *Provider, model string) bool {
+	for _, m := range p.Models {
+		if m.ID == model && r.modelAllowedByCatalogLocked(m) {
+			return true
+		}
+	}
+	return false
+}
+
 // catalogSizeGBLocked returns the model's reported weight footprint in GB,
 // or 0 when unknown. Caller must hold r.mu (read or write). Zero means the
 // memory-admission gate should not enforce for this model — typically a
@@ -679,6 +958,15 @@ func (r *Registry) CatalogWeightHash(model string) string {
 func (r *Registry) catalogSizeGBLocked(model string) float64 {
 	if e, ok := r.modelCatalog[model]; ok {
 		return e.SizeGB
+	}
+	return 0
+}
+
+// catalogMinRAMGbLocked returns the model's authoritative minimum-RAM
+// requirement (GB) from the catalog, or 0 when unknown. Caller must hold r.mu.
+func (r *Registry) catalogMinRAMGbLocked(model string) int {
+	if e, ok := r.modelCatalog[model]; ok {
+		return e.MinRAMGB
 	}
 	return 0
 }
@@ -707,12 +995,14 @@ func (r *Registry) SetQueue(q *RequestQueue) {
 // tok/s, max Mac Studio RAM is 512 GB) so legitimate future hardware isn't
 // clamped unnecessarily.
 const (
-	maxDecodeTPS          = 500.0
-	maxPrefillTPS         = 5000.0
-	maxMemoryBandwidthGBs = 2000.0
-	maxMemoryGB           = 1024
-	maxMemoryGBFloat      = 1024.0
-	maxTokensPotential    = 1_000_000
+	maxDecodeTPS                    = 500.0
+	maxPrefillTPS                   = 5000.0
+	maxMemoryBandwidthGBs           = 2000.0
+	maxMemoryGB                     = 1024
+	maxMemoryGBFloat                = 1024.0
+	maxReportedMaxConcurrency       = 24
+	maxTokensPotential              = 1_000_000
+	maxTokenBudgetCap         int64 = 10_000_000_000 // 10 billion — generous safety valve for total token budget capacity
 )
 
 // clampNonNeg returns v clamped into [0, max]; NaN/negative become 0.
@@ -769,11 +1059,49 @@ func clampBackendCapacity(logger *slog.Logger, providerID string, bc *protocol.B
 		if s.NumWaiting < 0 {
 			s.NumWaiting = 0
 		}
+		if s.MaxConcurrency < 0 || s.MaxConcurrency > maxReportedMaxConcurrency {
+			logger.Warn("provider slot max_concurrency out of range, clamping",
+				"provider_id", providerID, "model", s.Model, "reported", s.MaxConcurrency)
+			if s.MaxConcurrency < 0 {
+				s.MaxConcurrency = 0
+			} else {
+				s.MaxConcurrency = maxReportedMaxConcurrency
+			}
+		}
+		if v, changed := clampNonNeg(s.ObservedDecodeTPS, maxDecodeTPS); changed {
+			logger.Warn("provider slot observed_decode_tps out of range, clamping",
+				"provider_id", providerID, "model", s.Model, "reported", s.ObservedDecodeTPS, "clamped", v)
+			s.ObservedDecodeTPS = v
+		}
+		if s.ActiveTokenBudgetUsed < 0 || s.ActiveTokenBudgetUsed > maxTokenBudgetCap {
+			if s.ActiveTokenBudgetUsed < 0 {
+				s.ActiveTokenBudgetUsed = 0
+			} else {
+				s.ActiveTokenBudgetUsed = maxTokenBudgetCap
+			}
+		}
+		if s.ActiveTokenBudgetMax < 0 || s.ActiveTokenBudgetMax > maxTokenBudgetCap {
+			if s.ActiveTokenBudgetMax < 0 {
+				s.ActiveTokenBudgetMax = 0
+			} else {
+				s.ActiveTokenBudgetMax = maxTokenBudgetCap
+			}
+		}
+		if s.QueuedTokenBudget < 0 || s.QueuedTokenBudget > maxTokenBudgetCap {
+			if s.QueuedTokenBudget < 0 {
+				s.QueuedTokenBudget = 0
+			} else {
+				s.QueuedTokenBudget = maxTokenBudgetCap
+			}
+		}
 	}
 }
 
 // Register adds a new provider to the registry, returning its assigned ID.
-// If a model catalog is configured, only models in the catalog are kept.
+// Provider-reported model inventory is preserved even when the current catalog
+// denies every model; catalog checks are applied dynamically during routing so
+// providers that connect before a model is promoted become routable immediately
+// after the catalog is updated.
 func (r *Registry) Register(id string, conn *websocket.Conn, msg *protocol.RegisterMessage) *Provider {
 	// Clamp provider-reported performance stats used in routing score.
 	// Refuse to trust unbounded values — a malicious provider reporting
@@ -803,33 +1131,7 @@ func (r *Registry) Register(id string, conn *websocket.Conn, msg *protocol.Regis
 		}
 	}
 
-	// Filter models against the catalog before storing.
 	models := msg.Models
-	r.mu.RLock()
-	catalog := r.modelCatalog
-	r.mu.RUnlock()
-	if len(catalog) > 0 {
-		filtered := make([]protocol.ModelInfo, 0, len(models))
-		for _, m := range models {
-			entry, inCatalog := catalog[m.ID]
-			if !inCatalog {
-				r.logger.Debug("provider model not in catalog, skipping",
-					"provider_id", id, "model", m.ID)
-				continue
-			}
-			// Verify weight hash if the catalog has an expected hash.
-			if entry.WeightHash != "" && m.WeightHash != "" && m.WeightHash != entry.WeightHash {
-				r.logger.Warn("provider model weight hash mismatch, rejecting model",
-					"provider_id", id, "model", m.ID,
-					"expected", TruncHash(entry.WeightHash),
-					"got", TruncHash(m.WeightHash),
-				)
-				continue
-			}
-			filtered = append(filtered, m)
-		}
-		models = filtered
-	}
 
 	// Validate X25519 public key if provided.
 	// Reject invalid keys at registration rather than failing at encryption time.
@@ -852,7 +1154,7 @@ func (r *Registry) Register(id string, conn *websocket.Conn, msg *protocol.Regis
 		Backend:                 msg.Backend,
 		PublicKey:               pubKey,
 		EncryptedResponseChunks: msg.EncryptedResponseChunks,
-		WalletAddress:           msg.WalletAddress,
+		PrivateOnly:             msg.PrivateOnly,
 		PrefillTPS:              msg.PrefillTPS,
 		DecodeTPS:               msg.DecodeTPS,
 		TrustLevel:              TrustNone,
@@ -876,6 +1178,20 @@ func (r *Registry) Register(id string, conn *websocket.Conn, msg *protocol.Regis
 	}
 	r.mu.Unlock()
 
+	// Open a session row for this connection (async; durable uptime history).
+	// serial/account are empty here (set after attestation/linking) and are
+	// backfilled by the throttled TouchProviderSession in persistProviderNow.
+	if r.store != nil {
+		sessionID := p.ID
+		saferun.Go(r.logger, "registry.openSession", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := r.store.OpenProviderSession(ctx, sessionID, "", ""); err != nil {
+				r.logger.Warn("failed to open provider session", "provider_id", sessionID, "error", err)
+			}
+		})
+	}
+
 	r.logger.Info("provider registered",
 		"provider_id", id,
 		"chip", msg.Hardware.ChipName,
@@ -887,7 +1203,7 @@ func (r *Registry) Register(id string, conn *websocket.Conn, msg *protocol.Regis
 	)
 
 	// Persist provider record to store (async).
-	r.persistProvider(p)
+	r.persistProviderNow(p)
 
 	return p
 }
@@ -970,16 +1286,27 @@ func (r *Registry) Heartbeat(id string, msg *protocol.HeartbeatMessage) {
 	p.Stats.TokensGenerated += cumulativeDelta(p.lastSessionStats.TokensGenerated, msg.Stats.TokensGenerated)
 	p.lastSessionStats = msg.Stats
 	p.SystemMetrics = msg.SystemMetrics
-	// Update backend capacity from heartbeat (nil-safe for old providers).
-	if msg.BackendCapacity != nil {
-		p.BackendCapacity = msg.BackendCapacity
+	// Update backend capacity from heartbeat. A nil report clears prior live
+	// capacity so stale slot state cannot keep influencing routing.
+	p.BackendCapacity = msg.BackendCapacity
+	if p.BackendCapacity != nil {
+		chipFamily := p.Hardware.ChipFamily
+		for _, slot := range p.BackendCapacity.Slots {
+			if slot.ObservedDecodeTPS > 0 {
+				r.tpsRegistry.Record(slot.Model, chipFamily, slot.ObservedDecodeTPS)
+			}
+		}
 	}
-	// Update warm models from heartbeat
-	if len(msg.WarmModels) > 0 {
-		p.WarmModels = msg.WarmModels
-	}
+	// Update warm models from heartbeat. Always overwrite -- an empty list
+	// means the provider has no models loaded, and stale entries must be
+	// cleared to prevent TriggerModelSwaps from suppressing needed swaps.
+	p.WarmModels = msg.WarmModels
 	if msg.ActiveModel != nil {
 		p.CurrentModel = *msg.ActiveModel
+	} else {
+		// nil active_model means no model is loaded — clear stale state
+		// so attestation challenges don't compare against an unloaded model.
+		p.CurrentModel = ""
 	}
 	// Only update status from heartbeat if provider is not actively serving
 	// (serving status is managed by request lifecycle). Crucially, an
@@ -998,12 +1325,414 @@ func (r *Registry) Heartbeat(id string, msg *protocol.HeartbeatMessage) {
 	}
 	p.mu.Unlock()
 
-	r.PersistProvider(p)
+	r.PersistProviderThrottled(p)
 
 	// Heartbeats can make a recovered slot routable again (for example after a
 	// crash auto-restart). Drain matching queues using the canonical scheduler
 	// rather than the legacy direct queue assignment path.
 	r.drainQueuedRequestsForModels(providerModelIDs(p))
+
+	// If queue drain didn't satisfy all pending requests (no warm provider),
+	// check if a cold provider should swap models to serve queued demand.
+	r.TriggerModelSwaps()
+}
+
+// SendLoadModel instructs a provider to eagerly load a model so it becomes
+// warm for incoming requests. The provider will autonomously evict idle
+// models to make room. This is a fire-and-forget call — the coordinator
+// does not block waiting for the load to complete. The provider replies
+// asynchronously with a load_model_status message.
+func (r *Registry) SendLoadModel(providerID, modelID string) error {
+	r.mu.RLock()
+	p, ok := r.providers[providerID]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("provider %q not found", providerID)
+	}
+
+	msg := protocol.LoadModelMessage{
+		Type:    protocol.TypeLoadModel,
+		ModelID: modelID,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal load_model message: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	p.mu.Lock()
+	conn := p.Conn
+	p.mu.Unlock()
+
+	if conn == nil {
+		return fmt.Errorf("provider %q has no active connection", providerID)
+	}
+
+	if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
+		return fmt.Errorf("failed to send load_model to provider %q: %w", providerID, err)
+	}
+
+	r.logger.Info("sent load_model to provider",
+		"provider_id", providerID,
+		"model_id", modelID,
+	)
+	return nil
+}
+
+// TriggerModelSwaps checks for queued requests that have no warm provider
+// and sends load_model to cold providers that have the model available on
+// disk. This enables demand-driven model swapping: when requests queue for
+// a model that no provider has warm, the coordinator proactively triggers
+// a swap on an idle provider.
+//
+// Called after heartbeat processing and queue drain to catch demand that
+// can't be satisfied by warm providers alone.
+func (r *Registry) TriggerModelSwaps() {
+	if r.queue == nil {
+		return
+	}
+
+	queuedModels := r.queue.QueuedModels()
+	if len(queuedModels) == 0 {
+		return
+	}
+
+	now := time.Now()
+	r.expirePendingModelLoads(now)
+
+	actions := r.planModelLoadActions(queuedModels, now)
+	actions = r.reservePendingModelLoads(actions, now)
+	r.sendModelLoadActions(actions)
+}
+
+func (r *Registry) expirePendingModelLoads(now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, sentAt := range r.pendingModelLoads {
+		if now.Sub(sentAt) > pendingModelLoadTTL {
+			delete(r.pendingModelLoads, key)
+		}
+	}
+}
+
+func (r *Registry) planModelLoadActions(queuedModels []string, now time.Time) []modelLoadAction {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	selectedProviders := make(map[string]struct{})
+	actions := make([]modelLoadAction, 0, len(queuedModels))
+	for _, model := range queuedModels {
+		if r.hasWarmProviderLocked(model, now) {
+			continue
+		}
+
+		providerID := r.bestModelLoadProviderLocked(model, now, selectedProviders)
+		if providerID == "" {
+			continue
+		}
+		selectedProviders[providerID] = struct{}{}
+		actions = append(actions, modelLoadAction{providerID: providerID, modelID: model})
+	}
+	return actions
+}
+
+// hasWarmProviderLocked reports whether a connected provider already has the
+// model warm. Caller must hold r.mu (read or write).
+func (r *Registry) hasWarmProviderLocked(model string, now time.Time) bool {
+	for _, p := range r.providers {
+		p.mu.Lock()
+		warm := r.providerHasWarmModelLocked(p, model, now)
+		p.mu.Unlock()
+		if warm {
+			return true
+		}
+	}
+	return false
+}
+
+// providerHasWarmModelLocked checks whether the provider has the model warm
+// AND passes the same routing safety gates used by the scheduler. A provider
+// with stale attestation or failed privacy checks should not suppress swap
+// planning. Caller must hold p.mu. Caller must hold r.mu (read or write).
+func (r *Registry) providerHasWarmModelLocked(p *Provider, model string, now time.Time) bool {
+	if p.Status == StatusOffline || p.Status == StatusUntrusted {
+		return false
+	}
+	// Private-only providers serve only their owner's self-route traffic, never
+	// the public fleet. They must not suppress public swap planning: otherwise a
+	// private-only machine that happens to hold a queued public model warm makes
+	// the planner believe the model is already served and skip load_model to an
+	// eligible public node, stranding public requests until queue timeout.
+	if p.PrivateOnly {
+		return false
+	}
+	if trustRank(p.TrustLevel) < trustRank(r.MinTrustLevel) {
+		return false
+	}
+	if !p.RuntimeVerified {
+		return false
+	}
+	if !providerSupportsPrivateTextLocked(p) {
+		return false
+	}
+	if p.LastChallengeVerified.IsZero() || now.Sub(p.LastChallengeVerified) > challengeFreshnessMaxAge {
+		return false
+	}
+	if !r.providerServesCatalogModelLocked(p, model) {
+		return false
+	}
+	if p.BackendCapacity != nil {
+		for _, slot := range p.BackendCapacity.Slots {
+			if slot.Model == model {
+				// BackendCapacity is authoritative when present.
+				// Only "running" and "idle" mean the model is warm.
+				return slot.State == "running" || slot.State == "idle"
+			}
+		}
+		// Model has no slot in BackendCapacity -- it's not loaded.
+		return false
+	}
+	// Legacy provider without BackendCapacity: fall back to WarmModels.
+	for _, warmModel := range p.WarmModels {
+		if warmModel == model {
+			return true
+		}
+	}
+	return false
+}
+
+// bestModelLoadProviderLocked selects the eligible provider with the fewest
+// pending requests. Caller must hold r.mu (read or write).
+func (r *Registry) bestModelLoadProviderLocked(model string, now time.Time, selectedProviders map[string]struct{}) string {
+	bestProviderID := ""
+	for id, p := range r.providers {
+		if _, selected := selectedProviders[id]; selected {
+			continue
+		}
+		// Skip providers that have any pending model load -- sending a
+		// second load_model while the first is in progress can cause
+		// swap oscillation on single-slot providers.
+		if r.providerHasPendingLoad(id) {
+			continue
+		}
+
+		pendingCount, ok := r.modelLoadCandidatePendingLocked(p, model, now)
+		if !ok {
+			continue
+		}
+		// Only consider idle providers (no in-flight requests). Sending
+		// load_model to a provider that is actively serving another model
+		// will fail because the active slot cannot be evicted.
+		if pendingCount == 0 {
+			bestProviderID = id
+			break
+		}
+	}
+	return bestProviderID
+}
+
+// modelLoadCandidatePendingLocked applies the same routing safety gates used by
+// the scheduler, then returns the provider's current pending request count.
+// Caller must hold r.mu (read or write).
+func (r *Registry) modelLoadCandidatePendingLocked(p *Provider, model string, now time.Time) (int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.Status == StatusOffline || p.Status == StatusUntrusted {
+		return 0, false
+	}
+	// Private-only providers never serve public traffic, so never pick one as a
+	// public load_model target (mirrors the public-routing exclusion).
+	if p.PrivateOnly {
+		return 0, false
+	}
+	if trustRank(p.TrustLevel) < trustRank(r.MinTrustLevel) {
+		return 0, false
+	}
+	if !p.RuntimeVerified {
+		return 0, false
+	}
+	if !providerSupportsPrivateTextLocked(p) {
+		return 0, false
+	}
+	if p.LastChallengeVerified.IsZero() || now.Sub(p.LastChallengeVerified) > challengeFreshnessMaxAge {
+		return 0, false
+	}
+	if !r.providerServesCatalogModelLocked(p, model) {
+		return 0, false
+	}
+
+	// Memory gate: reject providers that cannot run the model per the catalog's
+	// authoritative min_ram_gb (falling back to the weight heuristic only when
+	// unknown). Shares modelFitsHardware with the consumer-routing admission
+	// gate so the two can never drift. This prevents the coordinator from
+	// sending load_model commands to machines that clearly cannot fit it, while
+	// trusting the operator-published requirement rather than a synthetic
+	// multiple that would exclude catalog-qualified nodes.
+	if entry, ok := r.modelCatalog[model]; ok && (entry.MinRAMGB > 0 || entry.SizeGB > 0) {
+		if !modelFitsHardware(entry.MinRAMGB, entry.SizeGB, float64(p.Hardware.MemoryGB)) {
+			return 0, false
+		}
+	}
+
+	return p.pendingCount(), true
+}
+
+func (r *Registry) reservePendingModelLoads(actions []modelLoadAction, now time.Time) []modelLoadAction {
+	if len(actions) == 0 {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pendingModelLoads == nil {
+		r.pendingModelLoads = make(map[string]time.Time)
+	}
+
+	reserved := actions[:0]
+	for _, action := range actions {
+		// Check per-provider (not just per-key) to prevent concurrent
+		// heartbeat goroutines from reserving the same idle provider
+		// for different models.
+		if r.providerHasPendingLoad(action.providerID) {
+			continue
+		}
+		r.pendingModelLoads[modelLoadKey(action.providerID, action.modelID)] = now
+		reserved = append(reserved, action)
+	}
+	return reserved
+}
+
+func (r *Registry) sendModelLoadActions(actions []modelLoadAction) {
+	for _, action := range actions {
+		if err := r.SendLoadModel(action.providerID, action.modelID); err != nil {
+			r.logger.Warn("failed to trigger model swap",
+				"provider_id", action.providerID,
+				"model_id", action.modelID,
+				"error", err,
+			)
+			r.ClearPendingModelLoad(action.providerID, action.modelID)
+		}
+	}
+}
+
+func modelLoadKey(providerID, modelID string) string {
+	return providerID + ":" + modelID
+}
+
+// providerHasPendingLoad reports whether the provider has any pending
+// load_model command. Caller must hold r.mu (read or write).
+func (r *Registry) providerHasPendingLoad(providerID string) bool {
+	prefix := providerID + ":"
+	for key := range r.pendingModelLoads {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return false
+}
+
+// MarkModelWarm adds a model to the provider's WarmModels list if not already
+// present. Called when load_model_status:succeeded arrives before the next
+// heartbeat, so the scheduler sees the provider as warm during queue drain.
+func (r *Registry) MarkModelWarm(providerID, modelID string) {
+	r.mu.RLock()
+	p, ok := r.providers[providerID]
+	r.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, wm := range p.WarmModels {
+		if wm == modelID {
+			return // already warm
+		}
+	}
+	p.WarmModels = append(p.WarmModels, modelID)
+	p.CurrentModel = modelID
+
+	// Inject a synthetic "idle" slot into BackendCapacity so the scheduler
+	// sees the model as warm. Without this, the scheduler only checks
+	// BackendCapacity.Slots (not WarmModels) for Swift providers, and a
+	// stale snapshot without the new model's slot would treat it as cold
+	// until the next heartbeat arrives.
+	//
+	// We only add/update the new model's slot and leave existing slots
+	// untouched — the provider may have multiple model slots loaded
+	// simultaneously (maxModelSlots defaults to 3). The next heartbeat
+	// will provide the authoritative slot list.
+	if p.BackendCapacity != nil {
+		found := false
+		for i, slot := range p.BackendCapacity.Slots {
+			if slot.Model == modelID {
+				p.BackendCapacity.Slots[i].State = "idle"
+				found = true
+				break
+			}
+		}
+		if !found {
+			p.BackendCapacity.Slots = append(p.BackendCapacity.Slots, protocol.BackendSlotCapacity{
+				Model: modelID,
+				State: "idle",
+			})
+		}
+	}
+}
+
+// ClearPendingModelLoad removes a pending model load entry after a terminal
+// load_model_status response.
+func (r *Registry) ClearPendingModelLoad(providerID, modelID string) {
+	r.mu.Lock()
+	delete(r.pendingModelLoads, modelLoadKey(providerID, modelID))
+	r.mu.Unlock()
+}
+
+// RejectUnservableQueuedRequests checks whether any eligible provider can
+// serve the given model. If not, all queued requests for the model are
+// rejected immediately rather than waiting for the 120s queue timeout.
+// Called after a load_model failure to give consumers a fast error.
+func (r *Registry) RejectUnservableQueuedRequests(modelID string) {
+	if r.queue == nil {
+		return
+	}
+	if r.queue.QueueSize(modelID) == 0 {
+		return
+	}
+
+	// Check if any provider can still serve this model. Only reject when
+	// NO provider serves the model at all. If providers exist but are
+	// temporarily at capacity (capacityRejections > 0), the requests
+	// should wait — those providers may finish current work and become
+	// available.
+	// modelTooLarge is intentionally ignored here: a model that can never fit
+	// any provider should NOT keep its queued requests waiting (they'd time out
+	// after 120s) — fall through to fail them fast.
+	candidates, capacityRejections, _ := r.QuickCapacityCheck(modelID, 500, defaultRequestedMaxTokens)
+	if candidates > 0 || capacityRejections > 0 {
+		return
+	}
+
+	// Prefer waiters are preserved only when their owner actually has an owned
+	// provider serving this model (it may free up). A prefer waiter with no
+	// owned provider is just waiting on the (now-unservable) public fleet, so it
+	// should fail fast like any public request. Compute eligibility here —
+	// OUTSIDE the queue lock — since OwnedProviderSummary takes the registry lock.
+	preferOwnerEligible := make(map[string]bool)
+	for _, owner := range r.queue.PreferWaiterOwners(modelID) {
+		_, servesModel := r.OwnedProviderSummary(owner, modelID)
+		preferOwnerEligible[owner] = servesModel > 0
+	}
+
+	failed := r.queue.FailQueuedRequestsForModel(modelID, preferOwnerEligible)
+	if failed > 0 {
+		r.logger.Warn("rejected queued requests for unservable model",
+			"model_id", modelID,
+			"rejected", failed,
+		)
+	}
 }
 
 func cumulativeDelta(previous, current int64) int64 {
@@ -1023,6 +1752,12 @@ func (r *Registry) Disconnect(id string) {
 	p, ok := r.providers[id]
 	if ok {
 		delete(r.providers, id)
+		// Clear any pending model load entries for this provider.
+		for key := range r.pendingModelLoads {
+			if len(key) > len(id)+1 && key[:len(id)+1] == id+":" {
+				delete(r.pendingModelLoads, key)
+			}
+		}
 		p.mu.Lock()
 		if p.Status != StatusUntrusted {
 			r.onlineCount.Add(-1)
@@ -1054,6 +1789,18 @@ func (r *Registry) Disconnect(id string) {
 	p.pendingReqs = make(map[string]*PendingRequest)
 	p.mu.Unlock()
 
+	// Close this connection's session row (async; durable uptime history).
+	// Covers both graceful disconnects and evictStale (which calls Disconnect).
+	if r.store != nil {
+		saferun.Go(r.logger, "registry.closeSession", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := r.store.CloseProviderSession(ctx, id, "disconnect", time.Now()); err != nil {
+				r.logger.Warn("failed to close provider session", "provider_id", id, "error", err)
+			}
+		})
+	}
+
 	r.logger.Info("provider disconnected", "provider_id", id)
 }
 
@@ -1064,10 +1811,41 @@ func (r *Registry) GetProvider(id string) *Provider {
 	return r.providers[id]
 }
 
-// MarkUntrusted sets a provider's status to untrusted, preventing it from
-// receiving new jobs. This is called when a provider fails too many
-// challenge-response verifications.
+// MarkUntrusted sets a provider's status to untrusted for a hard/security
+// reason (bad encrypted chunk, MDM/MDA failure, SIP disabled, binary or model
+// hash mismatch, serial impersonation, attestation failure). The deroute is
+// non-recoverable: the provider stays untrusted until it reconnects and
+// re-registers. This is the default for every direct deroute call site.
 func (r *Registry) MarkUntrusted(providerID string) {
+	r.markUntrusted(providerID, false)
+}
+
+// MarkUntrustedTransient sets a provider's status to untrusted for a *transient*
+// reason — MaxFailedChallenges consecutive missed-challenge timeouts (screen
+// sleep, network blip, momentary Secure Enclave inaccessibility). Unlike
+// MarkUntrusted, the provider remains eligible to self-recover: the challenge
+// loop keeps challenging it (see ChallengeShouldStop), and a subsequent fully
+// passing challenge (RecordChallengeSuccess) restores it to online.
+//
+// A passing challenge re-verifies signature, SIP, secure boot, binary hash,
+// model hash and runtime before RecordChallengeSuccess is reached, so using it
+// as the recovery trigger is safe.
+func (r *Registry) MarkUntrustedTransient(providerID string) {
+	r.markUntrusted(providerID, true)
+}
+
+// markUntrusted is the shared implementation. recoverable=true marks the untrust
+// as transiently recoverable; recoverable=false is a hard deroute.
+//
+// Transition rules:
+//   - not untrusted -> untrusted: decrement online/model counts, set status and
+//     the recoverable flag.
+//   - already untrusted + hard (recoverable=false): clear the flag. A hard
+//     reason always overrides/downgrades a previously-recoverable untrust.
+//   - already untrusted + transient (recoverable=true): leave the flag as-is, so
+//     a transient timeout can never *upgrade* a hard deroute to recoverable
+//     (matters for an in-flight challenge timeout that races a hard deroute).
+func (r *Registry) markUntrusted(providerID string, recoverable bool) {
 	r.mu.Lock()
 	p, ok := r.providers[providerID]
 	if !ok {
@@ -1081,48 +1859,19 @@ func (r *Registry) MarkUntrusted(providerID string) {
 		for _, m := range p.Models {
 			r.modelProviderDec(m.ID)
 		}
+		p.Status = StatusUntrusted
+		p.untrustedRecoverable = recoverable
+	} else if !recoverable {
+		p.untrustedRecoverable = false
 	}
-	p.Status = StatusUntrusted
+	failed := p.FailedChallenges // read under p.mu (the old code read this unlocked)
 	p.mu.Unlock()
 	r.mu.Unlock()
 
 	r.logger.Warn("provider marked as untrusted",
 		"provider_id", providerID,
-		"failed_challenges", p.FailedChallenges,
-	)
-}
-
-func (r *Registry) ForceTrustProvider(providerID string) {
-	r.mu.RLock()
-	p, ok := r.providers[providerID]
-	r.mu.RUnlock()
-	if !ok {
-		return
-	}
-
-	p.mu.Lock()
-	p.Status = StatusOnline
-	p.TrustLevel = TrustSelfSigned
-	p.ChallengeVerifiedSIP = true
-	p.LastChallengeVerified = time.Now()
-	p.FailedChallenges = 0
-	p.RuntimeVerified = true
-	p.RuntimeManifestChecked = true
-	if p.PrivacyCapabilities == nil {
-		p.PrivacyCapabilities = &protocol.PrivacyCapabilities{}
-	}
-	p.PrivacyCapabilities.TextBackendInprocess = true
-	p.PrivacyCapabilities.TextProxyDisabled = true
-	p.PrivacyCapabilities.PythonRuntimeLocked = true
-	p.PrivacyCapabilities.DangerousModulesBlocked = true
-	p.PrivacyCapabilities.AntiDebugEnabled = true
-	p.PrivacyCapabilities.CoreDumpsDisabled = true
-	p.PrivacyCapabilities.EnvScrubbed = true
-	p.mu.Unlock()
-
-	r.drainQueuedRequestsForModels(providerModelIDs(p))
-	r.logger.Info("provider force-trusted for testing",
-		"provider_id", providerID,
+		"failed_challenges", failed,
+		"recoverable", recoverable,
 	)
 }
 
@@ -1139,17 +1888,28 @@ func (r *Registry) SetTrustLevel(providerID string, level TrustLevel) {
 	p.mu.Unlock()
 
 	// Persist trust state.
-	r.persistProvider(p)
+	r.persistProviderNow(p)
 }
 
 // RecordChallengeSuccess records a successful challenge-response verification.
-func (r *Registry) RecordChallengeSuccess(providerID string) {
+// A fully passing challenge re-verifies signature, SIP, secure boot, binary
+// hash, model hash and runtime (see verifyChallengeResponse) before this is
+// called, so it doubles as the recovery trigger for a *transiently* untrusted
+// provider.
+//
+// Returns true iff this call recovered a transiently-untrusted provider back to
+// online. The caller (verifyChallengeResponse) uses that to push a fresh
+// "online" trust_status so the provider clears its local untrusted state and
+// cancels the pending diagnostic auto-report it scheduled at deroute time.
+func (r *Registry) RecordChallengeSuccess(providerID string) bool {
 	r.mu.RLock()
 	p, ok := r.providers[providerID]
 	r.mu.RUnlock()
 	if !ok {
-		return
+		return false
 	}
+
+	recovered := r.recoverIfTransientlyUntrusted(providerID, p)
 
 	p.mu.Lock()
 	p.LastChallengeVerified = time.Now()
@@ -1161,16 +1921,77 @@ func (r *Registry) RecordChallengeSuccess(providerID string) {
 	p.mu.Unlock()
 
 	// Persist challenge state and reputation.
-	r.persistProvider(p)
+	r.persistProviderNow(p)
 	r.persistReputation(p)
 
-	// A newly verified provider may unlock queued requests for any model it serves.
+	if recovered {
+		r.logger.Info("provider recovered from transient deroute", "provider_id", providerID)
+	}
+
+	// A newly verified (or newly recovered) provider may unlock queued requests
+	// for any model it serves.
 	r.drainQueuedRequestsForModels(providerModelIDs(p))
+
+	return recovered
+}
+
+// recoverIfTransientlyUntrusted promotes a transiently-untrusted provider back
+// to online, mirroring markUntrusted's bookkeeping in reverse. Returns true iff
+// a transition occurred. It acquires r.mu (write) then p.mu — the same order as
+// markUntrusted/Register/Disconnect — so online/model counts stay consistent and
+// the path is deadlock-free.
+func (r *Registry) recoverIfTransientlyUntrusted(providerID string, p *Provider) bool {
+	// Cheap pre-check under p.mu only, so the common (non-recovery) success path
+	// never contends on the registry write lock.
+	p.mu.Lock()
+	eligible := p.Status == StatusUntrusted && p.untrustedRecoverable
+	p.mu.Unlock()
+	if !eligible {
+		return false
+	}
+
+	r.mu.Lock()
+	// Re-verify membership: RecordChallengeSuccess looked p up under RLock and
+	// released it, so Disconnect may have removed (or replaced) it since. A
+	// transiently-untrusted provider was already decremented out of the counts,
+	// and Disconnect does not decrement an untrusted provider, so incrementing a
+	// stale/removed pointer here would permanently corrupt onlineCount and
+	// modelProviders. Only recover the provider still registered under this ID.
+	if cur, ok := r.providers[providerID]; !ok || cur != p {
+		r.mu.Unlock()
+		return false
+	}
+	p.mu.Lock()
+	// Re-check under the write lock: a hard deroute may have intervened and
+	// cleared the recoverable flag between the pre-check and here.
+	if p.Status != StatusUntrusted || !p.untrustedRecoverable {
+		p.mu.Unlock()
+		r.mu.Unlock()
+		return false
+	}
+	r.onlineCount.Add(1)
+	for _, m := range p.Models {
+		r.modelProviderInc(m.ID)
+	}
+	p.Status = StatusOnline
+	p.untrustedRecoverable = false
+	p.mu.Unlock()
+	r.mu.Unlock()
+	return true
 }
 
 // RecordChallengeFailure records a failed challenge-response. Returns the
 // new consecutive failure count.
-func (r *Registry) RecordChallengeFailure(providerID string) int {
+//
+// When transientOnly is true (timeout — the provider didn't respond in time),
+// routing eligibility is preserved until MaxFailedChallenges consecutive
+// failures. A single transient timeout should not instantly deroute a provider
+// that was verified seconds ago.
+//
+// When transientOnly is false (security failure — wrong signature, SIP
+// disabled, binary hash mismatch, etc.), routing eligibility is cleared
+// immediately because the provider actively failed a security check.
+func (r *Registry) RecordChallengeFailure(providerID string, transientOnly bool) int {
 	r.mu.RLock()
 	p, ok := r.providers[providerID]
 	r.mu.RUnlock()
@@ -1180,16 +2001,22 @@ func (r *Registry) RecordChallengeFailure(providerID string) int {
 
 	p.mu.Lock()
 	p.FailedChallenges++
-	// Any failed or missing challenge result invalidates the previous
-	// coordinator-verified security posture until the provider proves it again.
-	p.LastChallengeVerified = time.Time{}
-	p.ChallengeVerifiedSIP = false
 	p.Reputation.RecordChallengeFail()
 	count := p.FailedChallenges
+
+	if !transientOnly {
+		// Security failure — clear routing eligibility immediately.
+		p.LastChallengeVerified = time.Time{}
+		p.ChallengeVerifiedSIP = false
+	} else if count >= MaxFailedChallenges {
+		// Transient failures only clear after hitting the threshold.
+		p.LastChallengeVerified = time.Time{}
+		p.ChallengeVerifiedSIP = false
+	}
 	p.mu.Unlock()
 
 	// Persist challenge state and reputation.
-	r.persistProvider(p)
+	r.persistProviderNow(p)
 	r.persistReputation(p)
 
 	return count
@@ -1232,10 +2059,11 @@ func ScoreProvider(p *Provider, model string) float64 {
 	}
 
 	// Load: gradient from 0.0 (idle) to 1.0 (at max concurrency).
-	// Uses dynamic max based on hardware when backend capacity is reported.
-	pending := float64(p.PendingCount())
+	// Uses a positive provider-reported slot cap when present, otherwise the
+	// legacy provider-level dynamic max.
 	p.mu.Lock()
-	maxConc := p.maxConcurrency()
+	maxConc := p.maxConcurrencyForModelLocked(model)
+	pending := float64(p.pendingLoadForModelLocked(model))
 	p.mu.Unlock()
 	load := pending / float64(maxConc)
 	if load > 1.0 {
@@ -1417,14 +2245,14 @@ func (r *Registry) FindProviderWithTrust(model string, minTrust TrustLevel, excl
 		if lastChallenge.IsZero() || now.Sub(lastChallenge) > challengeMaxAge {
 			continue
 		}
-		if p.PendingCount() >= p.MaxConcurrency() {
+		p.mu.Lock()
+		hasHeadroom := p.hasConcurrencyHeadroomForModelLocked(model)
+		p.mu.Unlock()
+		if !hasHeadroom {
 			continue
 		}
-		for _, m := range p.Models {
-			if m.ID == model {
-				candidates = append(candidates, p)
-				break
-			}
+		if r.providerServesCatalogModelLocked(p, model) {
+			candidates = append(candidates, p)
 		}
 	}
 
@@ -1533,15 +2361,24 @@ func (r *Registry) ListModels() []AggregateModel {
 		attested := p.Attested
 		attestResult := p.AttestationResult
 		privateReady := providerSupportsPrivateTextLocked(p)
+		privateOnly := p.PrivateOnly
 		p.mu.Unlock()
 
 		if status == StatusOffline || status == StatusUntrusted {
+			continue
+		}
+		// Private-only providers serve only their owner's self-route traffic, so
+		// they must not appear in or inflate the public /v1/models aggregation.
+		if privateOnly {
 			continue
 		}
 		if !r.trustMeetsMinimum(trust) || !privateReady {
 			continue
 		}
 		for _, m := range p.Models {
+			if !r.modelAllowedByCatalogLocked(m) {
+				continue
+			}
 			k := m.ID
 			a, ok := agg[k]
 			if !ok {
@@ -1589,6 +2426,59 @@ func (r *Registry) ListModels() []AggregateModel {
 	}
 
 	return models
+}
+
+// ModelCountryCodes returns the sorted, de-duplicated ISO 3166-1 alpha-2
+// country codes of online providers serving the given model. Used to populate
+// the OpenRouter "datacenters" field. Only routing-eligible providers count —
+// the same gates as ListModels (online, meets the minimum trust level, and
+// private-text ready) — so a country whose providers can't actually serve the
+// model is not advertised. Providers without a known location are skipped.
+func (r *Registry) ModelCountryCodes(modelID string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	for _, p := range r.providers {
+		p.mu.Lock()
+		status := p.Status
+		trust := p.TrustLevel
+		privateReady := providerSupportsPrivateTextLocked(p)
+		var cc string
+		if p.Location != nil {
+			cc = strings.ToUpper(strings.TrimSpace(p.Location.CountryCode))
+		}
+		serves := false
+		if cc != "" {
+			for i := range p.Models {
+				if p.Models[i].ID == modelID {
+					serves = true
+					break
+				}
+			}
+		}
+		p.mu.Unlock()
+		if !serves {
+			continue
+		}
+		// Apply the same routing-eligibility gates as ListModels.
+		if status == StatusOffline || status == StatusUntrusted {
+			continue
+		}
+		if !r.trustMeetsMinimum(trust) || !privateReady {
+			continue
+		}
+		seen[cc] = true
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for c := range seen {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // trustRank returns a numeric rank for trust levels (higher = more trusted).
@@ -1688,37 +2578,6 @@ func (r *Registry) ModelProviderSnapshot() map[string]int64 {
 	return snap
 }
 
-// ProviderCountByChip returns a map of chip_name -> count of online providers.
-func (r *Registry) ProviderCountByChip() map[string]int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	counts := make(map[string]int)
-	for _, p := range r.providers {
-		p.mu.Lock()
-		online := p.Status != StatusOffline && p.Status != StatusUntrusted
-		p.mu.Unlock()
-		if online {
-			chip := p.Hardware.ChipName
-			if chip == "" {
-				chip = "unknown"
-			}
-			counts[chip]++
-		}
-	}
-	return counts
-}
-
-// ModelProviderCounts returns a map of model_id -> count of online providers
-// serving that model.
-func (r *Registry) ModelProviderCounts() map[string]int {
-	snap := r.ModelProviderSnapshot()
-	out := make(map[string]int, len(snap))
-	for k, v := range snap {
-		out[k] = int(v)
-	}
-	return out
-}
-
 func (r *Registry) ProviderCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -1781,6 +2640,246 @@ func (r *Registry) Snapshot() FleetSnapshot {
 		Idle:       idle,
 		QueueDepth: q,
 	}
+}
+
+// ModelCapacity describes the live capacity for a single model.
+type ModelCapacity struct {
+	ModelID              string  `json:"id"`
+	Ready                bool    `json:"ready"`                  // at least one routable provider with headroom
+	CanAccept            bool    `json:"can_accept"`             // ready AND queue not full
+	RoutableProviders    int     `json:"routable_providers"`     // passed all gates
+	WarmProviders        int     `json:"warm_providers"`         // model loaded (slot state "running")
+	ColdProviders        int     `json:"cold_providers"`         // model available but not loaded
+	ActiveRequests       int     `json:"active_requests"`        // in-flight across fleet
+	QueuedRequests       int     `json:"queued_requests"`        // waiting in coordinator queue
+	QueueLimit           int     `json:"queue_limit"`            // max queue depth per model
+	AggregateTPS         float64 `json:"aggregate_tps"`          // sum of effective decode TPS
+	EstimatedTTFTMs      int64   `json:"estimated_ttft_ms"`      // best-case TTFT from lowest-cost warm provider
+	TokenBudgetRemaining int64   `json:"token_budget_remaining"` // aggregate free budget across providers
+	TokenBudgetTotal     int64   `json:"token_budget_total"`     // aggregate total budget
+}
+
+// providerCapSnap is a per-provider snapshot collected under the registry
+// lock, then aggregated into ModelCapacity outside the lock.
+type providerCapSnap struct {
+	model                 string
+	warm                  bool
+	hasHeadroom           bool // pending < maxConcurrency
+	effectiveTPS          float64
+	prefillTPS            float64
+	activeRequests        int // numRunning + numWaiting from backend slot, or pendingCount
+	backlogTokens         float64
+	activeTokenBudgetMax  int64
+	activeTokenBudgetUsed int64
+	queuedTokenBudget     int64
+}
+
+// ModelCapacitySnapshot returns a capacity snapshot for every model served
+// by at least one provider. Providers must pass the same routing gates as
+// snapshotProviderLocked (status, trust, runtime, privacy, challenge
+// freshness, concurrency headroom) to be counted as routable.
+func (r *Registry) ModelCapacitySnapshot() []ModelCapacity {
+	now := time.Now()
+
+	// Phase 1: collect per-provider snapshots under the lock.
+	var snaps []providerCapSnap
+
+	r.mu.RLock()
+	for _, p := range r.providers {
+		p.mu.Lock()
+
+		// Apply the same gates as snapshotProviderLocked. Private-only machines
+		// never serve the public fleet, so they do not count toward public
+		// model capacity.
+		if p.Status == StatusOffline || p.Status == StatusUntrusted {
+			p.mu.Unlock()
+			continue
+		}
+		if p.PrivateOnly {
+			p.mu.Unlock()
+			continue
+		}
+		if trustRank(p.TrustLevel) < trustRank(r.MinTrustLevel) {
+			p.mu.Unlock()
+			continue
+		}
+		if !p.RuntimeVerified {
+			p.mu.Unlock()
+			continue
+		}
+		if !providerSupportsPrivateTextLocked(p) {
+			p.mu.Unlock()
+			continue
+		}
+		if p.LastChallengeVerified.IsZero() || now.Sub(p.LastChallengeVerified) > challengeFreshnessMaxAge {
+			p.mu.Unlock()
+			continue
+		}
+
+		decodeTPS := resolvedDecodeTPS(p)
+		prefillTPS := resolvedPrefillTPS(p)
+
+		// Enumerate every model this provider serves.
+		for _, m := range p.Models {
+			if !r.modelAllowedByCatalogLocked(m) {
+				continue
+			}
+			hasHeadroom := p.hasConcurrencyHeadroomForModelLocked(m.ID)
+			// Count only pending requests for this specific model, not the
+			// total across all models. Using the total inflates
+			// activeRequests for multi-model providers.
+			modelPending := 0
+			for _, pr := range p.pendingReqs {
+				if pr.Model == m.ID {
+					modelPending++
+				}
+			}
+
+			snap := providerCapSnap{
+				model:          m.ID,
+				hasHeadroom:    hasHeadroom,
+				effectiveTPS:   decodeTPS,
+				prefillTPS:     prefillTPS,
+				activeRequests: modelPending,
+			}
+
+			// Check backend capacity for this model's slot.
+			if p.BackendCapacity != nil {
+				for _, slot := range p.BackendCapacity.Slots {
+					if slot.Model != m.ID {
+						continue
+					}
+					snap.warm = slot.State == "running"
+					slotActive := int(slot.NumRunning) + int(slot.NumWaiting)
+					if slotActive > snap.activeRequests {
+						snap.activeRequests = slotActive
+					}
+					if slot.ObservedDecodeTPS > 0 {
+						snap.effectiveTPS = slot.ObservedDecodeTPS
+					}
+					snap.activeTokenBudgetMax = slot.ActiveTokenBudgetMax
+					snap.activeTokenBudgetUsed = slot.ActiveTokenBudgetUsed
+					snap.queuedTokenBudget = slot.QueuedTokenBudget
+					snap.backlogTokens = float64(slot.MaxTokensPotential)
+					break
+				}
+			} else {
+				// Without backend capacity, warm if currently serving this model.
+				snap.warm = p.CurrentModel == m.ID
+			}
+
+			snaps = append(snaps, snap)
+		}
+		p.mu.Unlock()
+	}
+	r.mu.RUnlock()
+
+	// Phase 2: aggregate per-model outside the lock.
+	type modelAgg struct {
+		routable         int
+		warm             int
+		cold             int
+		activeRequests   int
+		aggregateTPS     float64
+		budgetRemaining  int64
+		budgetTotal      int64
+		bestWarmTTFTMs   int64 // -1 = not set
+		bestColdTTFTMs   int64 // -1 = not set
+		anyImmediateSlot bool  // at least one provider with headroom
+	}
+	agg := make(map[string]*modelAgg)
+	for _, s := range snaps {
+		a, ok := agg[s.model]
+		if !ok {
+			a = &modelAgg{bestWarmTTFTMs: -1, bestColdTTFTMs: -1}
+			agg[s.model] = a
+		}
+		if s.warm {
+			a.warm++
+		} else {
+			a.cold++
+		}
+		a.activeRequests += s.activeRequests
+		a.aggregateTPS += s.effectiveTPS
+		if s.activeTokenBudgetMax > 0 {
+			headroom := s.activeTokenBudgetMax - s.activeTokenBudgetUsed - s.queuedTokenBudget
+			if headroom < 0 {
+				headroom = 0
+			}
+			a.budgetRemaining += headroom
+			a.budgetTotal += s.activeTokenBudgetMax
+		}
+		// Routable providers require both concurrency headroom AND token-budget
+		// headroom. A provider with exhausted token budget should not make the
+		// model appear immediately ready.
+		hasBudgetHeadroom := s.activeTokenBudgetMax <= 0 ||
+			s.activeTokenBudgetUsed+s.queuedTokenBudget < s.activeTokenBudgetMax
+		if s.hasHeadroom && hasBudgetHeadroom {
+			a.routable++
+			a.anyImmediateSlot = true
+		}
+
+		// Estimate TTFT for this provider: prefill 500 tokens + backlog drain.
+		const defaultPromptTokens = 500
+		ttftMs := int64(0)
+		if s.prefillTPS > 0 {
+			ttftMs = int64(float64(defaultPromptTokens) / s.prefillTPS * 1000)
+		}
+		if s.effectiveTPS > 0 {
+			ttftMs += int64(s.backlogTokens / s.effectiveTPS * 1000)
+		}
+		if s.warm {
+			if a.bestWarmTTFTMs < 0 || ttftMs < a.bestWarmTTFTMs {
+				a.bestWarmTTFTMs = ttftMs
+			}
+		} else {
+			coldTTFT := ttftMs + 20_000 // 20s cold-start penalty
+			if a.bestColdTTFTMs < 0 || coldTTFT < a.bestColdTTFTMs {
+				a.bestColdTTFTMs = coldTTFT
+			}
+		}
+	}
+
+	// Phase 3: read queue sizes (separate lock, safe to call after releasing r.mu).
+	queueLimit := 0
+	if r.queue != nil {
+		queueLimit = r.queue.MaxSize()
+	}
+
+	result := make([]ModelCapacity, 0, len(agg))
+	for model, a := range agg {
+		queued := 0
+		if r.queue != nil {
+			queued = r.queue.QueueSize(model)
+		}
+		ready := a.routable > 0
+		canAccept := ready && (queued < queueLimit || a.anyImmediateSlot)
+
+		ttft := a.bestWarmTTFTMs
+		if ttft < 0 {
+			ttft = a.bestColdTTFTMs
+		}
+		if ttft < 0 {
+			ttft = 0
+		}
+
+		result = append(result, ModelCapacity{
+			ModelID:              model,
+			Ready:                ready,
+			CanAccept:            canAccept,
+			RoutableProviders:    a.routable,
+			WarmProviders:        a.warm,
+			ColdProviders:        a.cold,
+			ActiveRequests:       a.activeRequests,
+			QueuedRequests:       queued,
+			QueueLimit:           queueLimit,
+			AggregateTPS:         a.aggregateTPS,
+			EstimatedTTFTMs:      ttft,
+			TokenBudgetRemaining: a.budgetRemaining,
+			TokenBudgetTotal:     a.budgetTotal,
+		})
+	}
+	return result
 }
 
 // ForEachProvider iterates over all registered providers (read lock held).

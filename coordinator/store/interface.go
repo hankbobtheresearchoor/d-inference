@@ -16,8 +16,14 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 )
+
+// ErrInsufficientBalance is returned by Debit when the account has
+// insufficient funds (or does not exist). Callers should check with
+// errors.Is to distinguish this from transient DB errors.
+var ErrInsufficientBalance = errors.New("insufficient balance or account not found")
 
 // Store is the interface that all storage backends must implement.
 type Store interface {
@@ -33,8 +39,57 @@ type Store interface {
 	// GetKeyAccount returns the account ID that owns this key, or "" if unlinked.
 	GetKeyAccount(key string) string
 
+	// ValidateKeyFull returns the active status and owner account ID for an
+	// API key in a single query, avoiding the 2-query overhead of
+	// ValidateKey + GetKeyAccount on every authenticated request.
+	ValidateKeyFull(key string) (active bool, ownerAccountID string, err error)
+
 	// RevokeKey deactivates a key. Returns true if the key existed.
 	RevokeKey(key string) bool
+
+	// --- Multi-key management (one account → many named, limited keys) ---
+
+	// CreateAPIKey mints a new API key for an account with optional per-key
+	// limits. It returns the raw key (shown once) and the stored record.
+	CreateAPIKey(accountID string, opts APIKeyCreate) (rawKey string, key *APIKey, err error)
+
+	// ListAPIKeys returns all (non-deleted) keys owned by an account, newest
+	// first. Secrets are never returned — only the masked label + metadata.
+	ListAPIKeys(accountID string) ([]APIKey, error)
+
+	// GetAPIKeyByID returns a single key by its public ID, scoped to the owner.
+	GetAPIKeyByID(accountID, id string) (*APIKey, error)
+
+	// UpdateAPIKey overwrites the mutable fields (name, disabled, limits,
+	// reset window, expiry, model allow-list) of a key, scoped to the owner.
+	// The caller supplies the fully-merged desired state; nil pointers clear
+	// the corresponding limit.
+	UpdateAPIKey(accountID, id string, mutable APIKey) (*APIKey, error)
+
+	// RevokeAPIKeyByID permanently deletes a key by ID, scoped to the owner.
+	RevokeAPIKeyByID(accountID, id string) error
+
+	// RotateAPIKey atomically replaces a key: it mints a new secret carrying the
+	// old key's name, limits, expiry, and disabled state, deletes the old key,
+	// and returns the new raw secret + record — all in one transaction/critical
+	// section so the old key is never usable after success and a concurrent
+	// rotate of the same key cannot mint two replacements. Scoped to the owner.
+	RotateAPIKey(accountID, id string) (rawKey string, key *APIKey, err error)
+
+	// AuthenticateKey resolves a raw key to its active record for request
+	// authentication. It returns an error when the key is unknown, disabled,
+	// or expired. The returned record carries the owner account and per-key
+	// limits used by the request path.
+	AuthenticateKey(rawKey string) (*APIKey, error)
+
+	// TouchAPIKey records that a key was used at the given time (last_used_at).
+	// Best-effort; callers typically invoke it asynchronously and throttled.
+	TouchAPIKey(id string, at time.Time)
+
+	// KeySpendSince returns the total micro-USD charged to the given key ID
+	// since the given UTC time. Zero `since` returns lifetime spend. Used to
+	// enforce per-key spend caps before the ledger reservation.
+	KeySpendSince(keyID string, since time.Time) int64
 
 	// RecordUsage logs an inference usage event.
 	RecordUsage(providerID, consumerKey, model string, promptTokens, completionTokens int)
@@ -42,11 +97,29 @@ type Store interface {
 	// RecordUsageWithCost logs an inference usage event including request ID and cost.
 	RecordUsageWithCost(providerID, consumerKey, model, requestID string, promptTokens, completionTokens int, costMicroUSD int64)
 
+	// RecordUsageWithCostAndLocation logs an inference usage event with an
+	// approximate request-origin location. Raw IP addresses are not stored.
+	RecordUsageWithCostAndLocation(providerID, consumerKey, model, requestID string, promptTokens, completionTokens int, costMicroUSD int64, requestLocation *ProviderLocation)
+
+	// RecordUsageFull logs an inference usage event with full attribution
+	// including the originating API key ID (for per-key usage and spend
+	// tracking). keyID may be empty for legacy/account-scoped attribution.
+	RecordUsageFull(providerID, consumerKey, keyID, model, requestID string, promptTokens, completionTokens int, costMicroUSD int64, requestLocation *ProviderLocation)
+
 	// RecordPayment records a settled payment between consumer and provider.
 	RecordPayment(txHash, consumerAddr, providerAddr, amountUSD, model string, promptTokens, completionTokens int, memo string) error
 
 	// UsageRecords returns all usage records.
 	UsageRecords() []UsageRecord
+
+	// UsageRecordsSince returns usage records created at or after the given time.
+	// Zero since returns all records.
+	UsageRecordsSince(since time.Time) []UsageRecord
+
+	// UsageCountSince returns the number of usage records created at or after
+	// the given time. Zero since returns all records. Uses SQL COUNT(*) to
+	// avoid transferring rows over the wire.
+	UsageCountSince(since time.Time) int64
 
 	// UsageTotals returns aggregated lifetime totals across all usage records
 	// without transferring per-row data over the wire.
@@ -55,6 +128,18 @@ type Store interface {
 	// UsageTimeSeries returns per-minute aggregates for the given time window.
 	// Buckets the rows by created_at truncated to the minute.
 	UsageTimeSeries(since time.Time) []UsageBucket
+
+	// UsageLocationBuckets returns approximate request-origin aggregates for
+	// public stats. Implementations must not store or return raw client IPs.
+	UsageLocationBuckets(since time.Time) []UsageLocationBucket
+
+	// UsageFlowBuckets returns aggregated directional flow buckets between
+	// consumer and provider regions. providerLocs supplies live provider
+	// locations from the registry so recently-connected providers that
+	// haven't been persisted yet are included. PostgresStore uses a SQL
+	// JOIN with the providers table and merges the live map; MemoryStore
+	// uses providerLocs directly.
+	UsageFlowBuckets(since time.Time, providerLocs map[string]*ProviderLocation) []UsageFlowBucket
 
 	// Leaderboard returns the top N accounts ranked by the given metric
 	// over the given time window. Zero `since` means all-time.
@@ -84,6 +169,11 @@ type Store interface {
 	// GetWithdrawableBalance returns the withdrawable balance in micro-USD.
 	GetWithdrawableBalance(accountID string) int64
 
+	// GetBalanceWithWithdrawable returns both the total balance and the
+	// withdrawable balance in a single query, avoiding two round trips to
+	// the same row in the balances table.
+	GetBalanceWithWithdrawable(accountID string) (balance int64, withdrawable int64)
+
 	// CreditWithdrawable adds micro-USD to both the total balance and the
 	// withdrawable balance, and records a ledger entry. Use for provider
 	// earnings, referral rewards, and admin rewards.
@@ -97,6 +187,14 @@ type Store interface {
 
 	// LedgerHistory returns ledger entries for an account, newest first.
 	LedgerHistory(accountID string) []LedgerEntry
+
+	// MigrateAccountBalance atomically moves the entire balance (and its
+	// withdrawable subset) from one account ID to another, merging into the
+	// destination, and records ledger entries on both sides. Returns moved=true
+	// when funds were transferred; it is a no-op (moved=false) when the source
+	// has no balance. Used to carry an unlinked legacy key's funds from its old
+	// raw-token identity to the hashed identity (see LegacyAccountID).
+	MigrateAccountBalance(from, to string) (moved bool, err error)
 
 	// --- Referral System ---
 
@@ -120,7 +218,7 @@ type Store interface {
 
 	// --- Billing Sessions ---
 
-	// CreateBillingSession stores a new billing session (Stripe, EVM, Solana).
+	// CreateBillingSession stores a new billing session (Stripe).
 	CreateBillingSession(session *BillingSession) error
 
 	// GetBillingSession retrieves a billing session by ID.
@@ -149,16 +247,20 @@ type Store interface {
 	// DeleteModelPrice removes a custom price override.
 	DeleteModelPrice(accountID, model string) error
 
-	// --- Supported Models (admin-managed catalog) ---
+	// --- Model Registry (manifest-backed catalog) ---
 
-	// SetSupportedModel adds or updates a supported model in the catalog.
-	SetSupportedModel(model *SupportedModel) error
-
-	// ListSupportedModels returns all supported models, ordered by min_ram_gb ascending.
-	ListSupportedModels() []SupportedModel
-
-	// DeleteSupportedModel removes a model from the catalog by ID.
-	DeleteSupportedModel(modelID string) error
+	UpsertModelRegistryEntry(entry *ModelRegistryEntry) error
+	SetModelVersion(entry *ModelRegistryEntry, version *ModelVersion, files []ModelVersionFile) error
+	PromoteModelVersion(modelID, version string) error
+	SetModelStatus(modelID, status string) error
+	ListActiveModelRegistry() []ModelRegistryRecord
+	ListActiveModelRegistryWithError() ([]ModelRegistryRecord, error)
+	GetModelRegistryRecord(modelID string) (*ModelRegistryRecord, error)
+	GetModelManifest(modelID string) (*ModelManifest, error)
+	UpsertPublishingAPIKey(key *PublishingAPIKey) error
+	FindPublishingAPIKeys() []PublishingAPIKey
+	FindPublishingAPIKeysWithError() ([]PublishingAPIKey, error)
+	MarkPublishingAPIKeyUsed(id string) error
 
 	// --- Releases (provider binary versioning) ---
 
@@ -195,6 +297,15 @@ type Store interface {
 	// GetUserByStripeAccount finds a user by their Stripe connected account ID.
 	// Used by webhook handlers to route account.updated / payout.* events.
 	GetUserByStripeAccount(stripeAccountID string) (*User, error)
+
+	// SetUserRole sets the account role (e.g. "" or RoleService). Used by the
+	// admin API to grant a partner account elevated rate limits.
+	SetUserRole(accountID, role string) error
+
+	// SetUserPlatformFeePercent sets a per-account platform fee override.
+	// Pass nil to clear the override and fall back to the global default.
+	// A non-nil value of 0 waives the platform fee entirely.
+	SetUserPlatformFeePercent(accountID string, feePercent *int64) error
 
 	// --- Stripe Withdrawals (bank/card payouts via Stripe Connect) ---
 
@@ -332,6 +443,27 @@ type Store interface {
 	// UpdateProviderRuntime persists runtime integrity verification state.
 	UpdateProviderRuntime(ctx context.Context, id string, verified bool, pythonHash, runtimeHash string) error
 
+	// OpenProviderSession records the start of a provider connection (one row per
+	// websocket session). serial/account may be empty at connect time and are
+	// backfilled by TouchProviderSession once attestation/linking completes.
+	OpenProviderSession(ctx context.Context, sessionID, serial, accountID string) error
+
+	// TouchProviderSession updates the open session's last_seen heartbeat and
+	// backfills serial/account if they were unknown at open time.
+	TouchProviderSession(ctx context.Context, sessionID, serial, accountID string, lastSeen time.Time) error
+
+	// CloseProviderSession marks the open session for sessionID as ended.
+	CloseProviderSession(ctx context.Context, sessionID, reason string, when time.Time) error
+
+	// CloseOpenProviderSessions closes sessions still marked open whose last
+	// heartbeat (last_seen) predates staleBefore — i.e. genuinely orphaned by a
+	// dead prior coordinator process. The staleBefore fence is what makes this
+	// safe under a blue-green/rolling deploy over a shared DB: a session still
+	// live on the OLD instance keeps getting TouchProviderSession heartbeats, so
+	// its last_seen stays fresh and is NOT closed by the NEW instance's startup
+	// reconcile. Returns the number of sessions closed.
+	CloseOpenProviderSessions(ctx context.Context, staleBefore time.Time) (int, error)
+
 	// --- Provider Reputation Persistence ---
 
 	// UpsertReputation creates or updates a provider's reputation record.
@@ -340,17 +472,21 @@ type Store interface {
 	// GetReputation returns a provider's reputation record.
 	GetReputation(ctx context.Context, providerID string) (*ReputationRecord, error)
 
+	// --- Provider Log Reports ---
+
+	// StoreLogReport stores a provider log report.
+	StoreLogReport(serialNumber, providerID, accountID string, logData []byte) error
+
+	// GetLogReports retrieves log reports for a serial number, newest first.
+	GetLogReports(serialNumber string, limit int) ([]LogReport, error)
+
+	// GetLogReport retrieves a single log report by ID.
+	GetLogReport(id int64) (*LogReport, error)
+
 	// --- Telemetry ---
 	//
-	// Telemetry events are forwarded to Datadog (Logs API + DogStatsD).
-	// The store retains a bounded in-memory ring buffer for the /v1/admin/metrics
-	// endpoint, but Postgres persistence and admin read/prune endpoints have
-	// been removed — Datadog handles retention and querying.
-
-	// InsertTelemetryEvents appends events to the in-memory ring buffer.
-	// Used by the ingestion handler and the coordinator emitter. The primary
-	// destination is Datadog; this is secondary for debugging.
-	InsertTelemetryEvents(ctx context.Context, events []TelemetryEventRecord) error
+	// Telemetry events are forwarded to Datadog (Logs API + DogStatsD)
+	// for durable storage and querying.
 }
 
 // TelemetryEventRecord is the persistence-layer representation of a telemetry
@@ -375,15 +511,17 @@ type TelemetryEventRecord struct {
 
 // UsageRecord captures a single inference usage event.
 type UsageRecord struct {
-	ProviderID       string    `json:"provider_id"`
-	ConsumerKey      string    `json:"consumer_key"`
-	Model            string    `json:"model"`
-	PromptTokens     int       `json:"prompt_tokens"`
-	CompletionTokens int       `json:"completion_tokens"`
-	Timestamp        time.Time `json:"timestamp"`
-	RequestID        string    `json:"request_id,omitempty"`
-	CostMicroUSD     int64     `json:"cost_micro_usd,omitempty"`
-	CreatedAt        time.Time `json:"created_at,omitempty"`
+	ProviderID       string            `json:"provider_id"`
+	ConsumerKey      string            `json:"consumer_key"`
+	KeyID            string            `json:"key_id,omitempty"`
+	Model            string            `json:"model"`
+	PromptTokens     int               `json:"prompt_tokens"`
+	CompletionTokens int               `json:"completion_tokens"`
+	RequestLocation  *ProviderLocation `json:"request_location,omitempty"`
+	Timestamp        time.Time         `json:"timestamp"`
+	RequestID        string            `json:"request_id,omitempty"`
+	CostMicroUSD     int64             `json:"cost_micro_usd,omitempty"`
+	CreatedAt        time.Time         `json:"created_at,omitempty"`
 }
 
 // UsageTotals aggregates the entire usage table.
@@ -399,6 +537,46 @@ type UsageBucket struct {
 	Requests         int64     `json:"requests"`
 	PromptTokens     int64     `json:"prompt_tokens"`
 	CompletionTokens int64     `json:"completion_tokens"`
+}
+
+// UsageLocationBucket aggregates request-origin location data for public stats.
+type UsageLocationBucket struct {
+	City             string  `json:"city"`
+	Region           string  `json:"region"`
+	RegionCode       string  `json:"region_code"`
+	Country          string  `json:"country"`
+	CountryCode      string  `json:"country_code"`
+	Latitude         float64 `json:"latitude"`
+	Longitude        float64 `json:"longitude"`
+	Requests         int64   `json:"requests"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	Providers        int     `json:"providers"`
+}
+
+// UsageFlowBucket is a pre-aggregated directional flow between a consumer
+// location and a provider location, computed via SQL JOIN.
+type UsageFlowBucket struct {
+	// Consumer (request origin)
+	ConsumerCity        string  `json:"consumer_city"`
+	ConsumerRegion      string  `json:"consumer_region"`
+	ConsumerRegionCode  string  `json:"consumer_region_code"`
+	ConsumerCountry     string  `json:"consumer_country"`
+	ConsumerCountryCode string  `json:"consumer_country_code"`
+	ConsumerLatitude    float64 `json:"consumer_latitude"`
+	ConsumerLongitude   float64 `json:"consumer_longitude"`
+	// Provider
+	ProviderCity        string  `json:"provider_city"`
+	ProviderRegion      string  `json:"provider_region"`
+	ProviderRegionCode  string  `json:"provider_region_code"`
+	ProviderCountry     string  `json:"provider_country"`
+	ProviderCountryCode string  `json:"provider_country_code"`
+	ProviderLatitude    float64 `json:"provider_latitude"`
+	ProviderLongitude   float64 `json:"provider_longitude"`
+	// Aggregates
+	Requests         int64 `json:"requests"`
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
 }
 
 // LeaderboardMetric selects the ranking column for a leaderboard query.
@@ -444,6 +622,7 @@ const (
 	LedgerRefund         LedgerEntryType = "refund"          // reservation refund (request failed before inference)
 	LedgerAdminCredit    LedgerEntryType = "admin_credit"    // admin-granted non-withdrawable credit
 	LedgerAdminReward    LedgerEntryType = "admin_reward"    // admin-granted withdrawable reward
+	LedgerMigration      LedgerEntryType = "migration"       // balance moved between account identities (e.g. legacy key re-keying)
 )
 
 // LedgerEntry is a single balance-changing event.
@@ -492,14 +671,93 @@ type ModelPrice struct {
 	OutputPrice int64  `json:"output_price"` // micro-USD per 1M tokens
 }
 
+// Per-key spend-cap reset windows. A cap with KeyResetNone is a lifetime cap;
+// the others reset at the corresponding UTC calendar boundary (midnight UTC for
+// daily, Monday 00:00 UTC for weekly, the 1st 00:00 UTC for monthly).
+const (
+	KeyResetNone    = "none"
+	KeyResetDaily   = "daily"
+	KeyResetWeekly  = "weekly"
+	KeyResetMonthly = "monthly"
+)
+
+// APIKey is a consumer API key with optional per-key limits. One account may
+// own many keys. The account's prepaid balance is always the hard ceiling;
+// each key's limits are sub-caps enforced before the ledger reservation.
+//
+// Nil limit pointers mean "no per-key limit" for that dimension (the key is
+// bounded only by the account's balance and the global per-account limiters).
+type APIKey struct {
+	ID             string `json:"id"`               // stable public id (e.g. "key_…"); safe to expose
+	OwnerAccountID string `json:"owner_account_id"` // owning account
+	Name           string `json:"name"`             // user-set label
+	Label          string `json:"label"`            // masked prefix…suffix for display (e.g. "sk-db-1a2b…c3d4")
+	KeyHash        string `json:"-"`                // sha256 of the raw key (Postgres); never serialized
+
+	Disabled bool `json:"disabled"` // soft lifecycle — a disabled key fails auth fast
+
+	// Spend cap. LimitMicroUSD nil = unlimited. LimitReset selects the window.
+	LimitMicroUSD *int64 `json:"limit_micro_usd,omitempty"`
+	LimitReset    string `json:"limit_reset"` // none | daily | weekly | monthly
+
+	// Throughput overrides. Nil = inherit the account-level limiter.
+	RPMLimit  *int64 `json:"rpm_limit,omitempty"`  // requests per minute
+	ITPMLimit *int64 `json:"itpm_limit,omitempty"` // input tokens per minute
+	OTPMLimit *int64 `json:"otpm_limit,omitempty"` // output tokens per minute
+
+	// AllowedModels restricts which models the key may call. Empty = all.
+	AllowedModels []string `json:"allowed_models,omitempty"`
+
+	// SelfRouteOnly is a hard ceiling: every request on this key is routed
+	// only to a machine the owning account runs, and is free. The key can
+	// never spend balance or reach the public fleet. See the "self-route"
+	// design in the consumer handler.
+	SelfRouteOnly bool `json:"self_route_only"`
+
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+}
+
+// APIKeyCreate carries the create-time options for a new API key. All limit
+// fields are optional; a nil pointer means "no limit" for that dimension.
+type APIKeyCreate struct {
+	Name          string
+	LimitMicroUSD *int64
+	LimitReset    string
+	RPMLimit      *int64
+	ITPMLimit     *int64
+	OTPMLimit     *int64
+	AllowedModels []string
+	SelfRouteOnly bool
+	ExpiresAt     *time.Time
+}
+
+// Account role values. The empty string is a normal consumer account.
+const (
+	// RoleService marks a trusted machine/partner account (e.g. an upstream
+	// aggregator such as OpenRouter). Service accounts get elevated or
+	// bypassed rate limits. They authenticate with a normal API key whose
+	// linked user carries this role.
+	RoleService = "service"
+)
+
 // User represents a consumer account linked to a Privy identity.
 type User struct {
-	AccountID           string    `json:"account_id"`            // internal account ID (used in ledger)
-	PrivyUserID         string    `json:"privy_user_id"`         // Privy DID (e.g. "did:privy:abc123")
-	Email               string    `json:"email,omitempty"`       // from Privy linked accounts
-	SolanaWalletAddress string    `json:"solana_wallet_address"` // embedded wallet public address
-	SolanaWalletID      string    `json:"solana_wallet_id"`      // Privy's internal wallet ID (for signing API)
-	CreatedAt           time.Time `json:"created_at"`
+	AccountID   string    `json:"account_id"`      // internal account ID (used in ledger)
+	PrivyUserID string    `json:"privy_user_id"`   // Privy DID (e.g. "did:privy:abc123")
+	Email       string    `json:"email,omitempty"` // from Privy linked accounts
+	CreatedAt   time.Time `json:"created_at"`
+
+	// Role gates elevated capabilities. "" = normal consumer,
+	// RoleService = trusted partner/aggregator (elevated rate limits).
+	Role string `json:"role,omitempty"`
+
+	// PlatformFeePercent overrides the global platform routing fee for this
+	// account when non-nil. nil = use the global default. A value of 0 means
+	// the account pays no platform fee (the provider receives 100%). Used to
+	// waive the fee for wholesale partners such as OpenRouter.
+	PlatformFeePercent *int64 `json:"platform_fee_percent,omitempty"`
 
 	// Stripe Connect Express — for bank/card payouts via Stripe.
 	// StripeAccountStatus mirrors the readiness of payouts on the connected
@@ -535,15 +793,14 @@ type StripeWithdrawal struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 }
 
-// SupportedModel represents a model in the admin-managed catalog.
-// The coordinator is the single source of truth for which models providers can serve.
-// SupportedModel represents a model in the admin-managed catalog.
-// The coordinator is the single source of truth for which models providers can serve.
+// SupportedModel is the lightweight in-memory shape the model-listing and
+// routing code uses to describe a servable model. It is derived from the
+// canonical model_registry (see supportedModelFromRegistryRecord); it is no
+// longer a standalone persisted catalog. The coordinator remains the single
+// source of truth for which models providers can serve.
 //
 // ModelType determines routing: "text" for chat/completions, "embedding" for
-// vector search, etc. Only add models that produce output worth paying for —
-// small chat models (< 7B) are not useful, but small specialized models
-// (embeddings) can be best-in-class.
+// vector search, etc.
 type SupportedModel struct {
 	ID           string  `json:"id"`           // HuggingFace path (e.g. "mlx-community/Qwen3.5-9B-MLX-4bit")
 	S3Name       string  `json:"s3_name"`      // CDN key for download (e.g. "Qwen3.5-9B-MLX-4bit")
@@ -555,6 +812,89 @@ type SupportedModel struct {
 	MinRAMGB     int     `json:"min_ram_gb"`   // Minimum system RAM for auto-selection
 	Active       bool    `json:"active"`       // Whether available for use
 	WeightHash   string  `json:"weight_hash"`  // Expected SHA-256 fingerprint of model weight files
+}
+
+// ModelRegistryEntry is the canonical admin-managed model catalog row.
+type ModelRegistryEntry struct {
+	ID                string         `json:"id"`
+	DisplayName       string         `json:"display_name"`
+	Family            string         `json:"family"`
+	Architecture      string         `json:"architecture"`
+	Quantization      string         `json:"quantization"`
+	MaxContextLength  int            `json:"max_context_length"`
+	MaxOutputLength   int            `json:"max_output_length"`
+	MinRAMGB          int            `json:"min_ram_gb"`
+	Capabilities      []string       `json:"capabilities"`
+	Status            string         `json:"status"`
+	Description       string         `json:"description"`
+	RuntimeParameters map[string]any `json:"runtime_parameters"`
+	Metadata          map[string]any `json:"metadata"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+}
+
+// ModelVersion is an uploaded manifest version for a registered model.
+type ModelVersion struct {
+	ID              int64          `json:"id"`
+	ModelID         string         `json:"model_id"`
+	Version         string         `json:"version"`
+	R2Prefix        string         `json:"r2_prefix"`
+	AggregateSHA256 string         `json:"aggregate_sha256"`
+	TotalSizeBytes  int64          `json:"total_size_bytes"`
+	FileCount       int            `json:"file_count"`
+	Status          string         `json:"status"`
+	UploadedBy      string         `json:"uploaded_by,omitempty"`
+	UploadedAt      time.Time      `json:"uploaded_at"`
+	PromotedAt      *time.Time     `json:"promoted_at,omitempty"`
+	Metadata        map[string]any `json:"metadata"`
+}
+
+// ModelVersionFile is one file in a model version manifest.
+type ModelVersionFile struct {
+	ID             int64  `json:"id"`
+	ModelVersionID int64  `json:"model_version_id"`
+	Path           string `json:"path"`
+	SizeBytes      int64  `json:"size_bytes"`
+	SHA256         string `json:"sha256"`
+	Role           string `json:"role"`
+}
+
+// ModelRegistryRecord combines a model with its active version and files.
+type ModelRegistryRecord struct {
+	ModelRegistryEntry
+	ActiveVersion *ModelVersion      `json:"active_version,omitempty"`
+	Files         []ModelVersionFile `json:"files,omitempty"`
+}
+
+// ModelManifest mirrors the minimal darkbloom-publish manifest JSON.
+type ModelManifest struct {
+	SchemaVersion   int            `json:"schema_version"`
+	ModelID         string         `json:"model_id"`
+	Version         string         `json:"version"`
+	R2Prefix        string         `json:"r2_prefix"`
+	AggregateSHA256 string         `json:"aggregate_sha256"`
+	TotalSizeBytes  int64          `json:"total_size_bytes"`
+	FileCount       int            `json:"file_count"`
+	Files           []ManifestFile `json:"files"`
+	CreatedAt       time.Time      `json:"created_at"`
+}
+
+// ManifestFile mirrors a file entry in a model manifest.
+type ManifestFile struct {
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
+	Role      string `json:"role"`
+}
+
+// PublishingAPIKey stores a hashed key allowed to publish model manifests.
+type PublishingAPIKey struct {
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	KeyHash    string     `json:"key_hash"`
+	Active     bool       `json:"active"`
+	CreatedAt  time.Time  `json:"created_at"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 }
 
 // Release represents a versioned provider binary release.
@@ -639,9 +979,9 @@ type ProviderEarningsSummary struct {
 	CompletionTokens int64 `json:"completion_tokens"`
 }
 
-// ProviderPayout records a provider wallet payout event. This is separate from
-// account-linked provider earnings because some providers are paid directly to a
-// wallet without being linked to a Privy account.
+// ProviderPayout records a provider payout event. This is separate from
+// account-linked provider earnings because some providers are paid directly
+// without being linked to a Privy account.
 type ProviderPayout struct {
 	ID              int64     `json:"id"`
 	ProviderAddress string    `json:"provider_address"`
@@ -652,12 +992,11 @@ type ProviderPayout struct {
 	Settled         bool      `json:"settled"`
 }
 
-// BillingSession tracks an in-progress payment via any method (Stripe, EVM, Solana).
+// BillingSession tracks an in-progress payment via any method (Stripe).
 type BillingSession struct {
 	ID             string     `json:"id"`
 	AccountID      string     `json:"account_id"`
-	PaymentMethod  string     `json:"payment_method"` // "stripe", "evm", "solana"
-	Chain          string     `json:"chain"`          // "ethereum", "tempo", "solana", ""
+	PaymentMethod  string     `json:"payment_method"` // "stripe"
 	AmountMicroUSD int64      `json:"amount_micro_usd"`
 	ExternalID     string     `json:"external_id"`   // Stripe session ID, tx hash, etc.
 	Status         string     `json:"status"`        // "pending", "completed", "expired"
@@ -669,31 +1008,77 @@ type BillingSession struct {
 // ProviderRecord is the persistent representation of a provider for storage.
 // Transient fields (WebSocket conn, pending requests, system metrics) are NOT persisted.
 type ProviderRecord struct {
-	ID                         string          `json:"id"`
-	Hardware                   json.RawMessage `json:"hardware"`
-	Models                     json.RawMessage `json:"models"`
-	Backend                    string          `json:"backend"`
-	TrustLevel                 string          `json:"trust_level"`
-	Attested                   bool            `json:"attested"`
-	AttestationResult          json.RawMessage `json:"attestation_result,omitempty"`
-	SEPublicKey                string          `json:"se_public_key,omitempty"`
-	SerialNumber               string          `json:"serial_number,omitempty"`
-	MDAVerified                bool            `json:"mda_verified"`
-	MDACertChain               json.RawMessage `json:"mda_cert_chain,omitempty"`
-	ACMEVerified               bool            `json:"acme_verified"`
-	Version                    string          `json:"version,omitempty"`
-	RuntimeVerified            bool            `json:"runtime_verified"`
-	PythonHash                 string          `json:"python_hash,omitempty"`
-	RuntimeHash                string          `json:"runtime_hash,omitempty"`
-	LastChallengeVerified      *time.Time      `json:"last_challenge_verified,omitempty"`
-	FailedChallenges           int             `json:"failed_challenges"`
-	AccountID                  string          `json:"account_id,omitempty"`
-	LifetimeRequestsServed     int64           `json:"lifetime_requests_served"`
-	LifetimeTokensGenerated    int64           `json:"lifetime_tokens_generated"`
-	LastSessionRequestsServed  int64           `json:"last_session_requests_served"`
-	LastSessionTokensGenerated int64           `json:"last_session_tokens_generated"`
-	RegisteredAt               time.Time       `json:"registered_at"`
-	LastSeen                   time.Time       `json:"last_seen"`
+	ID                         string            `json:"id"`
+	Hardware                   json.RawMessage   `json:"hardware"`
+	Models                     json.RawMessage   `json:"models"`
+	Backend                    string            `json:"backend"`
+	Location                   *ProviderLocation `json:"location,omitempty"`
+	TrustLevel                 string            `json:"trust_level"`
+	Attested                   bool              `json:"attested"`
+	AttestationResult          json.RawMessage   `json:"attestation_result,omitempty"`
+	SEPublicKey                string            `json:"se_public_key,omitempty"`
+	SerialNumber               string            `json:"serial_number,omitempty"`
+	MDAVerified                bool              `json:"mda_verified"`
+	MDACertChain               json.RawMessage   `json:"mda_cert_chain,omitempty"`
+	ACMEVerified               bool              `json:"acme_verified"`
+	Version                    string            `json:"version,omitempty"`
+	RuntimeVerified            bool              `json:"runtime_verified"`
+	PythonHash                 string            `json:"python_hash,omitempty"`
+	RuntimeHash                string            `json:"runtime_hash,omitempty"`
+	LastChallengeVerified      *time.Time        `json:"last_challenge_verified,omitempty"`
+	FailedChallenges           int               `json:"failed_challenges"`
+	AccountID                  string            `json:"account_id,omitempty"`
+	LifetimeRequestsServed     int64             `json:"lifetime_requests_served"`
+	LifetimeTokensGenerated    int64             `json:"lifetime_tokens_generated"`
+	LastSessionRequestsServed  int64             `json:"last_session_requests_served"`
+	LastSessionTokensGenerated int64             `json:"last_session_tokens_generated"`
+	RegisteredAt               time.Time         `json:"registered_at"`
+	LastSeen                   time.Time         `json:"last_seen"`
+}
+
+// ProviderSession is one connect→disconnect lifecycle of a provider machine.
+// connected_at/disconnected_at bound the session; last_seen is the most recent
+// heartbeat within it. disconnected_at == nil means the session is still open.
+// These rows are the durable source for uptime/downtime history (the providers
+// table only keeps a single mutable last_seen).
+type ProviderSession struct {
+	ID               int64      `json:"id"`
+	SessionID        string     `json:"session_id"` // providers.id for this connection
+	SerialNumber     string     `json:"serial_number"`
+	AccountID        string     `json:"account_id"`
+	ConnectedAt      time.Time  `json:"connected_at"`
+	LastSeen         time.Time  `json:"last_seen"`
+	DisconnectedAt   *time.Time `json:"disconnected_at,omitempty"`
+	DisconnectReason string     `json:"disconnect_reason"`
+}
+
+// ProviderLocation captures approximate geographic location for a provider or
+// request origin. Raw IP addresses are never stored. Populated from GeoIP
+// database lookups or trusted reverse-proxy headers.
+type ProviderLocation struct {
+	City             string    `json:"city,omitempty"`
+	Region           string    `json:"region,omitempty"`
+	RegionCode       string    `json:"region_code,omitempty"`
+	Country          string    `json:"country,omitempty"`
+	CountryCode      string    `json:"country_code,omitempty"`
+	Latitude         float64   `json:"latitude,omitempty"`
+	Longitude        float64   `json:"longitude,omitempty"`
+	AccuracyRadiusKM int       `json:"accuracy_radius_km,omitempty"`
+	Timezone         string    `json:"timezone,omitempty"`
+	Source           string    `json:"source,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at,omitempty"`
+}
+
+// LogReport represents a stored provider log report. LogData is only populated
+// when fetching a single report by ID (GetLogReport), not when listing.
+type LogReport struct {
+	ID           int64     `json:"id"`
+	SerialNumber string    `json:"serial_number"`
+	ProviderID   string    `json:"provider_id"`
+	AccountID    string    `json:"account_id"`
+	LogSizeBytes int64     `json:"log_size_bytes"`
+	CreatedAt    time.Time `json:"created_at"`
+	LogData      []byte    `json:"log_data,omitempty"`
 }
 
 // ReputationRecord is the persistent representation of a provider's reputation.

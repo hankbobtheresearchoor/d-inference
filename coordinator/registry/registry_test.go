@@ -40,7 +40,7 @@ func testRegisterMessage() *protocol.RegisterMessage {
 				Quantization: "4bit",
 			},
 		},
-		Backend:                 "inprocess-mlx",
+		Backend:                 BackendMLXSwift,
 		PublicKey:               "fX6XYH7p2hmM3ogeXaAsY+p8M6UKD1df/LJUN9Nj9Nw=",
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities: &protocol.PrivacyCapabilities{
@@ -191,23 +191,21 @@ func TestSwiftProviderPrivateTextWithoutPythonCaps(t *testing.T) {
 	}
 }
 
-func TestPythonProviderRequiresPythonCaps(t *testing.T) {
+func TestPythonProviderDeprecatedNotRoutable(t *testing.T) {
 	reg := New(testLogger())
 	msg := testRegisterMessage()
-	msg.Backend = BackendInprocessMLX
-	msg.PrivacyCapabilities.PythonRuntimeLocked = false
-	msg.PrivacyCapabilities.DangerousModulesBlocked = false
+	msg.Backend = "inprocess-mlx" // intentionally legacy backend
 
-	p := reg.Register("p-python-nocaps", nil, msg)
+	p := reg.Register("p-python-deprecated", nil, msg)
 	testMakeTextRoutable(p)
 
 	if providerSupportsPrivateTextLocked(p) {
-		t.Fatal("Python (inprocess-mlx) provider without PythonRuntimeLocked/DangerousModulesBlocked should NOT support private text")
+		t.Fatal("Python (inprocess-mlx) provider should NOT support private text — backend is deprecated")
 	}
 
 	found := reg.FindProvider("mlx-community/Qwen3.5-9B-Instruct-4bit")
 	if found != nil {
-		t.Fatal("Python provider without Python caps should not be routable for text models")
+		t.Fatal("deprecated Python provider should not be routable")
 	}
 }
 
@@ -235,7 +233,7 @@ func TestSwiftProviderMissingBaseCapsExcluded(t *testing.T) {
 func TestProviderPartialPrivacyCapsExcluded(t *testing.T) {
 	reg := New(testLogger())
 	msg := testRegisterMessage()
-	msg.PrivacyCapabilities.DangerousModulesBlocked = false
+	msg.PrivacyCapabilities.EnvScrubbed = false // base cap required for all backends
 	p := reg.Register("p-partial", nil, msg)
 	p.ChallengeVerifiedSIP = true
 	reg.SetTrustLevel(p.ID, TrustHardware)
@@ -719,12 +717,14 @@ func TestRecordChallengeSuccess(t *testing.T) {
 	msg := testRegisterMessage()
 	p := reg.Register("p1", nil, msg)
 
-	// Record some failures first
-	reg.RecordChallengeFailure("p1")
-	reg.RecordChallengeFailure("p1")
+	// Record some transient failures first
+	reg.RecordChallengeFailure("p1", true)
+	reg.RecordChallengeFailure("p1", true)
 
-	// Now record success
-	reg.RecordChallengeSuccess("p1")
+	// Now record success (provider was never untrusted -> not a recovery)
+	if reg.RecordChallengeSuccess("p1") {
+		t.Error("RecordChallengeSuccess should report recovery=false for a non-untrusted provider")
+	}
 
 	if p.FailedChallenges != 0 {
 		t.Errorf("failed_challenges = %d, want 0 after success", p.FailedChallenges)
@@ -737,30 +737,51 @@ func TestRecordChallengeSuccess(t *testing.T) {
 	}
 }
 
-func TestRecordChallengeFailure(t *testing.T) {
+func TestRecordChallengeFailureTransient(t *testing.T) {
 	reg := New(testLogger())
 	msg := testRegisterMessage()
 	p := reg.Register("p1", nil, msg)
 	p.LastChallengeVerified = time.Now()
 	p.ChallengeVerifiedSIP = true
 
-	count := reg.RecordChallengeFailure("p1")
+	// Transient (timeout) failure: should NOT clear routing below threshold.
+	count := reg.RecordChallengeFailure("p1", true)
 	if count != 1 {
 		t.Errorf("failure count = %d, want 1", count)
 	}
-	if p.FailedChallenges != 1 {
-		t.Errorf("failed_challenges = %d, want 1", p.FailedChallenges)
-	}
-	if !p.LastChallengeVerified.IsZero() {
-		t.Error("challenge failure should clear last_challenge_verified")
-	}
-	if p.ChallengeVerifiedSIP {
-		t.Error("challenge failure should clear SIP verification")
+	if p.LastChallengeVerified.IsZero() {
+		t.Error("single transient failure should NOT clear last_challenge_verified")
 	}
 
-	count = reg.RecordChallengeFailure("p1")
-	if count != 2 {
-		t.Errorf("failure count = %d, want 2", count)
+	reg.RecordChallengeFailure("p1", true) // 2
+	if p.LastChallengeVerified.IsZero() {
+		t.Error("two transient failures should NOT clear last_challenge_verified")
+	}
+
+	// Third transient failure hits threshold — now clear.
+	reg.RecordChallengeFailure("p1", true) // 3
+	if !p.LastChallengeVerified.IsZero() {
+		t.Error("at MaxFailedChallenges, transient failures should clear last_challenge_verified")
+	}
+}
+
+func TestRecordChallengeFailureSecurity(t *testing.T) {
+	reg := New(testLogger())
+	msg := testRegisterMessage()
+	p := reg.Register("p1", nil, msg)
+	p.LastChallengeVerified = time.Now()
+	p.ChallengeVerifiedSIP = true
+
+	// Security failure (e.g. SIP disabled): clears routing immediately.
+	count := reg.RecordChallengeFailure("p1", false)
+	if count != 1 {
+		t.Errorf("failure count = %d, want 1", count)
+	}
+	if !p.LastChallengeVerified.IsZero() {
+		t.Error("security failure should clear last_challenge_verified immediately")
+	}
+	if p.ChallengeVerifiedSIP {
+		t.Error("security failure should clear SIP verification immediately")
 	}
 }
 
@@ -769,9 +790,9 @@ func TestChallengeFailureThreshold(t *testing.T) {
 	msg := testRegisterMessage()
 	reg.Register("p1", nil, msg)
 
-	// Record failures up to the threshold
+	// Record failures up to the threshold (security failures)
 	for range 3 {
-		reg.RecordChallengeFailure("p1")
+		reg.RecordChallengeFailure("p1", false)
 	}
 
 	// The caller (handleChallengeFailure) is responsible for calling MarkUntrusted,
@@ -815,6 +836,209 @@ func TestHeartbeatDoesNotReviveUntrusted(t *testing.T) {
 	reg.Disconnect("p1")
 	if reg.OnlineCount() != 0 {
 		t.Errorf("OnlineCount = %d after disconnect, want 0 (no double-decrement)", reg.OnlineCount())
+	}
+}
+
+// --- Issue #239: reason-aware transient-deroute recovery ---
+
+const recoverTestModel = "mlx-community/Qwen3.5-9B-Instruct-4bit"
+
+// A transient (missed-challenge timeout) deroute is recoverable: the provider
+// returns to online on the next passing challenge, with all counts restored.
+func TestMarkUntrustedTransientRecovers(t *testing.T) {
+	reg := New(testLogger())
+	p := reg.Register("p1", nil, testRegisterMessage())
+
+	reg.MarkUntrustedTransient("p1")
+
+	if p.Status != StatusUntrusted {
+		t.Fatalf("status = %q, want %q", p.Status, StatusUntrusted)
+	}
+	if reg.OnlineCount() != 0 {
+		t.Errorf("OnlineCount = %d, want 0 after transient deroute", reg.OnlineCount())
+	}
+	if got := reg.ModelProviderSnapshot()[recoverTestModel]; got != 0 {
+		t.Errorf("model provider count = %d, want 0 after transient deroute", got)
+	}
+	if p.ChallengeShouldStop() {
+		t.Error("ChallengeShouldStop = true, want false for a transiently-untrusted provider")
+	}
+
+	if !reg.RecordChallengeSuccess("p1") {
+		t.Error("RecordChallengeSuccess should report recovery for a transiently-untrusted provider")
+	}
+
+	if p.Status != StatusOnline {
+		t.Fatalf("status = %q, want %q after recovery", p.Status, StatusOnline)
+	}
+	if reg.OnlineCount() != 1 {
+		t.Errorf("OnlineCount = %d, want 1 after recovery", reg.OnlineCount())
+	}
+	if got := reg.ModelProviderSnapshot()[recoverTestModel]; got != 1 {
+		t.Errorf("model provider count = %d, want 1 after recovery", got)
+	}
+	if p.FailedChallenges != 0 {
+		t.Errorf("FailedChallenges = %d, want 0 after recovery", p.FailedChallenges)
+	}
+	if p.LastChallengeVerified.IsZero() {
+		t.Error("LastChallengeVerified should be set after recovery")
+	}
+	if p.untrustedRecoverable {
+		t.Error("untrustedRecoverable should be cleared after recovery")
+	}
+}
+
+// A hard/security deroute is never auto-recovered by a passing challenge.
+func TestMarkUntrustedHardNotRecovered(t *testing.T) {
+	reg := New(testLogger())
+	p := reg.Register("p1", nil, testRegisterMessage())
+
+	reg.MarkUntrusted("p1") // hard
+
+	if !p.ChallengeShouldStop() {
+		t.Error("ChallengeShouldStop = false, want true for a hard-untrusted provider")
+	}
+
+	if reg.RecordChallengeSuccess("p1") {
+		t.Error("RecordChallengeSuccess must not report recovery for a hard-untrusted provider")
+	}
+
+	if p.Status != StatusUntrusted {
+		t.Fatalf("status = %q, want %q (hard deroute must not auto-recover)", p.Status, StatusUntrusted)
+	}
+	if reg.OnlineCount() != 0 {
+		t.Errorf("OnlineCount = %d, want 0 (hard deroute must stay derouted)", reg.OnlineCount())
+	}
+}
+
+// A later hard deroute downgrades a recoverable untrust; no double-decrement.
+func TestHardDerouteOverridesTransient(t *testing.T) {
+	reg := New(testLogger())
+	p := reg.Register("p1", nil, testRegisterMessage())
+
+	reg.MarkUntrustedTransient("p1") // recoverable...
+	reg.MarkUntrusted("p1")          // ...downgraded to hard
+
+	if !p.ChallengeShouldStop() {
+		t.Error("ChallengeShouldStop = false, want true after a hard deroute downgrades a transient one")
+	}
+	if reg.OnlineCount() != 0 {
+		t.Errorf("OnlineCount = %d, want 0 (no double-decrement)", reg.OnlineCount())
+	}
+
+	reg.RecordChallengeSuccess("p1")
+	if p.Status != StatusUntrusted {
+		t.Fatalf("status = %q, want %q (downgraded hard deroute must not recover)", p.Status, StatusUntrusted)
+	}
+	if reg.OnlineCount() != 0 {
+		t.Errorf("OnlineCount = %d, want 0 after non-recovery", reg.OnlineCount())
+	}
+}
+
+// A transient deroute must never *upgrade* an existing hard deroute to
+// recoverable (matters for an in-flight challenge timeout racing a hard mark).
+func TestTransientDoesNotUpgradeHard(t *testing.T) {
+	reg := New(testLogger())
+	p := reg.Register("p1", nil, testRegisterMessage())
+
+	reg.MarkUntrusted("p1")          // hard first
+	reg.MarkUntrustedTransient("p1") // must NOT upgrade to recoverable
+
+	if !p.ChallengeShouldStop() {
+		t.Error("ChallengeShouldStop = false, want true (transient must not upgrade a hard deroute)")
+	}
+	reg.RecordChallengeSuccess("p1")
+	if p.Status != StatusUntrusted {
+		t.Fatalf("status = %q, want %q (hard deroute must stay hard)", p.Status, StatusUntrusted)
+	}
+}
+
+// Full cycle register -> transient deroute -> recover -> disconnect balances counts.
+func TestRecoverThenDisconnectBalancesCounts(t *testing.T) {
+	reg := New(testLogger())
+	reg.Register("p1", nil, testRegisterMessage())
+
+	reg.MarkUntrustedTransient("p1")
+	reg.RecordChallengeSuccess("p1") // recover
+	if reg.OnlineCount() != 1 {
+		t.Fatalf("OnlineCount = %d, want 1 after recovery", reg.OnlineCount())
+	}
+	reg.Disconnect("p1")
+	if reg.OnlineCount() != 0 {
+		t.Errorf("OnlineCount = %d, want 0 after disconnect", reg.OnlineCount())
+	}
+	if got := reg.ModelProviderSnapshot()[recoverTestModel]; got != 0 {
+		t.Errorf("model provider count = %d, want 0 after disconnect", got)
+	}
+}
+
+// Regression for the verifier's HIGH finding: a recovery that resolved the
+// provider before Disconnect removed it must not increment counts for the stale
+// pointer (which would leave OnlineCount > ProviderCount forever).
+func TestStaleRecoveryAfterDisconnectDoesNotCorruptCounts(t *testing.T) {
+	reg := New(testLogger())
+	p := reg.Register("p1", nil, testRegisterMessage())
+
+	reg.MarkUntrustedTransient("p1")
+	reg.Disconnect("p1")
+	if reg.OnlineCount() != 0 || reg.ProviderCount() != 0 {
+		t.Fatalf("pre-state OnlineCount=%d ProviderCount=%d, want 0/0", reg.OnlineCount(), reg.ProviderCount())
+	}
+
+	if reg.recoverIfTransientlyUntrusted("p1", p) {
+		t.Error("recoverIfTransientlyUntrusted recovered a disconnected (stale) provider")
+	}
+	if reg.OnlineCount() != 0 {
+		t.Errorf("OnlineCount = %d, want 0 (stale recovery must not increment)", reg.OnlineCount())
+	}
+	if got := reg.ModelProviderSnapshot()[recoverTestModel]; got != 0 {
+		t.Errorf("model provider count = %d, want 0 (stale recovery must not increment)", got)
+	}
+}
+
+// Concurrency invariant (run with -race): after arbitrary interleavings of
+// transient/hard deroutes, recoveries, and disconnects, onlineCount must equal
+// the number of still-registered, non-untrusted providers — no drift, no panic,
+// no deadlock.
+func TestTransientRecoveryConcurrentRace(t *testing.T) {
+	reg := New(testLogger())
+	const n = 60
+	for i := range n {
+		reg.Register(fmt.Sprintf("p%d", i), nil, testRegisterMessage())
+	}
+
+	var wg sync.WaitGroup
+	for i := range n {
+		id := fmt.Sprintf("p%d", i)
+		ops := []func(){
+			func() { reg.MarkUntrustedTransient(id) },
+			func() { reg.RecordChallengeSuccess(id) },
+			func() { reg.MarkUntrusted(id) },
+			func() { reg.RecordChallengeSuccess(id) },
+		}
+		if i%3 == 0 {
+			// Also exercise the stale-recovery membership guard.
+			ops = append(ops, func() { reg.Disconnect(id) })
+		}
+		for _, op := range ops {
+			wg.Add(1)
+			go func(f func()) { defer wg.Done(); f() }(op)
+		}
+	}
+	wg.Wait()
+
+	var expectedOnline int64
+	for i := range n {
+		if p := reg.GetProvider(fmt.Sprintf("p%d", i)); p != nil {
+			p.Mu().Lock()
+			if p.Status != StatusUntrusted {
+				expectedOnline++
+			}
+			p.Mu().Unlock()
+		}
+	}
+	if got := reg.OnlineCount(); got != expectedOnline {
+		t.Errorf("OnlineCount = %d, want %d (must equal non-untrusted registered providers)", got, expectedOnline)
 	}
 }
 
@@ -1816,7 +2040,7 @@ func TestConcurrentFindProviderAndHeartbeat(t *testing.T) {
 // Model catalog enforcement
 // ---------------------------------------------------------------------------
 
-func TestModelCatalogFilterOnRegister(t *testing.T) {
+func TestModelCatalogGatesRoutingWithoutDroppingInventory(t *testing.T) {
 	reg := New(testLogger())
 	reg.MinTrustLevel = TrustNone
 
@@ -1824,22 +2048,22 @@ func TestModelCatalogFilterOnRegister(t *testing.T) {
 	reg.SetModelCatalog([]CatalogEntry{{ID: "mlx-community/Qwen3.5-9B-Instruct-4bit"}})
 
 	// Register a provider with two models — one in catalog, one not.
-	msg := &protocol.RegisterMessage{
-		Type:     protocol.TypeRegister,
-		Hardware: testRegisterMessage().Hardware,
-		Models: []protocol.ModelInfo{
-			{ID: "mlx-community/Qwen3.5-9B-Instruct-4bit", SizeBytes: 5700000000, ModelType: "qwen3", Quantization: "4bit"},
-			{ID: "mlx-community/random-model-not-in-catalog", SizeBytes: 1000000, ModelType: "llama", Quantization: "4bit"},
-		},
-		Backend: "vllm_mlx",
+	msg := testRegisterMessage()
+	msg.Models = []protocol.ModelInfo{
+		{ID: "mlx-community/Qwen3.5-9B-Instruct-4bit", SizeBytes: 5700000000, ModelType: "qwen3", Quantization: "4bit"},
+		{ID: "mlx-community/random-model-not-in-catalog", SizeBytes: 1000000, ModelType: "llama", Quantization: "4bit"},
 	}
 	p := reg.Register("p1", nil, msg)
 
-	if len(p.Models) != 1 {
-		t.Fatalf("expected 1 model after catalog filter, got %d", len(p.Models))
+	if len(p.Models) != 2 {
+		t.Fatalf("expected full provider inventory to be preserved, got %d models", len(p.Models))
 	}
-	if p.Models[0].ID != "mlx-community/Qwen3.5-9B-Instruct-4bit" {
-		t.Errorf("expected whitelisted model, got %q", p.Models[0].ID)
+	testMakeTextRoutable(p)
+	if found := reg.FindProvider("mlx-community/random-model-not-in-catalog"); found != nil {
+		t.Fatal("expected non-catalog model to stay unroutable")
+	}
+	if found := reg.FindProvider("mlx-community/Qwen3.5-9B-Instruct-4bit"); found == nil {
+		t.Fatal("expected catalog model to be routable")
 	}
 }
 
@@ -1920,10 +2144,37 @@ func TestIsModelInCatalog(t *testing.T) {
 		t.Error("expected model-c to NOT be in catalog")
 	}
 
+	// Empty but configured catalog means deny-all. This is the production
+	// startup state for a fresh DB-backed model registry with no promoted rows.
+	reg.SetModelCatalog([]CatalogEntry{})
+	if reg.IsModelInCatalog("model-a") {
+		t.Error("expected configured empty catalog to deny all models")
+	}
+
 	// Clear catalog.
 	reg.SetModelCatalog(nil)
 	if !reg.IsModelInCatalog("model-c") {
 		t.Error("expected IsModelInCatalog to return true after clearing catalog")
+	}
+}
+
+func TestRegisterWithEmptyConfiguredCatalogPreservesInventoryButRoutesNothingUntilCatalogUpdates(t *testing.T) {
+	reg := New(testLogger())
+	reg.MinTrustLevel = TrustNone
+	reg.SetModelCatalog([]CatalogEntry{})
+
+	provider := reg.Register("p-empty-catalog", nil, testRegisterMessage())
+	if len(provider.Models) != 1 {
+		t.Fatalf("expected provider inventory to be preserved, got %#v", provider.Models)
+	}
+	testMakeTextRoutable(provider)
+	modelID := provider.Models[0].ID
+	if found := reg.FindProvider(modelID); found != nil {
+		t.Fatal("expected empty configured catalog to route no models")
+	}
+	reg.SetModelCatalog([]CatalogEntry{{ID: modelID}})
+	if found := reg.FindProvider(modelID); found == nil {
+		t.Fatal("expected existing provider to become routable after catalog update")
 	}
 }
 
@@ -2000,11 +2251,20 @@ func TestModelCatalogWeightHashVerification(t *testing.T) {
 	}
 	p2 := reg.Register("p2", nil, msg2)
 
-	if len(p2.Models) != 1 {
-		t.Fatalf("expected 1 model (model-a rejected), got %d", len(p2.Models))
+	if len(p2.Models) != 2 {
+		t.Fatalf("expected full provider inventory to be preserved, got %d", len(p2.Models))
 	}
-	if p2.Models[0].ID != "model-b" {
-		t.Errorf("expected model-b to survive, got %q", p2.Models[0].ID)
+	reg.mu.RLock()
+	p2.mu.Lock()
+	modelAAllowed := reg.providerServesCatalogModelLocked(p2, "model-a")
+	modelBAllowed := reg.providerServesCatalogModelLocked(p2, "model-b")
+	p2.mu.Unlock()
+	reg.mu.RUnlock()
+	if modelAAllowed {
+		t.Fatal("expected model-a with wrong hash to be unroutable")
+	}
+	if !modelBAllowed {
+		t.Fatal("expected model-b to remain allowed")
 	}
 }
 
@@ -2340,6 +2600,33 @@ func TestBackwardCompatNoCapacity(t *testing.T) {
 	found := reg.FindProvider("mlx-community/Qwen3.5-9B-Instruct-4bit")
 	if found == nil {
 		t.Error("old provider without BackendCapacity should still be routable")
+	}
+}
+
+func TestHeartbeatClearsStaleBackendCapacity(t *testing.T) {
+	reg := New(testLogger())
+	msg := testRegisterMessage()
+	p := reg.Register("p1", nil, msg)
+	p.mu.Lock()
+	p.BackendCapacity = &protocol.BackendCapacity{
+		TotalMemoryGB: 64,
+		Slots: []protocol.BackendSlotCapacity{{
+			Model: "mlx-community/Qwen3.5-9B-Instruct-4bit",
+			State: "crashed",
+		}},
+	}
+	p.mu.Unlock()
+
+	reg.Heartbeat("p1", &protocol.HeartbeatMessage{
+		Type:   protocol.TypeHeartbeat,
+		Status: "idle",
+		Stats:  protocol.HeartbeatStats{},
+	})
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.BackendCapacity != nil {
+		t.Fatalf("BackendCapacity=%+v, want nil after omitted heartbeat capacity", p.BackendCapacity)
 	}
 }
 

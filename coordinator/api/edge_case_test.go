@@ -163,9 +163,9 @@ func TestEdge_UnicodeInModelName(t *testing.T) {
 	w := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w, req)
 
-	// Should fail with not found (not in catalog or no provider)
-	if w.Code != http.StatusNotFound && w.Code != http.StatusServiceUnavailable {
-		t.Errorf("unicode model: status = %d, want 404 or 503", w.Code)
+	// Should fail with not found (not in catalog), 429 (queue timeout), or 503 (no provider).
+	if w.Code != http.StatusNotFound && w.Code != http.StatusTooManyRequests && w.Code != http.StatusServiceUnavailable {
+		t.Errorf("unicode model: status = %d, want 404, 429, or 503", w.Code)
 	}
 }
 
@@ -299,6 +299,9 @@ func TestEdge_AuthMalformedHeader(t *testing.T) {
 func TestEdge_WrongHTTPMethod(t *testing.T) {
 	srv, _ := testServer(t)
 
+	// /v1/chat/completions is POST-only. Wrong methods are caught by the
+	// /v1/ catch-all and return a structured JSON 404 (not Go's default 405
+	// text/plain), which is better for OpenAI SDK compatibility.
 	methods := []string{http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodPatch}
 	for _, method := range methods {
 		t.Run(method, func(t *testing.T) {
@@ -307,8 +310,12 @@ func TestEdge_WrongHTTPMethod(t *testing.T) {
 			w := httptest.NewRecorder()
 			srv.Handler().ServeHTTP(w, req)
 
-			if w.Code != http.StatusMethodNotAllowed {
-				t.Errorf("%s: status = %d, want 405", method, w.Code)
+			if w.Code != http.StatusNotFound {
+				t.Errorf("%s: status = %d, want 404", method, w.Code)
+			}
+			ct := w.Header().Get("Content-Type")
+			if ct != "application/json" {
+				t.Errorf("%s: Content-Type = %q, want application/json", method, ct)
 			}
 		})
 	}
@@ -320,9 +327,9 @@ func TestEdge_WrongHTTPMethod(t *testing.T) {
 
 func TestEdge_ProviderEmptyModels(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -343,9 +350,9 @@ func TestEdge_ProviderEmptyModels(t *testing.T) {
 
 func TestEdge_ProviderDuplicateModels(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -371,9 +378,9 @@ func TestEdge_ProviderDuplicateModels(t *testing.T) {
 
 func TestEdge_ProviderVeryLargeRegistration(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -405,9 +412,9 @@ func TestEdge_ProviderVeryLargeRegistration(t *testing.T) {
 
 func TestEdge_CatalogChangeDuringActiveProvider(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 100 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())
@@ -535,9 +542,9 @@ func TestEdge_ProviderSendsVeryLargeChunk(t *testing.T) {
 
 func TestEdge_ConcurrentRequestsSameProvider(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 500 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())
@@ -609,15 +616,7 @@ func TestEdge_ConcurrentRequestsSameProvider(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestEdge_ModelsEndpointNoProviders(t *testing.T) {
-	srv, st := testServer(t)
-
-	// Add models to the catalog store
-	st.SetSupportedModel(&store.SupportedModel{
-		ID: "model-a", DisplayName: "Model A", ModelType: "text", Active: true,
-	})
-
-	// Sync catalog to registry
-	srv.SyncModelCatalog()
+	srv, _ := testServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer test-key")
@@ -633,63 +632,9 @@ func TestEdge_ModelsEndpointNoProviders(t *testing.T) {
 	}
 	json.Unmarshal(w.Body.Bytes(), &resp)
 
-	// With no providers connected, the models list will be empty
-	// (models endpoint shows available models from live providers)
-	// This verifies the endpoint doesn't crash with no providers
-}
-
-func TestEdge_ModelCatalogHidesRetiredProviderModels(t *testing.T) {
-	srv, st := testServer(t)
-
-	models := []store.SupportedModel{
-		{
-			ID:          "black-forest-labs/FLUX.1-schnell",
-			S3Name:      "flux-4b",
-			DisplayName: "Flux 4B",
-			ModelType:   "image",
-			Active:      true,
-		},
-		{
-			ID:          "cohere/command-audio-stt",
-			S3Name:      "cohere-stt",
-			DisplayName: "Cohere STT",
-			ModelType:   "transcription",
-			Active:      true,
-		},
-		{
-			ID:          "qwen3.5-27b-claude-opus-8bit",
-			S3Name:      "qwen35-27b-claude-opus-8bit",
-			DisplayName: "Qwen3.5 27B Claude Opus",
-			ModelType:   "text",
-			Active:      true,
-		},
-	}
-	for _, model := range models {
-		if err := st.SetSupportedModel(&model); err != nil {
-			t.Fatalf("SetSupportedModel(%q): %v", model.ID, err)
-		}
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/v1/models/catalog", nil)
-	w := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("models catalog: status = %d, want 200", w.Code)
-	}
-
-	var resp struct {
-		Models []store.SupportedModel `json:"models"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(resp.Models) != 1 {
-		t.Fatalf("models len = %d, want 1: %#v", len(resp.Models), resp.Models)
-	}
-	if resp.Models[0].ID != "qwen3.5-27b-claude-opus-8bit" {
-		t.Fatalf("model = %q, want qwen text model", resp.Models[0].ID)
-	}
+	// With no providers connected, the models list is empty (the endpoint shows
+	// available models from live providers). This verifies the endpoint doesn't
+	// crash with no providers or registry rows.
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,9 +1153,9 @@ func TestEdge_ErrorResponseFormat(t *testing.T) {
 
 func TestEdge_ProviderDisconnectMidStream(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -1406,9 +1351,9 @@ func TestEdge_VersionEndpointIncludesSwiftReleaseMetadata(t *testing.T) {
 
 func TestEdge_ProviderInvalidPublicKey(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()

@@ -115,7 +115,7 @@ const FAQ = [
   },
   {
     question: "What models can I serve?",
-    answer: "The interactive model picker shows all supported models that fit your hardware. Models include text models like Qwen3.5 27B, Gemma 4 26B, and MiniMax M2.5 239B. The provider downloads selected models automatically.",
+    answer: "The interactive model picker shows all supported models that fit your hardware. Models include text models like Gemma 4 26B and GPT-OSS 20B. The provider downloads selected models automatically.",
   },
   {
     question: "What is hardware attestation?",
@@ -148,7 +148,7 @@ export default function ProviderSetupPage() {
           Your Mac becomes part of a decentralized, hardware-attested inference network.
         </p>
         <p className="text-xs text-text-tertiary max-w-md mx-auto mt-3 leading-relaxed">
-          Darkbloom is an experimental research project in active development.
+          Darkbloom is currently in public alpha and in active development.
           Provider participation is part of our pilot program and the system may change as we iterate.
         </p>
       </div>

@@ -13,7 +13,7 @@ package api
 //   - mlx-community/Qwen3.5-0.8B-MLX-4bit downloaded (~0.5GB per instance)
 //   - ~1GB RAM per provider instance
 //
-// Gate: LIVE_FULLSTACK_TEST=1 cargo test (not run in CI)
+// Gate: LIVE_FULLSTACK_TEST=1 (not run in CI)
 //
 //     LIVE_FULLSTACK_TEST=1 go test ./internal/api/ -run TestFullStack -v -timeout=600s
 //
@@ -188,7 +188,7 @@ func (p *simulatedProvider) connect(ctx context.Context, coordinatorURL string) 
 			Quantization: "4bit",
 			SizeBytes:    500_000_000,
 		}},
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               p.pubKeyB64,
 		DecodeTPS:               100.0,
 		EncryptedResponseChunks: true,
@@ -462,11 +462,11 @@ func TestFullStack_MultiProviderInference(t *testing.T) {
 	// --- Start coordinator ---
 	t.Log("=== Starting coordinator ===")
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 	reg.MinTrustLevel = registry.TrustNone // no attestation for testing
 	reg.SetQueue(registry.NewRequestQueue(100, 60*time.Second))
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 30 * time.Second
 
 	ts := httptest.NewServer(srv.Handler())
@@ -678,7 +678,7 @@ func TestFullStack_MultiProviderInference(t *testing.T) {
 
 	// --- Test 8: Model not available ---
 	t.Log("--- Test 8: Model not available ---")
-	code, body, _ = consumerRequest(ctx, ts.URL, "test-key", "nonexistent-model-xyz",
+	code, _, _ = consumerRequest(ctx, ts.URL, "test-key", "nonexistent-model-xyz",
 		"hello", true)
 	if code == 200 {
 		t.Error("request for nonexistent model should not succeed")
@@ -735,11 +735,11 @@ func TestFullStack_TenProviderStress(t *testing.T) {
 
 	t.Logf("=== 10-PROVIDER STRESS TEST ===")
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 	reg.MinTrustLevel = registry.TrustNone
 	reg.SetQueue(registry.NewRequestQueue(200, 60*time.Second))
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 30 * time.Second
 
 	ts := httptest.NewServer(srv.Handler())
@@ -898,11 +898,11 @@ func runBatchingBenchmark(t *testing.T, numProviders, numRequests int, continuou
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 	reg.MinTrustLevel = registry.TrustNone
 	reg.SetQueue(registry.NewRequestQueue(200, 120*time.Second))
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 60 * time.Second
 
 	ts := httptest.NewServer(srv.Handler())
@@ -1048,11 +1048,11 @@ func TestFullStack_LargeModelInference(t *testing.T) {
 	t.Logf("=== LARGE MODEL TEST: %s ===", selectedModel)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
 	reg.MinTrustLevel = registry.TrustNone
 	reg.SetQueue(registry.NewRequestQueue(10, 120*time.Second))
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 60 * time.Second
 
 	ts := httptest.NewServer(srv.Handler())

@@ -62,6 +62,61 @@ func TestRegisterMessageMarshal(t *testing.T) {
 	}
 }
 
+// TestRegisterMessagePrivateOnlySymmetry verifies the coordinator decodes the
+// private_only flag the Swift provider emits (snake_case key, only present when
+// true), and that the Go side round-trips it. Protects the Go↔Swift protocol
+// symmetry for the self-route "private machine" mode.
+func TestRegisterMessagePrivateOnlySymmetry(t *testing.T) {
+	// A minimal register payload exactly as the Swift ProviderMessage encoder
+	// emits it (private_only present and true).
+	swiftJSON := `{
+		"type": "register",
+		"hardware": {"chip_name": "Apple M3 Max", "memory_gb": 64},
+		"models": [{"id": "m", "model_type": "qwen3", "quantization": "4bit"}],
+		"backend": "mlx",
+		"public_key": "abc",
+		"auth_token": "tok",
+		"private_only": true
+	}`
+	var decoded RegisterMessage
+	if err := json.Unmarshal([]byte(swiftJSON), &decoded); err != nil {
+		t.Fatalf("unmarshal swift payload: %v", err)
+	}
+	if !decoded.PrivateOnly {
+		t.Fatal("private_only=true from the Swift payload did not decode")
+	}
+
+	// Omitted private_only must default to false (Swift omits it when false).
+	withoutFlag := `{"type":"register","hardware":{},"models":[],"backend":"mlx"}`
+	var d2 RegisterMessage
+	if err := json.Unmarshal([]byte(withoutFlag), &d2); err != nil {
+		t.Fatalf("unmarshal without flag: %v", err)
+	}
+	if d2.PrivateOnly {
+		t.Fatal("private_only should default to false when omitted")
+	}
+
+	// Go round-trip: false is omitted (omitempty), true survives.
+	data, _ := json.Marshal(RegisterMessage{Type: TypeRegister, PrivateOnly: false})
+	if contains(string(data), "private_only") {
+		t.Errorf("private_only=false should be omitted, got %s", data)
+	}
+	data, _ = json.Marshal(RegisterMessage{Type: TypeRegister, PrivateOnly: true})
+	var back RegisterMessage
+	if err := json.Unmarshal(data, &back); err != nil || !back.PrivateOnly {
+		t.Errorf("private_only=true round-trip failed: %v / %s", err, data)
+	}
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
 func TestHeartbeatMessageMarshal(t *testing.T) {
 	msg := HeartbeatMessage{
 		Type:        TypeHeartbeat,
@@ -94,6 +149,83 @@ func TestHeartbeatMessageMarshal(t *testing.T) {
 	}
 }
 
+func TestBackendSlotCapacityMaxConcurrencyRoundTrip(t *testing.T) {
+	msg := HeartbeatMessage{
+		Type:   TypeHeartbeat,
+		Status: "serving",
+		BackendCapacity: &BackendCapacity{
+			Slots: []BackendSlotCapacity{{
+				Model:          "qwen",
+				State:          "running",
+				MaxConcurrency: 3,
+			}},
+		},
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !json.Valid(data) {
+		t.Fatal("marshaled heartbeat is invalid JSON")
+	}
+
+	var decoded HeartbeatMessage
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.BackendCapacity == nil || len(decoded.BackendCapacity.Slots) != 1 {
+		t.Fatalf("decoded slots = %+v", decoded.BackendCapacity)
+	}
+	if got := decoded.BackendCapacity.Slots[0].MaxConcurrency; got != 3 {
+		t.Fatalf("MaxConcurrency=%d, want 3", got)
+	}
+}
+
+func TestBackendSlotCapacityMaxConcurrencyOmittedCompatibility(t *testing.T) {
+	data := []byte(`{
+		"type":"heartbeat",
+		"status":"serving",
+		"active_model":null,
+		"stats":{},
+		"system_metrics":{},
+		"backend_capacity":{"slots":[{"model":"qwen","state":"running"}]}
+	}`)
+
+	var decoded HeartbeatMessage
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.BackendCapacity == nil || len(decoded.BackendCapacity.Slots) != 1 {
+		t.Fatalf("decoded slots = %+v", decoded.BackendCapacity)
+	}
+	if got := decoded.BackendCapacity.Slots[0].MaxConcurrency; got != 0 {
+		t.Fatalf("omitted MaxConcurrency=%d, want zero compatibility default", got)
+	}
+}
+
+func TestBackendSlotCapacityMaxConcurrencyExplicitZeroCompatibility(t *testing.T) {
+	data := []byte(`{
+		"type":"heartbeat",
+		"status":"serving",
+		"active_model":null,
+		"stats":{},
+		"system_metrics":{},
+		"backend_capacity":{"slots":[{"model":"qwen","state":"running","max_concurrency":0}]}
+	}`)
+
+	var decoded HeartbeatMessage
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.BackendCapacity == nil || len(decoded.BackendCapacity.Slots) != 1 {
+		t.Fatalf("decoded slots = %+v", decoded.BackendCapacity)
+	}
+	if got := decoded.BackendCapacity.Slots[0].MaxConcurrency; got != 0 {
+		t.Fatalf("explicit zero MaxConcurrency=%d, want preserved zero", got)
+	}
+}
+
 func TestHeartbeatWithActiveModel(t *testing.T) {
 	model := "qwen3.5-9b"
 	msg := HeartbeatMessage{
@@ -118,6 +250,25 @@ func TestHeartbeatWithActiveModel(t *testing.T) {
 	}
 	if *decoded.ActiveModel != "qwen3.5-9b" {
 		t.Errorf("active_model = %q, want %q", *decoded.ActiveModel, "qwen3.5-9b")
+	}
+}
+
+func TestProviderMessageUnmarshalLoadModelStatus(t *testing.T) {
+	data := []byte(`{"type":"load_model_status","model_id":"qwen","status":"failed","error":"GPU OOM"}`)
+
+	var msg ProviderMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if msg.Type != TypeLoadModelStatus {
+		t.Fatalf("Type=%q, want %q", msg.Type, TypeLoadModelStatus)
+	}
+	status, ok := msg.Payload.(*LoadModelStatusMessage)
+	if !ok {
+		t.Fatalf("Payload=%T, want *LoadModelStatusMessage", msg.Payload)
+	}
+	if status.ModelID != "qwen" || status.Status != LoadModelStatusFailed || status.Error != "GPU OOM" {
+		t.Fatalf("decoded status = %+v", status)
 	}
 }
 
@@ -365,35 +516,6 @@ func TestProviderMessageUnmarshalInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestRegisterMessageWithWalletAddress(t *testing.T) {
-	msg := RegisterMessage{
-		Type: TypeRegister,
-		Hardware: Hardware{
-			ChipName: "Apple M3 Max",
-			MemoryGB: 64,
-		},
-		Models: []ModelInfo{
-			{ID: "qwen3.5-9b", ModelType: "qwen3", Quantization: "4bit"},
-		},
-		Backend:       "vllm_mlx",
-		WalletAddress: "0x1234567890abcdef1234567890abcdef12345678",
-	}
-
-	data, err := json.Marshal(msg)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-
-	var decoded RegisterMessage
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	if decoded.WalletAddress != "0x1234567890abcdef1234567890abcdef12345678" {
-		t.Errorf("wallet_address = %q", decoded.WalletAddress)
-	}
-}
-
 func TestRegisterMessageWithAttestation(t *testing.T) {
 	attestationJSON := json.RawMessage(`{"attestation":{"chipName":"Apple M3 Max","hardwareModel":"Mac15,8","publicKey":"dGVzdA=="},"signature":"c2ln"}`)
 	msg := RegisterMessage{
@@ -451,42 +573,6 @@ func TestRegisterMessageWithoutAttestation(t *testing.T) {
 	json.Unmarshal(data, &m)
 	if _, ok := m["attestation"]; ok {
 		t.Error("attestation should be omitted when nil")
-	}
-}
-
-func TestRegisterMessageWithoutWalletAddress(t *testing.T) {
-	// wallet_address should be omitted from JSON when empty.
-	msg := RegisterMessage{
-		Type:     TypeRegister,
-		Hardware: Hardware{ChipName: "M3 Max", MemoryGB: 64},
-		Models:   []ModelInfo{{ID: "test"}},
-		Backend:  "test",
-	}
-
-	data, err := json.Marshal(msg)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-
-	// wallet_address should not appear when empty (omitempty)
-	var m map[string]any
-	json.Unmarshal(data, &m)
-	if _, ok := m["wallet_address"]; ok {
-		t.Error("wallet_address should be omitted when empty")
-	}
-}
-
-func TestProviderMessageUnmarshalRegisterWithWallet(t *testing.T) {
-	raw := `{"type":"register","hardware":{"chip_name":"M3 Max","memory_gb":64},"models":[{"id":"test"}],"backend":"test","wallet_address":"0xDeadBeef"}`
-
-	var pm ProviderMessage
-	if err := json.Unmarshal([]byte(raw), &pm); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	reg := pm.Payload.(*RegisterMessage)
-	if reg.WalletAddress != "0xDeadBeef" {
-		t.Errorf("wallet_address = %q, want 0xDeadBeef", reg.WalletAddress)
 	}
 }
 
@@ -784,5 +870,90 @@ func TestProviderMessageUnmarshalHeartbeatWithoutCapacity(t *testing.T) {
 	hb := pm.Payload.(*HeartbeatMessage)
 	if hb.BackendCapacity != nil {
 		t.Error("backend_capacity should be nil for old providers")
+	}
+}
+
+func TestBackendSlotCapacityTokenBudgetFields(t *testing.T) {
+	slot := BackendSlotCapacity{
+		Model:                 "mlx-community/Qwen2.5-7B-4bit",
+		State:                 "running",
+		NumRunning:            3,
+		NumWaiting:            1,
+		ActiveTokens:          5000,
+		MaxTokensPotential:    12000,
+		ObservedDecodeTPS:     85.5,
+		ActiveTokenBudgetUsed: 28000,
+		ActiveTokenBudgetMax:  32768,
+		QueuedTokenBudget:     4096,
+	}
+
+	data, err := json.Marshal(slot)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded BackendSlotCapacity
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.ObservedDecodeTPS != 85.5 {
+		t.Errorf("observed_decode_tps = %f, want 85.5", decoded.ObservedDecodeTPS)
+	}
+	if decoded.ActiveTokenBudgetUsed != 28000 {
+		t.Errorf("active_token_budget_used = %d, want 28000", decoded.ActiveTokenBudgetUsed)
+	}
+	if decoded.ActiveTokenBudgetMax != 32768 {
+		t.Errorf("active_token_budget_max = %d, want 32768", decoded.ActiveTokenBudgetMax)
+	}
+	if decoded.QueuedTokenBudget != 4096 {
+		t.Errorf("queued_token_budget = %d, want 4096", decoded.QueuedTokenBudget)
+	}
+}
+
+func TestBackendSlotCapacityOmitsZeroTokenBudget(t *testing.T) {
+	slot := BackendSlotCapacity{
+		Model:      "test-model",
+		State:      "running",
+		NumRunning: 1,
+	}
+
+	data, err := json.Marshal(slot)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var m map[string]any
+	json.Unmarshal(data, &m)
+
+	for _, key := range []string{"observed_decode_tps", "active_token_budget_used", "active_token_budget_max", "queued_token_budget"} {
+		if _, ok := m[key]; ok {
+			t.Errorf("%s should be omitted when zero (omitempty)", key)
+		}
+	}
+}
+
+func TestBackendSlotCapacityBackwardCompatDecode(t *testing.T) {
+	// Old provider sends a slot without the new token-budget fields.
+	raw := `{"model":"test","state":"running","num_running":2,"num_waiting":0,"active_tokens":3000,"max_tokens_potential":8000}`
+
+	var slot BackendSlotCapacity
+	if err := json.Unmarshal([]byte(raw), &slot); err != nil {
+		t.Fatalf("unmarshal old-format slot: %v", err)
+	}
+	if slot.ObservedDecodeTPS != 0 {
+		t.Errorf("observed_decode_tps = %f, want 0 (absent from JSON)", slot.ObservedDecodeTPS)
+	}
+	if slot.ActiveTokenBudgetUsed != 0 {
+		t.Errorf("active_token_budget_used = %d, want 0", slot.ActiveTokenBudgetUsed)
+	}
+	if slot.ActiveTokenBudgetMax != 0 {
+		t.Errorf("active_token_budget_max = %d, want 0", slot.ActiveTokenBudgetMax)
+	}
+	if slot.QueuedTokenBudget != 0 {
+		t.Errorf("queued_token_budget = %d, want 0", slot.QueuedTokenBudget)
+	}
+	if slot.NumRunning != 2 {
+		t.Errorf("num_running = %d, want 2", slot.NumRunning)
 	}
 }

@@ -7,7 +7,7 @@ import (
 )
 
 func TestNewWithAdminKey(t *testing.T) {
-	s := NewMemory("test-admin-key")
+	s := NewMemory(Config{AdminKey: "test-admin-key"})
 	if !s.ValidateKey("test-admin-key") {
 		t.Error("admin key should be valid")
 	}
@@ -17,22 +17,22 @@ func TestNewWithAdminKey(t *testing.T) {
 }
 
 func TestNewWithoutAdminKey(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 	if s.KeyCount() != 0 {
 		t.Errorf("key count = %d, want 0", s.KeyCount())
 	}
 }
 
 func TestCreateKey(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	key, err := s.CreateKey()
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
 
-	if !strings.HasPrefix(key, "eigeninference-") {
-		t.Errorf("key %q does not have eigeninference- prefix", key)
+	if !strings.HasPrefix(key, KeyPrefix) {
+		t.Errorf("key %q does not have %q prefix", key, KeyPrefix)
 	}
 
 	if !s.ValidateKey(key) {
@@ -45,7 +45,7 @@ func TestCreateKey(t *testing.T) {
 }
 
 func TestCreateMultipleKeys(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	key1, _ := s.CreateKey()
 	key2, _ := s.CreateKey()
@@ -60,7 +60,7 @@ func TestCreateMultipleKeys(t *testing.T) {
 }
 
 func TestValidateKeyInvalid(t *testing.T) {
-	s := NewMemory("admin-key")
+	s := NewMemory(Config{AdminKey: "admin-key"})
 	if s.ValidateKey("wrong-key") {
 		t.Error("wrong key should not be valid")
 	}
@@ -70,7 +70,7 @@ func TestValidateKeyInvalid(t *testing.T) {
 }
 
 func TestRevokeKey(t *testing.T) {
-	s := NewMemory("admin-key")
+	s := NewMemory(Config{AdminKey: "admin-key"})
 
 	key, _ := s.CreateKey()
 	if !s.ValidateKey(key) {
@@ -86,14 +86,14 @@ func TestRevokeKey(t *testing.T) {
 }
 
 func TestRevokeKeyNonexistent(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 	if s.RevokeKey("nonexistent") {
 		t.Error("RevokeKey should return false for nonexistent key")
 	}
 }
 
 func TestRecordUsage(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	s.RecordUsage("provider-1", "consumer-key", "qwen3.5-9b", 50, 100)
 	s.RecordUsage("provider-2", "consumer-key", "llama-3", 30, 200)
@@ -125,7 +125,7 @@ func TestRecordUsage(t *testing.T) {
 }
 
 func TestUsageRecordsReturnsCopy(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 	s.RecordUsage("p1", "k1", "m1", 10, 20)
 
 	records := s.UsageRecords()
@@ -139,7 +139,7 @@ func TestUsageRecordsReturnsCopy(t *testing.T) {
 }
 
 func TestUsageRecordsEmpty(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 	records := s.UsageRecords()
 	if len(records) != 0 {
 		t.Errorf("usage records = %d, want 0", len(records))
@@ -147,7 +147,7 @@ func TestUsageRecordsEmpty(t *testing.T) {
 }
 
 func TestRecordPayment(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	err := s.RecordPayment("0xabc123", "0xconsumer", "0xprovider", "0.05", "qwen3.5-9b", 50, 100, "test payment")
 	if err != nil {
@@ -156,7 +156,7 @@ func TestRecordPayment(t *testing.T) {
 }
 
 func TestRecordPaymentDuplicateTxHash(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	err := s.RecordPayment("0xabc123", "0xconsumer", "0xprovider", "0.05", "qwen3.5-9b", 50, 100, "")
 	if err != nil {
@@ -170,111 +170,11 @@ func TestRecordPaymentDuplicateTxHash(t *testing.T) {
 }
 
 func TestMemoryStoreImplementsInterface(t *testing.T) {
-	var _ Store = NewMemory("")
-}
-
-func TestSupportedModels(t *testing.T) {
-	s := NewMemory("")
-
-	// Initially empty
-	models := s.ListSupportedModels()
-	if len(models) != 0 {
-		t.Fatalf("expected 0 models, got %d", len(models))
-	}
-
-	// Add models
-	m1 := &SupportedModel{
-		ID:           "mlx-community/Qwen2.5-0.5B-MLX-4bit",
-		S3Name:       "Qwen2.5-0.5B-MLX-4bit",
-		DisplayName:  "Qwen2.5 0.5B",
-		ModelType:    "text",
-		SizeGB:       0.5,
-		Architecture: "0.5B dense",
-		Description:  "Lightweight chat model",
-		MinRAMGB:     8,
-		Active:       true,
-	}
-	m2 := &SupportedModel{
-		ID:           "mlx-community/Qwen3.5-9B-MLX-4bit",
-		S3Name:       "Qwen3.5-9B-MLX-4bit",
-		DisplayName:  "Qwen3.5 9B",
-		ModelType:    "text",
-		SizeGB:       6.0,
-		Architecture: "9B dense",
-		Description:  "Balanced",
-		MinRAMGB:     16,
-		Active:       true,
-	}
-
-	if err := s.SetSupportedModel(m1); err != nil {
-		t.Fatalf("SetSupportedModel m1: %v", err)
-	}
-	if err := s.SetSupportedModel(m2); err != nil {
-		t.Fatalf("SetSupportedModel m2: %v", err)
-	}
-
-	models = s.ListSupportedModels()
-	if len(models) != 2 {
-		t.Fatalf("expected 2 models, got %d", len(models))
-	}
-	// Should be sorted by MinRAMGB ascending
-	if models[0].MinRAMGB > models[1].MinRAMGB {
-		t.Error("models should be sorted by MinRAMGB ascending")
-	}
-	if models[0].ID != m1.ID {
-		t.Errorf("first model = %q, want %q", models[0].ID, m1.ID)
-	}
-
-	// Update existing model
-	m1Updated := &SupportedModel{
-		ID:           m1.ID,
-		S3Name:       m1.S3Name,
-		DisplayName:  "Qwen2.5 0.5B (updated)",
-		SizeGB:       0.5,
-		Architecture: m1.Architecture,
-		Description:  "Updated description",
-		MinRAMGB:     8,
-		Active:       false,
-	}
-	if err := s.SetSupportedModel(m1Updated); err != nil {
-		t.Fatalf("SetSupportedModel update: %v", err)
-	}
-	models = s.ListSupportedModels()
-	if len(models) != 2 {
-		t.Fatalf("expected 2 models after update, got %d", len(models))
-	}
-	// Find the updated model
-	for _, m := range models {
-		if m.ID == m1.ID {
-			if m.DisplayName != "Qwen2.5 0.5B (updated)" {
-				t.Errorf("display_name = %q, want updated", m.DisplayName)
-			}
-			if m.Active {
-				t.Error("model should be inactive after update")
-			}
-		}
-	}
-
-	// Delete model
-	if err := s.DeleteSupportedModel(m1.ID); err != nil {
-		t.Fatalf("DeleteSupportedModel: %v", err)
-	}
-	models = s.ListSupportedModels()
-	if len(models) != 1 {
-		t.Fatalf("expected 1 model after delete, got %d", len(models))
-	}
-	if models[0].ID != m2.ID {
-		t.Errorf("remaining model = %q, want %q", models[0].ID, m2.ID)
-	}
-
-	// Delete nonexistent model
-	if err := s.DeleteSupportedModel("nonexistent"); err == nil {
-		t.Error("expected error deleting nonexistent model")
-	}
+	var _ Store = NewMemory(Config{})
 }
 
 func TestDeviceCodeFlow(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	dc := &DeviceCode{
 		DeviceCode: "dev-code-123",
@@ -329,7 +229,7 @@ func TestDeviceCodeFlow(t *testing.T) {
 }
 
 func TestDeviceCodeExpiry(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	dc := &DeviceCode{
 		DeviceCode: "expired-code",
@@ -356,7 +256,7 @@ func TestDeviceCodeExpiry(t *testing.T) {
 }
 
 func TestProviderToken(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	rawToken := "darkbloom-token-abc123"
 	tokenHash := sha256Hex(rawToken)
@@ -390,7 +290,7 @@ func TestProviderToken(t *testing.T) {
 }
 
 func TestProviderEarnings_RecordAndGetByAccount(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	// Record three earnings for the same account, two different nodes.
 	e1 := &ProviderEarning{
@@ -444,7 +344,7 @@ func TestProviderEarnings_RecordAndGetByAccount(t *testing.T) {
 }
 
 func TestProviderEarnings_GetByProviderKey(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	// Record earnings for two different nodes.
 	for i := range 5 {
@@ -489,7 +389,7 @@ func TestProviderEarnings_GetByProviderKey(t *testing.T) {
 }
 
 func TestProviderEarnings_NewestFirst(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	// Record in chronological order.
 	for i := range 5 {
@@ -513,7 +413,7 @@ func TestProviderEarnings_NewestFirst(t *testing.T) {
 }
 
 func TestProviderEarnings_LimitRespected(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	// Record 10 earnings.
 	for i := range 10 {
@@ -548,7 +448,7 @@ func TestProviderEarnings_LimitRespected(t *testing.T) {
 }
 
 func TestProviderEarnings_DifferentAccounts(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	// Record earnings for two different accounts.
 	_ = s.RecordProviderEarning(&ProviderEarning{
@@ -580,7 +480,7 @@ func TestProviderEarnings_DifferentAccounts(t *testing.T) {
 }
 
 func TestProviderPayouts_RecordListAndSettle(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	p1 := &ProviderPayout{
 		ProviderAddress: "0xProvider1",
@@ -635,7 +535,7 @@ func TestProviderPayouts_RecordListAndSettle(t *testing.T) {
 }
 
 func TestCreditProviderAccountAtomic(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	earning := &ProviderEarning{
 		AccountID:        "acct-linked",
@@ -676,7 +576,7 @@ func TestCreditProviderAccountAtomic(t *testing.T) {
 }
 
 func TestCreditProviderWalletAtomic(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	payout := &ProviderPayout{
 		ProviderAddress: "0xatomicwallet",
@@ -713,7 +613,7 @@ func TestCreditProviderWalletAtomic(t *testing.T) {
 }
 
 func TestReleases(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	// Empty initially.
 	releases := s.ListReleases()
@@ -804,7 +704,7 @@ func TestReleases(t *testing.T) {
 }
 
 func TestGetLatestReleasePrefersHigherSemverOverNewerTimestamp(t *testing.T) {
-	s := NewMemory("")
+	s := NewMemory(Config{})
 
 	if err := s.SetRelease(&Release{
 		Version:    "0.3.9",

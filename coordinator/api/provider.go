@@ -28,8 +28,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"log/slog"
+	"errors"
+
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,8 +53,20 @@ const (
 	// ChallengeResponseTimeout is how long to wait for a challenge response.
 	ChallengeResponseTimeout = 30 * time.Second
 
-	// MaxFailedChallenges is the number of consecutive failures before marking untrusted.
-	MaxFailedChallenges = 3
+	// MaxConsecutiveChallengeTimeoutsBeforeReconnect is the number of consecutive
+	// transient challenge timeouts (no response within ChallengeResponseTimeout)
+	// after which the coordinator force-closes the provider's WebSocket so it must
+	// reconnect and re-register.
+	//
+	// MarkUntrustedTransient keeps challenging a provider in place so it can
+	// self-recover via a later passing challenge — but that only helps if the
+	// provider can actually send a response. A provider whose outbound path is
+	// wedged keeps heartbeating (so it is never evicted by the stale sweeper)
+	// while failing every challenge, leaving it pinned hardware/untrusted forever.
+	// Cycling the connection forces a clean re-registration, which is the only way
+	// back. Must be > MaxFailedChallenges so a brief blip (sleep/network) still
+	// self-recovers without a disconnect.
+	MaxConsecutiveChallengeTimeoutsBeforeReconnect = 6
 )
 
 // pendingChallenge tracks an outstanding challenge sent to a provider.
@@ -113,12 +127,12 @@ func (s *Server) handleProviderWS(w http.ResponseWriter, r *http.Request) {
 	acmeResult := s.extractAndVerifyClientCert(r)
 
 	// Run the read loop; on return the provider is disconnected.
-	s.providerReadLoop(r.Context(), conn, providerID, acmeResult)
+	s.providerReadLoop(r.Context(), conn, providerID, acmeResult, r)
 }
 
 // providerReadLoop reads messages from the provider WebSocket and dispatches
 // them. It runs until the connection closes or the context is cancelled.
-func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, providerID string, acmeResult *ACMEVerificationResult) {
+func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, providerID string, acmeResult *ACMEVerificationResult, r *http.Request) {
 	var provider *registry.Provider
 	tracker := newChallengeTracker()
 
@@ -127,6 +141,7 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 	defer func() {
 		loopCancel()
 		s.registry.Disconnect(providerID)
+		s.clearPendingACME(providerID)
 		conn.Close(websocket.StatusNormalClosure, "goodbye")
 	}()
 
@@ -164,6 +179,7 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 		case protocol.TypeRegister:
 			regMsg := msg.Payload.(*protocol.RegisterMessage)
 			provider = s.registry.Register(providerID, conn, regMsg)
+			s.attachProviderLocation(providerID, provider, r)
 			s.verifyProviderAttestation(providerID, provider, regMsg)
 
 			// Record registration outcome metrics + telemetry.
@@ -238,9 +254,15 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 						_ = conn.Write(writeCtx, websocket.MessageText, statusData)
 						writeCancel()
 					}
+					mismatchDetails := make([]string, 0, len(mismatches))
+					for _, m := range mismatches {
+						mismatchDetails = append(mismatchDetails, m.Component+"="+m.Got)
+					}
 					s.logger.Warn("provider runtime integrity mismatch — excluded from routing",
 						"provider_id", providerID,
 						"mismatches", len(mismatches),
+						"details", mismatchDetails,
+						"backend", regMsg.Backend,
 					)
 				} else {
 					s.logger.Info("provider runtime integrity verified",
@@ -293,7 +315,14 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 
 		case protocol.TypeInferenceComplete:
 			completeMsg := msg.Payload.(*protocol.InferenceCompleteMessage)
-			s.handleComplete(providerID, provider, completeMsg)
+			// Run completion handling (billing settlement) off the read loop.
+			// Billing does synchronous DB calls (GetModelPrice, Credit, Charge)
+			// that can block for seconds under DB pressure. If the read loop is
+			// blocked, attestation challenge responses can't be read from the
+			// WebSocket, causing challenge timeouts and provider derouting.
+			saferun.Go(s.logger, "handleComplete", func() {
+				s.handleComplete(providerID, provider, completeMsg)
+			})
 
 		case protocol.TypeInferenceError:
 			errMsg := msg.Payload.(*protocol.InferenceErrorMessage)
@@ -303,10 +332,61 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 			respMsg := msg.Payload.(*protocol.AttestationResponseMessage)
 			s.handleAttestationResponse(providerID, provider, respMsg, tracker)
 
+		case protocol.TypeLoadModelStatus:
+			statusMsg := msg.Payload.(*protocol.LoadModelStatusMessage)
+			s.logger.Info("provider load_model_status",
+				"provider_id", providerID,
+				"model_id", statusMsg.ModelID,
+				"status", statusMsg.Status,
+				"error", statusMsg.Error,
+			)
+			switch statusMsg.Status {
+			case protocol.LoadModelStatusSucceeded:
+				// Mark the model warm on this provider BEFORE draining so
+				// the scheduler sees it as a candidate. Without this, the
+				// provider still looks cold until the next heartbeat.
+				s.registry.MarkModelWarm(providerID, statusMsg.ModelID)
+				s.registry.ClearPendingModelLoad(providerID, statusMsg.ModelID)
+				s.registry.DrainQueuedRequestsForModel(statusMsg.ModelID)
+			case protocol.LoadModelStatusFailed:
+				// Keep the pending entry (TTL cooldown suppresses retry storms).
+				// If no other provider can serve this model, reject queued
+				// requests immediately rather than making them wait 120s.
+				s.registry.RejectUnservableQueuedRequests(statusMsg.ModelID)
+			}
+			// "started" status: no action — load is in progress.
+
 		default:
 			s.logger.Warn("unhandled provider message type", "provider_id", providerID, "type", msg.Type)
 		}
 	}
+}
+
+// attachProviderLocation resolves the provider's approximate geographic
+// location from the registration HTTP request. The resolved location is
+// stored on the Provider struct for stats aggregation. Raw IP addresses
+// are never persisted.
+func (s *Server) attachProviderLocation(providerID string, provider *registry.Provider, r *http.Request) {
+	if s.geoResolver == nil || provider == nil || r == nil {
+		return
+	}
+	loc := s.geoResolver.Lookup(r)
+	if loc == nil {
+		return
+	}
+	provider.Mu().Lock()
+	provider.Location = loc
+	provider.Mu().Unlock()
+	s.registry.PersistProvider(provider)
+	if s.readCache != nil {
+		s.readCache.Invalidate("stats:v1")
+	}
+	s.logger.Info("provider location resolved",
+		"provider_id", providerID,
+		"city", loc.City,
+		"country", loc.CountryCode,
+		"source", loc.Source,
+	)
 }
 
 func (s *Server) applyACMETrust(providerID string, provider *registry.Provider, acmeResult *ACMEVerificationResult) {
@@ -318,12 +398,19 @@ func (s *Server) applyACMETrust(providerID string, provider *registry.Provider, 
 	provider.ACMEVerified = true
 	provider.Mu().Unlock()
 
+	// Stash the result so retryACMETrust can re-run this on the first passing
+	// challenge. At registration the attestation challenge/response has not yet
+	// completed, so AttestationResult is nil and the two binding checks below
+	// fail purely on ordering — without a retry the provider would stay
+	// self_signed forever despite presenting a valid device cert.
+	s.stashPendingACME(providerID, acmeResult)
+
 	if !providerHasBoundEncryptionAttestation(provider) {
-		s.logger.Warn("ACME client cert verified but X25519 key was not bound by attestation",
+		// Expected before the first challenge completes; logged at debug so it
+		// doesn't look like a failure. The retry path resolves it.
+		s.logger.Debug("ACME cert verified but attestation not yet bound — will retry after challenge",
 			"provider_id", providerID,
 			"acme_serial", acmeResult.SerialNumber,
-			"acme_issuer", acmeResult.Issuer,
-			"acme_key_alg", acmeResult.PublicKeyAlg,
 		)
 		return
 	}
@@ -338,12 +425,43 @@ func (s *Server) applyACMETrust(providerID string, provider *registry.Provider, 
 	}
 
 	provider.SetAttested(true, registry.TrustHardware)
+	s.sendTrustStatus(provider, registry.TrustHardware, "online", "ACME device attestation verified")
+	s.clearPendingACME(providerID)
 	s.logger.Info("ACME client cert verified — hardware trust via Apple SE attestation",
 		"provider_id", providerID,
 		"acme_serial", acmeResult.SerialNumber,
 		"acme_issuer", acmeResult.Issuer,
 		"acme_key_alg", acmeResult.PublicKeyAlg,
 	)
+}
+
+// stashPendingACME records the connect-time ACME result for later retry.
+func (s *Server) stashPendingACME(providerID string, acmeResult *ACMEVerificationResult) {
+	s.pendingACMEMu.Lock()
+	s.pendingACME[providerID] = acmeResult
+	s.pendingACMEMu.Unlock()
+}
+
+// clearPendingACME drops a stashed ACME result (after a successful upgrade or
+// on disconnect).
+func (s *Server) clearPendingACME(providerID string) {
+	s.pendingACMEMu.Lock()
+	delete(s.pendingACME, providerID)
+	s.pendingACMEMu.Unlock()
+}
+
+// retryACMETrust re-applies a stashed ACME result. Called from the
+// challenge-success path so a provider whose device cert was presented at
+// connect — but whose attestation had not yet bound — gets upgraded to
+// hardware once the binding completes. Mirrors the MDM re-verification retry.
+func (s *Server) retryACMETrust(providerID string, provider *registry.Provider) {
+	s.pendingACMEMu.Lock()
+	acmeResult := s.pendingACME[providerID]
+	s.pendingACMEMu.Unlock()
+	if acmeResult == nil {
+		return
+	}
+	s.applyACMETrust(providerID, provider, acmeResult)
 }
 
 func providerHasBoundEncryptionAttestation(provider *registry.Provider) bool {
@@ -419,10 +537,10 @@ func (s *Server) challengeLoop(ctx context.Context, conn *websocket.Conn, provid
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			provider.Mu().Lock()
-			untrusted := provider.Status == registry.StatusUntrusted
-			provider.Mu().Unlock()
-			if untrusted {
+			// Stop only for a hard (non-recoverable) untrust. A transiently
+			// untrusted provider (missed-challenge timeouts) keeps being
+			// challenged so a later passing challenge can restore it.
+			if provider.ChallengeShouldStop() {
 				return
 			}
 			s.sendChallenge(ctx, conn, providerID, provider, tracker)
@@ -490,13 +608,13 @@ func (s *Server) sendChallenge(ctx context.Context, conn *websocket.Conn, provid
 		tracker.remove(nonce)
 		if resp == nil {
 			// Channel closed without response
-			s.handleChallengeFailure(providerID, "no response")
+			s.handleTransientChallengeFailure(conn, providerID, "no response")
 			return
 		}
 		s.verifyChallengeResponse(providerID, provider, pc, resp)
 	case <-time.After(timeout):
 		tracker.remove(nonce)
-		s.handleChallengeFailure(providerID, "timeout")
+		s.handleTransientChallengeFailure(conn, providerID, "timeout")
 	}
 }
 
@@ -602,9 +720,36 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 				"provider_id", providerID,
 			)
 		default:
+			// Instrumentation for the non-recovering status-sig lockout seen on
+			// a couple of nodes (cause unconfirmed). Because the plain challenge
+			// signature already verified above (we returned on its failure),
+			// reaching here isolates the status-sig / canonical path: log
+			// plain_sig_passed plus the Go canonical bytes and per-field lengths
+			// so a field-presence or canonicalization mismatch is diagnosable
+			// from logs alone, without shipping a new build to the affected box.
+			canonical, cerr := attestation.BuildStatusCanonical(statusInput)
+			canonicalB64 := ""
+			if cerr == nil {
+				canonicalB64 = base64.StdEncoding.EncodeToString(canonical)
+			}
+			s.ddIncr("attestation.challenges", []string{"outcome:status_sig_failed"})
+			if s.metrics != nil {
+				s.metrics.IncCounter("attestation_status_sig_failed_total")
+			}
 			s.logger.Error("status signature verification failed — possible tampering or canonical mismatch",
 				"provider_id", providerID,
 				"error", err,
+				"plain_sig_passed", true,
+				"go_canonical_b64", canonicalB64,
+				"go_canonical_len", len(canonical),
+				"canonical_build_err", cerr,
+				"status_sig_len", len(resp.StatusSignature),
+				"binary_hash_len", len(resp.BinaryHash),
+				"active_model_hash_len", len(resp.ActiveModelHash),
+				"python_hash_len", len(resp.PythonHash),
+				"runtime_hash_len", len(resp.RuntimeHash),
+				"template_hashes_count", len(resp.TemplateHashes),
+				"model_hashes_count", len(resp.ModelHashes),
 			)
 			s.handleChallengeFailure(providerID, "status signature verification failed: "+err.Error())
 			return
@@ -782,9 +927,16 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 		provider.Mu().Unlock()
 
 		if !runtimeOK {
+			// Log detailed mismatch info for debugging outages.
+			mismatchDetails := make([]string, 0, len(mismatches))
+			for _, m := range mismatches {
+				mismatchDetails = append(mismatchDetails, m.Component+"="+m.Got)
+			}
 			s.logger.Warn("provider runtime integrity mismatch in challenge response — excluding from routing",
 				"provider_id", providerID,
 				"mismatches", len(mismatches),
+				"details", mismatchDetails,
+				"backend", provider.Backend,
 			)
 			// Send status feedback but do NOT fail the challenge or mark untrusted.
 			// The provider remains connected but is excluded from routing until
@@ -840,7 +992,17 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 	provider.Mu().Unlock()
 
 	// Challenge passed.
-	s.registry.RecordChallengeSuccess(providerID)
+	recovered := s.registry.RecordChallengeSuccess(providerID)
+	if recovered {
+		// The provider was transiently untrusted and is now back online. It was
+		// last told "untrusted" (handleChallengeFailure) and scheduled a 10-min
+		// diagnostic auto-report; push a fresh "online" trust_status so it clears
+		// that local state and cancels the report.
+		provider.Mu().Lock()
+		trustLevel := provider.TrustLevel
+		provider.Mu().Unlock()
+		s.sendTrustStatus(provider, trustLevel, "online", "recovered after transient deroute")
+	}
 	s.ddIncr("attestation.challenges", []string{"outcome:passed"})
 	s.logger.Info("attestation challenge verified",
 		"provider_id", providerID,
@@ -859,12 +1021,66 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 			"weight_hash", hash,
 		)
 	}
+
+	// Re-attempt MDM verification for self_signed providers. This handles
+	// providers that installed the MDM enrollment profile after their initial
+	// registration — they would otherwise stay at self_signed trust forever
+	// since verifyProviderViaMDM only ran once at registration time.
+	provider.Mu().Lock()
+	trustLevel := provider.TrustLevel
+	attestResult := provider.AttestationResult
+	provider.Mu().Unlock()
+
+	if trustLevel == registry.TrustSelfSigned && s.mdmClient != nil && attestResult != nil {
+		result := *attestResult
+		saferun.Go(s.logger, "retryMDMVerification", func() {
+			s.verifyProviderViaMDM(providerID, provider, result)
+		})
+	}
+
+	// Re-attempt ACME (mTLS device-cert) trust for self_signed providers.
+	// applyACMETrust ran at registration before attestation was bound, so a
+	// provider that presented a valid device cert can be promoted to hardware
+	// now that the challenge has passed. No-op if nothing was stashed.
+	if trustLevel == registry.TrustSelfSigned {
+		s.retryACMETrust(providerID, provider)
+	}
+}
+
+// handleTransientChallengeFailure records a transient challenge failure
+// (timeout / no response) and, once a provider has missed too many consecutive
+// challenges, force-closes its WebSocket so it must reconnect and re-register.
+//
+// A provider whose outbound path is wedged keeps heartbeating (so the stale
+// sweeper never evicts it) while every challenge times out, pinning it
+// hardware/untrusted forever. MarkUntrustedTransient alone cannot recover it
+// because recovery requires a passing challenge, which requires a working
+// outbound path. Cycling the connection forces a clean re-registration.
+func (s *Server) handleTransientChallengeFailure(conn *websocket.Conn, providerID, reason string) {
+	failures := s.handleChallengeFailure(providerID, reason)
+	if conn == nil || failures < MaxConsecutiveChallengeTimeoutsBeforeReconnect {
+		return
+	}
+	s.logger.Warn("provider exceeded consecutive challenge timeouts — forcing reconnect",
+		"provider_id", providerID,
+		"consecutive_failures", failures,
+		"reason", reason,
+	)
+	s.ddIncr("attestation.force_reconnect", []string{"reason:" + reason})
+	if s.metrics != nil {
+		s.metrics.IncCounter("attestation_force_reconnect_total", MetricLabel{"reason", reason})
+	}
+	// Closing the conn unblocks providerReadLoop's conn.Read, which cancels the
+	// loop context (stopping this challenge loop) and runs registry.Disconnect.
+	_ = conn.Close(websocket.StatusPolicyViolation, "attestation unresponsive — reconnect required")
 }
 
 // handleChallengeFailure records a failed challenge and marks the provider
-// as untrusted if the failure threshold is reached.
-func (s *Server) handleChallengeFailure(providerID string, reason string) {
-	failures := s.registry.RecordChallengeFailure(providerID)
+// as untrusted if the failure threshold is reached. It returns the running
+// count of consecutive failures.
+func (s *Server) handleChallengeFailure(providerID string, reason string) int {
+	transient := reason == "timeout" || reason == "no response"
+	failures := s.registry.RecordChallengeFailure(providerID, transient)
 	s.ddIncr("attestation.challenges", []string{"outcome:failed"})
 	s.logger.Warn("attestation challenge failed",
 		"provider_id", providerID,
@@ -873,9 +1089,19 @@ func (s *Server) handleChallengeFailure(providerID string, reason string) {
 	)
 
 	severity := protocol.SeverityWarn
-	if failures >= MaxFailedChallenges {
+	if failures >= registry.MaxFailedChallenges {
 		severity = protocol.SeverityError
-		s.registry.MarkUntrusted(providerID)
+		if transient {
+			// Missed-challenge timeouts (sleep / network blip) are recoverable:
+			// keep challenging and let a later passing challenge restore the
+			// provider without requiring a reconnect.
+			s.registry.MarkUntrustedTransient(providerID)
+		} else {
+			s.registry.MarkUntrusted(providerID)
+		}
+		if p := s.registry.GetProvider(providerID); p != nil {
+			s.sendTrustStatus(p, p.TrustLevel, string(registry.StatusUntrusted), reason)
+		}
 	}
 	s.emit(context.Background(), severity, protocol.KindAttestationFailure,
 		"attestation challenge failed",
@@ -890,6 +1116,7 @@ func (s *Server) handleChallengeFailure(providerID string, reason string) {
 		)
 	}
 	s.ddIncr("attestation.failures", []string{"reason:" + reason})
+	return failures
 }
 
 func (s *Server) handleChunk(providerID string, provider *registry.Provider, msg *protocol.InferenceResponseChunkMessage) {
@@ -997,140 +1224,313 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 	pr.SESignature = msg.SESignature
 	pr.ResponseHash = msg.ResponseHash
 
+	// Billing-zero observability: a COMPLETED request that reports zero tokens
+	// is billed $0 (and fully refunded). The provider-side fix (EngineBridge
+	// max + content-frame floor) should prevent this, but emit a metric so any
+	// residual leak is visible on the dashboard rather than silent.
+	if msg.Usage.CompletionTokens == 0 {
+		s.ddIncr("billing.zero_usage_complete", []string{"model:" + pr.Model})
+		s.logger.Warn("completed request reported zero completion tokens — billed $0",
+			"provider_id", providerID,
+			"request_id", msg.RequestID,
+			"model", pr.Model,
+			"prompt_tokens", msg.Usage.PromptTokens,
+		)
+	}
+
 	// Record job success and usage BEFORE closing ChunkCh. Closing
 	// ChunkCh unblocks the consumer response handler, and callers may
 	// check usage immediately after the HTTP response completes.
 	responseTime := time.Duration(msg.Usage.CompletionTokens) * time.Millisecond * 10
 	s.registry.RecordJobSuccess(providerID, responseTime)
 
-	// Calculate cost — check provider's custom price, then platform DB price,
-	// then hardcoded defaults.
-	providerWalletForPricing := ""
-	if p := s.registry.GetProvider(providerID); p != nil {
-		providerWalletForPricing = p.WalletAddress
+	// Resolve the consumer once: platform-fee override (nil = global default)
+	// and whether this is a wholesale/service channel (e.g. OpenRouter). A
+	// failed lookup (raw API-key account with no user row) falls back to
+	// defaults. Service accounts run on a 0% fee.
+	var feePercent *int64
+	isServiceConsumer := false
+	if u, err := s.store.GetUserByAccountID(pr.ConsumerKey); err == nil && u != nil {
+		feePercent = u.PlatformFeePercent
+		isServiceConsumer = u.Role == store.RoleService
 	}
-	customIn, customOut, hasCustom := s.store.GetModelPrice(providerWalletForPricing, pr.Model)
+
+	// Calculate cost. Direct consumers: provider custom price, then platform DB
+	// price, then hardcoded defaults, with the per-request minimum applied.
+	// Service/wholesale traffic is billed at the advertised platform price
+	// (never a provider's higher custom price) and is exempt from the minimum,
+	// so the debit matches the published per-token OpenRouter feed exactly.
+	providerAccountForPricing := ""
+	if p := s.registry.GetProvider(providerID); p != nil {
+		providerAccountForPricing = providerPricingKeys(p)
+	}
+	var customIn, customOut int64
+	var hasCustom bool
+	if !isServiceConsumer {
+		customIn, customOut, hasCustom = s.store.GetModelPrice(providerAccountForPricing, pr.Model)
+	}
 	if !hasCustom {
 		customIn, customOut, hasCustom = s.store.GetModelPrice("platform", pr.Model)
 	}
-	totalCost := payments.CalculateCostWithOverrides(pr.Model, msg.Usage.PromptTokens, msg.Usage.CompletionTokens, customIn, customOut, hasCustom)
-
-	// Clamp reported cost at the pre-flight reservation. The reservation
-	// uses platform-default and platform-override pricing; a provider that
-	// sets a custom price above the platform rate accepts revenue capped at
-	// the reservation (this is documented by reservationCost). The clamp
-	// also neutralizes over-reporting: with max_tokens injected into the
-	// outgoing request a cooperating provider can never legitimately bill
-	// more than the reservation, so excess means miscounting or fraud.
-	// Logged at Error so misbehavior shows in the operator dashboards.
-	if pr.ReservedMicroUSD > 0 && totalCost > pr.ReservedMicroUSD {
-		s.logger.Error("provider reported cost above reservation — clamping",
-			"provider_id", providerID,
-			"request_id", msg.RequestID,
-			"reported_cost_micro_usd", totalCost,
-			"reserved_micro_usd", pr.ReservedMicroUSD,
-			"prompt_tokens", msg.Usage.PromptTokens,
-			"completion_tokens", msg.Usage.CompletionTokens,
-		)
-		s.ddIncr("billing.cost_clamped", []string{"model:" + pr.Model})
-		totalCost = pr.ReservedMicroUSD
+	var totalCost int64
+	if isServiceConsumer {
+		totalCost = payments.CalculateCostWithOverridesNoMinimum(pr.Model, msg.Usage.PromptTokens, msg.Usage.CompletionTokens, customIn, customOut, hasCustom)
+	} else {
+		totalCost = payments.CalculateCostWithOverrides(pr.Model, msg.Usage.PromptTokens, msg.Usage.CompletionTokens, customIn, customOut, hasCustom)
 	}
-	providerPayout := payments.ProviderPayout(totalCost)
 
-	// Adjust billing against the pre-flight reservation. After the clamp above
-	// totalCost <= reserved, so the only path here is a refund of the unused
-	// portion. The old "charge extra" path is retained for the unreserved
-	// code path below (billing disabled / legacy requests).
+	providerPayout := payments.ProviderPayoutWithPercent(totalCost, feePercent)
+
+	// Free settlement when an OWNED machine served the request. Two paths reach
+	// here:
+	//   - FreeSelfRoute (exclusive self-route): the router only ever picks owned
+	//     providers, so a mismatch should be impossible (machine unlinked
+	//     mid-flight); a mismatch falls back to paid to close the "mark free,
+	//     serve elsewhere" hole.
+	//   - PreferOwner (prefer-with-fallback): the request may legitimately have
+	//     fallen back to a PUBLIC provider, in which case paid settlement is the
+	//     correct, expected outcome — not an error.
+	// Either way: free iff the provider that actually served it is owned by the
+	// requesting account. Ownership is read from the serving provider object
+	// (stable across deregistration), not a fresh lookup.
+	freeSelfRoute := false
+	if pr.FreeSelfRoute || pr.PreferOwner {
+		serving := s.registry.GetProvider(providerID)
+		if serving == nil {
+			serving = provider
+		}
+		serving.Mu().Lock()
+		servingOwner := serving.AccountID
+		serving.Mu().Unlock()
+		if servingOwner != "" && servingOwner == pr.ConsumerKey {
+			// Owned machine served it → free. For PreferOwner this also fully
+			// refunds the up-front reservation below (totalCost 0 < reserved).
+			freeSelfRoute = true
+			totalCost = 0
+			providerPayout = 0
+		} else if pr.FreeSelfRoute {
+			// Exclusive self-route should never be served by a non-owned
+			// provider — surface it and settle as paid (defense-in-depth).
+			s.logger.Error("self-route completion served by a non-owned provider — settling as paid (defense-in-depth)",
+				"provider_id", providerID,
+				"request_id", msg.RequestID,
+				"serving_owner", servingOwner,
+				"consumer_key", pr.ConsumerKey,
+			)
+		}
+		// PreferOwner served by a public provider is the normal fallback — no
+		// log, settle as paid against the reservation.
+	}
+
+	billingFinalized := true
+
+	// Settle billing against the pre-flight reservation. All balance
+	// mutations (overage charge, refund) happen inside the finalization
+	// gate so that a concurrent timeout/error refund path cannot race
+	// with the settlement here.
 	if pr.ReservedMicroUSD > 0 {
-		if totalCost < pr.ReservedMicroUSD {
+		if !pr.MarkReservationFinalized() {
+			billingFinalized = false
+			s.logger.Warn("skipping completion billing for already-finalized reservation",
+				"provider_id", providerID,
+				"request_id", msg.RequestID,
+			)
+		} else if totalCost > pr.ReservedMicroUSD {
+			// Actual cost exceeds reservation (e.g. provider custom
+			// pricing above platform rate). Attempt to charge the
+			// consumer the difference. Cap overage at the reservation
+			// amount as a fraud circuit-breaker — a provider cannot
+			// bill more than 2x the pre-flight estimate.
+			overage := totalCost - pr.ReservedMicroUSD
+			if overage > pr.ReservedMicroUSD {
+				s.logger.Error("overage exceeds reservation cap — clamping",
+					"provider_id", providerID,
+					"request_id", msg.RequestID,
+					"reported_cost_micro_usd", totalCost,
+					"reserved_micro_usd", pr.ReservedMicroUSD,
+					"uncapped_overage_micro_usd", overage,
+				)
+				s.ddIncr("billing.cost_clamped", []string{"model:" + pr.Model})
+				overage = pr.ReservedMicroUSD
+				totalCost = pr.ReservedMicroUSD * 2
+			}
+			if err := s.ledger.Charge(pr.ConsumerKey, overage, "overage:"+msg.RequestID); err != nil {
+				// Overage charge failed — clamp to reservation so
+				// the provider still gets paid something.
+				if errors.Is(err, store.ErrInsufficientBalance) {
+					s.logger.Warn("overage charge failed (insufficient balance) — clamping to reservation",
+						"provider_id", providerID,
+						"request_id", msg.RequestID,
+						"reported_cost_micro_usd", totalCost,
+						"reserved_micro_usd", pr.ReservedMicroUSD,
+						"overage_micro_usd", overage,
+					)
+				} else {
+					s.logger.Error("overage charge failed (DB error) — clamping to reservation",
+						"provider_id", providerID,
+						"request_id", msg.RequestID,
+						"reported_cost_micro_usd", totalCost,
+						"reserved_micro_usd", pr.ReservedMicroUSD,
+						"overage_micro_usd", overage,
+						"error", err,
+					)
+				}
+				s.ddIncr("billing.cost_clamped", []string{"model:" + pr.Model})
+				totalCost = pr.ReservedMicroUSD
+			} else {
+				s.logger.Info("overage charged to consumer",
+					"provider_id", providerID,
+					"request_id", msg.RequestID,
+					"overage_micro_usd", overage,
+					"total_cost_micro_usd", totalCost,
+				)
+				s.ddIncr("billing.overage_charged", []string{"model:" + pr.Model})
+				s.ddHistogram("billing.overage_micro_usd", float64(overage), []string{"model:" + pr.Model})
+				pr.ReservedMicroUSD = totalCost
+			}
+			// Recompute payout after potential clamp.
+			providerPayout = payments.ProviderPayoutWithPercent(totalCost, feePercent)
+		} else if totalCost < pr.ReservedMicroUSD {
 			refund := pr.ReservedMicroUSD - totalCost
 			start := time.Now()
 			_ = s.store.Credit(pr.ConsumerKey, refund, store.LedgerRefund, msg.RequestID)
 			s.ddHistogram("billing.settlement_refund_micro_usd", float64(refund), []string{"model:" + pr.Model})
 			s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:settlement_refund"})
 		}
-	} else {
+	} else if !freeSelfRoute {
 		start := time.Now()
 		if err := s.ledger.Charge(pr.ConsumerKey, totalCost, msg.RequestID); err != nil {
-			s.logger.Warn("could not charge consumer (insufficient balance)",
-				"consumer_key", pr.ConsumerKey,
-				"cost_micro_usd", totalCost,
-				"error", err,
-			)
+			if errors.Is(err, store.ErrInsufficientBalance) {
+				s.logger.Warn("could not charge consumer (insufficient balance)",
+					"consumer_key", pr.ConsumerKey,
+					"cost_micro_usd", totalCost,
+				)
+			} else {
+				s.logger.Error("could not charge consumer (DB error)",
+					"consumer_key", pr.ConsumerKey,
+					"cost_micro_usd", totalCost,
+					"error", err,
+				)
+			}
+			// If this was a self-route request that FELL BACK to paid settlement
+			// (marked free at dispatch, but mid-flight ownership revalidation
+			// failed), the owner has no balance because self-route skips
+			// reservation — so a failed charge means no money was collected and
+			// we must NOT credit the provider from an unfunded balance. Zero the
+			// cost and payout. (Other no-reservation paths — e.g. admin /
+			// platform-covered usage — keep their existing payout behavior.)
+			if pr.FreeSelfRoute {
+				totalCost = 0
+				providerPayout = 0
+				s.ddIncr("billing.uncollected_zeroed", []string{"model:" + pr.Model})
+			}
 		}
 		s.ddHistogram("store.debit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:charge"})
 	}
 
-	// Record usage entry — both in-memory (for current session) and persisted
-	// to database (survives coordinator restart).
-	s.ledger.RecordUsage(pr.ConsumerKey, payments.UsageEntry{
-		JobID:            msg.RequestID,
-		Model:            pr.Model,
-		PromptTokens:     msg.Usage.PromptTokens,
-		CompletionTokens: msg.Usage.CompletionTokens,
-		CostMicroUSD:     totalCost,
-		Timestamp:        time.Now(),
-	})
-	s.store.RecordUsageWithCost(providerID, pr.ConsumerKey, pr.Model, msg.RequestID, msg.Usage.PromptTokens, msg.Usage.CompletionTokens, totalCost)
-	s.ddIncr("inference.completions", []string{"model:" + pr.Model})
-	s.ddCount("inference.prompt_tokens_total", int64(msg.Usage.PromptTokens), []string{"model:" + pr.Model})
-	s.ddHistogram("inference.prompt_tokens", float64(msg.Usage.PromptTokens), []string{"model:" + pr.Model})
-	s.ddCount("inference.completion_tokens_total", int64(msg.Usage.CompletionTokens), []string{"model:" + pr.Model})
-	s.ddHistogram("inference.completion_tokens", float64(msg.Usage.CompletionTokens), []string{"model:" + pr.Model})
+	if billingFinalized {
+		// Record in-memory usage (for current session queries).
+		s.ledger.RecordUsage(pr.ConsumerKey, payments.UsageEntry{
+			JobID:            msg.RequestID,
+			Model:            pr.Model,
+			PromptTokens:     msg.Usage.PromptTokens,
+			CompletionTokens: msg.Usage.CompletionTokens,
+			CostMicroUSD:     totalCost,
+			Timestamp:        time.Now(),
+		})
 
-	// Credit the provider's pending payout.
-	// If the provider is linked to an account (via device auth), credit that account.
-	// Otherwise, fall back to the provider's self-reported wallet address.
-	if p := s.registry.GetProvider(providerID); p != nil {
-		if p.AccountID != "" {
-			start := time.Now()
-			if err := s.store.CreditProviderAccount(&store.ProviderEarning{
-				AccountID:        p.AccountID,
-				ProviderID:       providerID,
-				ProviderKey:      p.PublicKey,
-				JobID:            msg.RequestID,
-				Model:            pr.Model,
-				AmountMicroUSD:   providerPayout,
-				PromptTokens:     msg.Usage.PromptTokens,
-				CompletionTokens: msg.Usage.CompletionTokens,
-				CreatedAt:        time.Now(),
-			}); err != nil {
-				s.logger.Error("failed to credit linked provider account",
-					"provider_id", providerID,
-					"account_id", p.AccountID,
-					"request_id", msg.RequestID,
-					"error", err,
-				)
-			}
-			s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:provider_account_credit"})
-			s.ddCount("billing.provider_credits_micro_usd", providerPayout, []string{"model:" + pr.Model, "type:account"})
-		} else if p.WalletAddress != "" {
-			start := time.Now()
-			if err := s.ledger.CreditProvider(p.WalletAddress, providerPayout, pr.Model, msg.RequestID); err != nil {
-				s.logger.Error("failed to credit provider wallet payout",
-					"provider_id", providerID,
-					"wallet_address", p.WalletAddress,
-					"request_id", msg.RequestID,
-					"error", err,
-				)
-			}
-			s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:provider_wallet_credit"})
-			s.ddCount("billing.provider_credits_micro_usd", providerPayout, []string{"model:" + pr.Model, "type:wallet"})
+		// Persist usage to DB asynchronously — billing has already been
+		// settled above, so this INSERT is not on the critical path. KeyID
+		// carries per-key usage/spend attribution (empty for legacy callers).
+		//
+		// Skip the persistent (public-stats-feeding) row for FREE self-route:
+		// it is private, owner-only traffic and must not appear in the public
+		// /stats time-series, request-location, or flow aggregations. Private-only
+		// providers only ever serve free self-route, so this also keeps their
+		// traffic out of public stats. The owner still sees it via the in-memory
+		// RecordUsage above (their session/transparency view).
+		if !freeSelfRoute {
+			saferun.Go(s.logger, "recordUsage", func() {
+				s.store.RecordUsageFull(providerID, pr.ConsumerKey, pr.KeyID, pr.Model, msg.RequestID, msg.Usage.PromptTokens, msg.Usage.CompletionTokens, totalCost, pr.ConsumerLocation)
+			})
 		}
-	}
 
-	// Record platform fee, distributing referral rewards if applicable.
-	platformFee := payments.PlatformFee(totalCost)
-	if platformFee > 0 {
-		// Check if consumer has a referrer and distribute reward.
-		// The referral service deducts the referrer's share from the platform fee.
-		if s.billing != nil && s.billing.Referral() != nil {
+		s.ddIncr("inference.completions", []string{"model:" + pr.Model})
+		s.ddCount("inference.prompt_tokens_total", int64(msg.Usage.PromptTokens), []string{"model:" + pr.Model})
+		s.ddHistogram("inference.prompt_tokens", float64(msg.Usage.PromptTokens), []string{"model:" + pr.Model})
+		s.ddCount("inference.completion_tokens_total", int64(msg.Usage.CompletionTokens), []string{"model:" + pr.Model})
+		s.ddHistogram("inference.completion_tokens", float64(msg.Usage.CompletionTokens), []string{"model:" + pr.Model})
+
+		// Resolve provider identity for payout.
+		p := s.registry.GetProvider(providerID)
+		if p == nil {
+			p = provider
+		}
+
+		// Compute platform fee (needs referral lookup before spawning goroutines).
+		platformFee := payments.PlatformFeeWithPercent(totalCost, feePercent)
+		if platformFee > 0 && s.billing != nil && s.billing.Referral() != nil {
 			platformFee = s.billing.Referral().DistributeReferralReward(pr.ConsumerKey, platformFee, msg.RequestID)
 		}
-		start := time.Now()
-		_ = s.store.Credit("platform", platformFee, store.LedgerPlatformFee, msg.RequestID)
-		s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:platform_fee"})
-		s.ddCount("billing.platform_fees_micro_usd", platformFee, []string{"model:" + pr.Model})
+
+		// Run provider credit and platform fee credit concurrently —
+		// they target different accounts so there is no data dependency.
+		var settlementWg sync.WaitGroup
+
+		// Credit the provider's linked account (if any).
+		if p != nil {
+			p.Mu().Lock()
+			accountID := p.AccountID
+			publicKey := p.PublicKey
+			p.Mu().Unlock()
+
+			// Credit the provider only when there is an actual payout. A zero
+			// payout means either free self-route (consumer == provider account)
+			// or an uncollected charge (e.g. a self-route paid-fallback whose
+			// owner had no balance) — in both cases we must not record a
+			// (zero-value) earning row. Mirrors the platformFee > 0 guard below.
+			if accountID != "" && !freeSelfRoute && providerPayout > 0 {
+				settlementWg.Add(1)
+				go func() {
+					defer settlementWg.Done()
+					start := time.Now()
+					if err := s.store.CreditProviderAccount(&store.ProviderEarning{
+						AccountID:        accountID,
+						ProviderID:       providerID,
+						ProviderKey:      publicKey,
+						JobID:            msg.RequestID,
+						Model:            pr.Model,
+						AmountMicroUSD:   providerPayout,
+						PromptTokens:     msg.Usage.PromptTokens,
+						CompletionTokens: msg.Usage.CompletionTokens,
+						CreatedAt:        time.Now(),
+					}); err != nil {
+						s.logger.Error("failed to credit linked provider account",
+							"provider_id", providerID,
+							"account_id", accountID,
+							"request_id", msg.RequestID,
+							"error", err,
+						)
+					}
+					s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:provider_account_credit"})
+					s.ddCount("billing.provider_credits_micro_usd", providerPayout, []string{"model:" + pr.Model, "type:account"})
+				}()
+			}
+		}
+
+		// Record platform fee.
+		if platformFee > 0 {
+			settlementWg.Add(1)
+			go func() {
+				defer settlementWg.Done()
+				start := time.Now()
+				_ = s.store.Credit("platform", platformFee, store.LedgerPlatformFee, msg.RequestID)
+				s.ddHistogram("store.credit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:platform_fee"})
+				s.ddCount("billing.platform_fees_micro_usd", platformFee, []string{"model:" + pr.Model})
+			}()
+		}
+
+		settlementWg.Wait()
 	}
 
 	// Signal completion to the consumer response handler. This must happen
@@ -1169,8 +1569,20 @@ func (s *Server) handleInferenceError(providerID string, provider *registry.Prov
 	close(pr.CompleteCh)
 	close(pr.ErrorCh)
 
-	// Record job failure for reputation tracking.
-	s.registry.RecordJobFailure(providerID)
+	// Record job failure for reputation tracking, but carve out capacity
+	// rejections — those are not provider faults, just the provider declining
+	// work it cannot currently serve (the coordinator reroutes these). Counting
+	// them would unfairly penalise healthy providers shedding load. Capacity
+	// signals: HTTP 503 (service unavailable) / 429 (too many requests), an
+	// exhausted token budget, or an out-of-memory model-load reject.
+	loweredErr := strings.ToLower(msg.Error)
+	capacityRejection := msg.StatusCode == http.StatusServiceUnavailable ||
+		msg.StatusCode == http.StatusTooManyRequests ||
+		strings.Contains(loweredErr, "token_budget_exhausted") ||
+		strings.Contains(loweredErr, "insufficient memory")
+	if !capacityRejection {
+		s.registry.RecordJobFailure(providerID)
+	}
 
 	// Mark provider idle.
 	s.registry.SetProviderIdle(providerID)
@@ -1300,6 +1712,7 @@ func (s *Server) verifyProviderAttestation(providerID string, provider *registry
 	}
 
 	provider.SetAttested(true, registry.TrustSelfSigned)
+	s.sendTrustStatus(provider, registry.TrustSelfSigned, "online", "SE attestation verified, awaiting MDM/ACME upgrade")
 
 	// The SE attestation already proves SIP, Secure Boot, and binary hash —
 	// the same checks a challenge re-verifies. Set LastChallengeVerified so
@@ -1402,6 +1815,16 @@ func (s *Server) verifyProviderViaMDM(providerID string, provider *registry.Prov
 	}
 
 	if mdmResult.Error != "" {
+		// A timeout means APN latency or device sleep — not evidence of
+		// compromise. Keep the provider at its current trust level (self_signed)
+		// instead of marking it untrusted.
+		if strings.Contains(mdmResult.Error, "timeout") {
+			s.logger.Warn("MDM verification timed out — staying at current trust level",
+				"provider_id", providerID,
+				"error", mdmResult.Error,
+			)
+			return
+		}
 		s.logger.Warn("MDM verification failed — marking provider untrusted",
 			"provider_id", providerID,
 			"error", mdmResult.Error,
@@ -1416,6 +1839,7 @@ func (s *Server) verifyProviderViaMDM(providerID string, provider *registry.Prov
 
 	// MDM SecurityInfo verification passed — upgrade to hardware trust.
 	provider.SetAttested(true, registry.TrustHardware)
+	s.sendTrustStatus(provider, registry.TrustHardware, "online", "MDM verification passed")
 	s.logger.Info("MDM verification passed — upgraded to hardware trust",
 		"provider_id", providerID,
 		"serial_number", attestResult.SerialNumber,
@@ -1669,15 +2093,25 @@ func (s *Server) handleProviderAttestation(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// SendInferenceRequest writes an inference request to the provider's WebSocket.
-func SendInferenceRequest(ctx context.Context, conn *websocket.Conn, msg *protocol.InferenceRequestMessage, logger *slog.Logger) error {
+// sendTrustStatus sends the provider its current trust level and status over
+// the WebSocket connection. This allows the provider to react — e.g. by
+// auto-reporting unified logs when it learns it is self_signed or untrusted.
+func (s *Server) sendTrustStatus(provider *registry.Provider, trustLevel registry.TrustLevel, status string, reason string) {
+	conn := provider.Conn
+	if conn == nil {
+		return
+	}
+	msg := protocol.TrustStatusMessage{
+		Type:       protocol.TypeTrustStatus,
+		TrustLevel: string(trustLevel),
+		Status:     status,
+		Reason:     reason,
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
-		return err
+		return
 	}
-	if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
-		logger.Error("failed to send inference request", "request_id", msg.RequestID, "error", err)
-		return err
-	}
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = conn.Write(ctx, websocket.MessageText, data)
 }

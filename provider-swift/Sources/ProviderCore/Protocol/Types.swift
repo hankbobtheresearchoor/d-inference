@@ -143,15 +143,32 @@ public struct ProviderStats: Codable, Sendable, Equatable {
 public struct UsageInfo: Codable, Sendable, Equatable {
     public var promptTokens: UInt64
     public var completionTokens: UInt64
+    /// Subset of `completionTokens` spent on reasoning/analysis content
+    /// (gpt-oss analysis channel, <think> blocks, etc.). Counted with the
+    /// model tokenizer on the provider; 0 when the response carried no
+    /// reasoning content. The coordinator surfaces this as
+    /// `reasoning_tokens` in the Responses API and as
+    /// `completion_tokens_details.reasoning_tokens` in chat completions.
+    public var reasoningTokens: UInt64
 
     enum CodingKeys: String, CodingKey {
         case promptTokens = "prompt_tokens"
         case completionTokens = "completion_tokens"
+        case reasoningTokens = "reasoning_tokens"
     }
 
-    public init(promptTokens: UInt64, completionTokens: UInt64) {
+    public init(promptTokens: UInt64, completionTokens: UInt64, reasoningTokens: UInt64 = 0) {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
+        self.reasoningTokens = reasoningTokens
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.promptTokens = try c.decode(UInt64.self, forKey: .promptTokens)
+        self.completionTokens = try c.decode(UInt64.self, forKey: .completionTokens)
+        // Optional for backward compatibility with peers that don't send it.
+        self.reasoningTokens = try c.decodeIfPresent(UInt64.self, forKey: .reasoningTokens) ?? 0
     }
 }
 
@@ -214,6 +231,19 @@ public struct PrivacyCapabilities: Codable, Sendable, Equatable {
         self.envScrubbed = envScrubbed
         self.hypervisorActive = hypervisorActive
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        textBackendInprocess = try container.decode(Bool.self, forKey: .textBackendInprocess)
+        textProxyDisabled = try container.decode(Bool.self, forKey: .textProxyDisabled)
+        pythonRuntimeLocked = try container.decode(Bool.self, forKey: .pythonRuntimeLocked)
+        dangerousModulesBlocked = try container.decode(Bool.self, forKey: .dangerousModulesBlocked)
+        sipEnabled = try container.decode(Bool.self, forKey: .sipEnabled)
+        antiDebugEnabled = try container.decode(Bool.self, forKey: .antiDebugEnabled)
+        coreDumpsDisabled = try container.decode(Bool.self, forKey: .coreDumpsDisabled)
+        envScrubbed = try container.decode(Bool.self, forKey: .envScrubbed)
+        hypervisorActive = try container.decodeIfPresent(Bool.self, forKey: .hypervisorActive) ?? false
+    }
 }
 
 public struct RuntimeMismatch: Codable, Sendable, Equatable {
@@ -235,6 +265,12 @@ public struct BackendSlotCapacity: Codable, Sendable, Equatable {
     public var numWaiting: UInt32
     public var activeTokens: Int64
     public var maxTokensPotential: Int64
+    public var observedDecodeTps: Double
+    public var activeTokenBudgetUsed: Int64
+    public var activeTokenBudgetMax: Int64
+    public var queuedTokenBudget: Int64
+    public var kvBytesPerToken: Int64
+    public var maxConcurrency: UInt32
 
     enum CodingKeys: String, CodingKey {
         case model
@@ -243,6 +279,12 @@ public struct BackendSlotCapacity: Codable, Sendable, Equatable {
         case numWaiting = "num_waiting"
         case activeTokens = "active_tokens"
         case maxTokensPotential = "max_tokens_potential"
+        case observedDecodeTps = "observed_decode_tps"
+        case activeTokenBudgetUsed = "active_token_budget_used"
+        case activeTokenBudgetMax = "active_token_budget_max"
+        case queuedTokenBudget = "queued_token_budget"
+        case kvBytesPerToken = "kv_bytes_per_token"
+        case maxConcurrency = "max_concurrency"
     }
 
     public init(
@@ -251,7 +293,13 @@ public struct BackendSlotCapacity: Codable, Sendable, Equatable {
         numRunning: UInt32,
         numWaiting: UInt32,
         activeTokens: Int64,
-        maxTokensPotential: Int64
+        maxTokensPotential: Int64,
+        maxConcurrency: UInt32 = 0,
+        observedDecodeTps: Double = 0,
+        activeTokenBudgetUsed: Int64 = 0,
+        activeTokenBudgetMax: Int64 = 0,
+        queuedTokenBudget: Int64 = 0,
+        kvBytesPerToken: Int64 = 0
     ) {
         self.model = model
         self.state = state
@@ -259,6 +307,64 @@ public struct BackendSlotCapacity: Codable, Sendable, Equatable {
         self.numWaiting = numWaiting
         self.activeTokens = activeTokens
         self.maxTokensPotential = maxTokensPotential
+        self.maxConcurrency = maxConcurrency
+        self.observedDecodeTps = observedDecodeTps
+        self.activeTokenBudgetUsed = activeTokenBudgetUsed
+        self.activeTokenBudgetMax = activeTokenBudgetMax
+        self.queuedTokenBudget = queuedTokenBudget
+        self.kvBytesPerToken = kvBytesPerToken
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        model = try container.decode(String.self, forKey: .model)
+        state = try container.decode(String.self, forKey: .state)
+        numRunning = try container.decode(UInt32.self, forKey: .numRunning)
+        numWaiting = try container.decode(UInt32.self, forKey: .numWaiting)
+        activeTokens = try container.decodeIfPresent(Int64.self, forKey: .activeTokens) ?? 0
+        maxTokensPotential = try container.decodeIfPresent(Int64.self, forKey: .maxTokensPotential) ?? 0
+        maxConcurrency = try container.decodeIfPresent(UInt32.self, forKey: .maxConcurrency) ?? 0
+        observedDecodeTps = try container.decodeIfPresent(Double.self, forKey: .observedDecodeTps) ?? 0
+        activeTokenBudgetUsed = try container.decodeIfPresent(Int64.self, forKey: .activeTokenBudgetUsed) ?? 0
+        activeTokenBudgetMax = try container.decodeIfPresent(Int64.self, forKey: .activeTokenBudgetMax) ?? 0
+        queuedTokenBudget = try container.decodeIfPresent(Int64.self, forKey: .queuedTokenBudget) ?? 0
+        kvBytesPerToken = try container.decodeIfPresent(Int64.self, forKey: .kvBytesPerToken) ?? 0
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(model, forKey: .model)
+        try container.encode(state, forKey: .state)
+        try container.encode(numRunning, forKey: .numRunning)
+        try container.encode(numWaiting, forKey: .numWaiting)
+        try container.encode(activeTokens, forKey: .activeTokens)
+        try container.encode(maxTokensPotential, forKey: .maxTokensPotential)
+        try encodeIfNonZero(maxConcurrency, forKey: .maxConcurrency, into: &container)
+        try encodeIfNonZero(observedDecodeTps, forKey: .observedDecodeTps, into: &container)
+        try encodeIfNonZero(activeTokenBudgetUsed, forKey: .activeTokenBudgetUsed, into: &container)
+        try encodeIfNonZero(activeTokenBudgetMax, forKey: .activeTokenBudgetMax, into: &container)
+        try encodeIfNonZero(queuedTokenBudget, forKey: .queuedTokenBudget, into: &container)
+        try encodeIfNonZero(kvBytesPerToken, forKey: .kvBytesPerToken, into: &container)
+    }
+
+    private func encodeIfNonZero<T: BinaryInteger & Encodable>(
+        _ value: T,
+        forKey key: CodingKeys,
+        into container: inout KeyedEncodingContainer<CodingKeys>
+    ) throws {
+        if value != 0 {
+            try container.encode(value, forKey: key)
+        }
+    }
+
+    private func encodeIfNonZero(
+        _ value: Double,
+        forKey key: CodingKeys,
+        into container: inout KeyedEncodingContainer<CodingKeys>
+    ) throws {
+        if value != 0 {
+            try container.encode(value, forKey: key)
+        }
     }
 }
 
@@ -328,7 +434,7 @@ extension RawJSON: Codable {
 
 /// Minimal JSON value type for capturing arbitrary JSON without structure loss.
 /// Used both for RawJSON (attestation blobs) and for the InferenceRequest body
-/// field which is an opaque serde_json::Value in the Rust source.
+/// field, which is an opaque JSON value on the wire.
 public enum JSONValue: Codable, Sendable, Equatable {
     case null
     case bool(Bool)

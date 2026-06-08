@@ -107,7 +107,7 @@ func connectProvider(t *testing.T, ctx context.Context, tsURL string, models []p
 			MemoryGB:     64,
 		},
 		Models:                  models,
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               publicKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
@@ -121,7 +121,7 @@ func connectProvider(t *testing.T, ctx context.Context, tsURL string, models []p
 }
 
 // connectProviderWithToken dials the WebSocket with an auth token.
-func connectProviderWithToken(t *testing.T, ctx context.Context, tsURL string, models []protocol.ModelInfo, publicKey, authToken, walletAddress string) *websocket.Conn {
+func connectProviderWithToken(t *testing.T, ctx context.Context, tsURL string, models []protocol.ModelInfo, publicKey, authToken string) *websocket.Conn {
 	t.Helper()
 	wsURL := "ws" + strings.TrimPrefix(tsURL, "http") + "/ws/provider"
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
@@ -136,12 +136,11 @@ func connectProviderWithToken(t *testing.T, ctx context.Context, tsURL string, m
 			MemoryGB:     64,
 		},
 		Models:                  models,
-		Backend:                 "inprocess-mlx",
+		Backend:                 "mlx-swift",
 		PublicKey:               publicKey,
 		EncryptedResponseChunks: true,
 		PrivacyCapabilities:     testPrivacyCaps(),
 		AuthToken:               authToken,
-		WalletAddress:           walletAddress,
 	}
 	regData, _ := json.Marshal(regMsg)
 	if err := conn.Write(ctx, websocket.MessageText, regData); err != nil {
@@ -155,9 +154,9 @@ func connectProviderWithToken(t *testing.T, ctx context.Context, tsURL string, m
 // that disconnects and reconnects is NOT routable until it passes a new challenge.
 func TestIntegration_ProviderReconnectRequiresChallenge(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 100 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())
@@ -276,12 +275,12 @@ func TestIntegration_ProviderReconnectRequiresChallenge(t *testing.T) {
 }
 
 // TestIntegration_ChallengeFailureBlocksRouting verifies that a provider
-// responding with wrong nonces gets marked untrusted after MaxFailedChallenges.
+// responding with wrong nonces gets marked untrusted after registry.MaxFailedChallenges.
 func TestIntegration_ChallengeFailureBlocksRouting(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 200 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())
@@ -336,12 +335,12 @@ func TestIntegration_ChallengeFailureBlocksRouting(t *testing.T) {
 		t.Fatal("provider should be routable after first challenge")
 	}
 
-	// Now respond to the next MaxFailedChallenges challenges with wrong nonces.
+	// Now respond to the next registry.MaxFailedChallenges challenges with wrong nonces.
 	failCount := 0
 	failsDone := make(chan struct{})
 	go func() {
 		defer close(failsDone)
-		for failCount < MaxFailedChallenges {
+		for failCount < registry.MaxFailedChallenges {
 			_, data, err := conn.Read(ctx)
 			if err != nil {
 				return
@@ -361,7 +360,7 @@ func TestIntegration_ChallengeFailureBlocksRouting(t *testing.T) {
 	select {
 	case <-failsDone:
 	case <-time.After(10 * time.Second):
-		t.Fatalf("timed out waiting for %d failed challenges, got %d", MaxFailedChallenges, failCount)
+		t.Fatalf("timed out waiting for %d failed challenges, got %d", registry.MaxFailedChallenges, failCount)
 	}
 
 	// Wait for the last failure to be processed.
@@ -384,12 +383,12 @@ func TestIntegration_ChallengeFailureBlocksRouting(t *testing.T) {
 
 // TestIntegration_E2EEncryptionRoundtrip tests that the coordinator's
 // encryption can be decrypted by Go code using the same NaCl Box primitives
-// that the Rust provider uses.
+// that the Swift provider uses.
 func TestIntegration_E2EEncryptionRoundtrip(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 200 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())
@@ -548,9 +547,9 @@ func TestIntegration_E2EEncryptionRoundtrip(t *testing.T) {
 // linked account (not the wallet address) when a provider authenticates via device token.
 func TestIntegration_AccountLinkedEarnings(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 200 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())
@@ -577,9 +576,8 @@ func TestIntegration_AccountLinkedEarnings(t *testing.T) {
 	pubKey := testPublicKeyB64()
 	model := "earnings-model"
 	models := []protocol.ModelInfo{{ID: model, ModelType: "test", Quantization: "4bit"}}
-	walletAddr := "0xProviderWalletShouldNotBeUsed"
 
-	conn := connectProviderWithToken(t, ctx, ts.URL, models, pubKey, rawToken, walletAddr)
+	conn := connectProviderWithToken(t, ctx, ts.URL, models, pubKey, rawToken)
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	// Wait for registration + attestation to fully complete before
@@ -658,15 +656,10 @@ func TestIntegration_AccountLinkedEarnings(t *testing.T) {
 	// Give handleComplete a moment to process credits.
 	time.Sleep(300 * time.Millisecond)
 
-	// Verify the account received credits, not the wallet address.
+	// Verify the account received credits.
 	accountBalance := st.GetBalance(accountID)
 	if accountBalance <= 0 {
 		t.Errorf("account balance = %d, want > 0 (provider payout should be credited)", accountBalance)
-	}
-
-	walletBalance := st.GetBalance(walletAddr)
-	if walletBalance != 0 {
-		t.Errorf("wallet balance = %d, want 0 (account-linked provider should not credit wallet)", walletBalance)
 	}
 
 	// Verify provider earnings were recorded.
@@ -697,9 +690,9 @@ func TestIntegration_AccountLinkedEarnings(t *testing.T) {
 // to a provider when it becomes idle.
 func TestIntegration_RequestQueueDrain(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	srv.challengeInterval = 200 * time.Millisecond
 
 	ts := httptest.NewServer(srv.Handler())

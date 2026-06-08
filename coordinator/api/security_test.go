@@ -23,9 +23,9 @@ import (
 func securityTestServer(t *testing.T) (*Server, *store.MemoryStore) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	st := store.NewMemory("test-key")
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
 	reg := registry.New(logger)
-	srv := NewServer(reg, st, logger)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
 	return srv, st
 }
 
@@ -57,7 +57,7 @@ func registerProvider(t *testing.T, conn *websocket.Conn, models []protocol.Mode
 			MemoryGB:     64,
 		},
 		Models:    models,
-		Backend:   "inprocess-mlx",
+		Backend:   "mlx-swift",
 		PublicKey: publicKey,
 	}
 	data, _ := json.Marshal(regMsg)

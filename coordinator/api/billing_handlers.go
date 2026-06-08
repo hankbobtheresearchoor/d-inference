@@ -327,8 +327,6 @@ func (s *Server) handleReferralInfo(w http.ResponseWriter, r *http.Request) {
 // Public endpoint — returns platform default prices. Also overlays platform
 // DB overrides (set via admin endpoint).
 func (s *Server) handleGetPricing(w http.ResponseWriter, r *http.Request) {
-	defaults := payments.DefaultPrices()
-
 	type priceEntry struct {
 		Model       string `json:"model"`
 		InputPrice  int64  `json:"input_price"`  // micro-USD per 1M tokens
@@ -337,37 +335,25 @@ func (s *Server) handleGetPricing(w http.ResponseWriter, r *http.Request) {
 		OutputUSD   string `json:"output_usd"`
 	}
 
-	// Start with hardcoded defaults.
-	priceMap := make(map[string]priceEntry)
-	for model, prices := range defaults {
-		priceMap[model] = priceEntry{
-			Model:       model,
-			InputPrice:  prices[0],
-			OutputPrice: prices[1],
-			InputUSD:    fmt.Sprintf("$%.4f", float64(prices[0])/1_000_000),
-			OutputUSD:   fmt.Sprintf("$%.4f", float64(prices[1])/1_000_000),
-		}
-	}
-
-	// Overlay admin-set platform prices (account_id = "platform").
+	// All model prices come from the database (set via PUT /v1/admin/pricing).
 	platformPrices := s.store.ListModelPrices("platform")
+	prices := make([]priceEntry, 0, len(platformPrices))
 	for _, mp := range platformPrices {
-		priceMap[mp.Model] = priceEntry{
+		prices = append(prices, priceEntry{
 			Model:       mp.Model,
 			InputPrice:  mp.InputPrice,
 			OutputPrice: mp.OutputPrice,
 			InputUSD:    fmt.Sprintf("$%.4f", float64(mp.InputPrice)/1_000_000),
 			OutputUSD:   fmt.Sprintf("$%.4f", float64(mp.OutputPrice)/1_000_000),
-		}
-	}
-
-	var prices []priceEntry
-	for _, p := range priceMap {
-		prices = append(prices, p)
+		})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"prices": prices,
+		"prices":                prices,
+		"fallback_input_price":  payments.DefaultInputPricePerMillion,
+		"fallback_output_price": payments.DefaultOutputPricePerMillion,
+		"fallback_input_usd":    fmt.Sprintf("$%.4f", float64(payments.DefaultInputPricePerMillion)/1_000_000),
+		"fallback_output_usd":   fmt.Sprintf("$%.4f", float64(payments.DefaultOutputPricePerMillion)/1_000_000),
 	})
 }
 
@@ -375,9 +361,7 @@ func (s *Server) handleGetPricing(w http.ResponseWriter, r *http.Request) {
 // Sets platform default prices for a model. Requires a Privy account with
 // an admin email. These defaults apply to all users who haven't set custom prices.
 func (s *Server) handleAdminPricing(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil || !s.isAdmin(user) {
-		writeJSON(w, http.StatusForbidden, errorResponse("forbidden", "admin access required"))
+	if !s.isAdminAuthorized(w, r) {
 		return
 	}
 
@@ -420,6 +404,93 @@ func (s *Server) handleAdminPricing(w http.ResponseWriter, r *http.Request) {
 		"input_usd":    fmt.Sprintf("$%.4f per 1M tokens", float64(req.InputPrice)/1_000_000),
 		"output_usd":   fmt.Sprintf("$%.4f per 1M tokens", float64(req.OutputPrice)/1_000_000),
 	})
+}
+
+// handleAdminSetUserRole handles PUT /v1/admin/users/role.
+// Grants or clears an account role (e.g. RoleService for OpenRouter). Admin only.
+func (s *Server) handleAdminSetUserRole(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdminAuthorized(w, r) {
+		return
+	}
+
+	var req struct {
+		AccountID string `json:"account_id"`
+		Role      string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "invalid JSON: "+err.Error()))
+		return
+	}
+	if req.AccountID == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "account_id is required", withParam("account_id")))
+		return
+	}
+	// Only known roles are accepted. "" clears the role back to a normal account.
+	if req.Role != "" && req.Role != store.RoleService {
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error",
+			fmt.Sprintf("invalid role %q — allowed: %q or \"\"", req.Role, store.RoleService), withParam("role")))
+		return
+	}
+
+	if err := s.store.SetUserRole(req.AccountID, req.Role); err != nil {
+		s.logger.Error("admin set role: failed", "account_id", req.AccountID, "error", err)
+		writeJSON(w, http.StatusNotFound, errorResponse("not_found", "user not found or update failed"))
+		return
+	}
+
+	s.logger.Info("admin: user role updated", "account_id", req.AccountID, "role", req.Role)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     "role_updated",
+		"account_id": req.AccountID,
+		"role":       req.Role,
+	})
+}
+
+// handleAdminSetUserPlatformFee handles PUT /v1/admin/users/platform-fee.
+// Sets a per-account platform fee override (0–100). Omit platform_fee_percent
+// (or send null) to clear the override and fall back to the global default.
+// Admin only.
+func (s *Server) handleAdminSetUserPlatformFee(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdminAuthorized(w, r) {
+		return
+	}
+
+	var req struct {
+		AccountID          string `json:"account_id"`
+		PlatformFeePercent *int64 `json:"platform_fee_percent"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "invalid JSON: "+err.Error()))
+		return
+	}
+	if req.AccountID == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "account_id is required", withParam("account_id")))
+		return
+	}
+	if req.PlatformFeePercent != nil && (*req.PlatformFeePercent < 0 || *req.PlatformFeePercent > 100) {
+		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error",
+			"platform_fee_percent must be between 0 and 100", withParam("platform_fee_percent")))
+		return
+	}
+
+	if err := s.store.SetUserPlatformFeePercent(req.AccountID, req.PlatformFeePercent); err != nil {
+		s.logger.Error("admin set platform fee: failed", "account_id", req.AccountID, "error", err)
+		writeJSON(w, http.StatusNotFound, errorResponse("not_found", "user not found or update failed"))
+		return
+	}
+
+	resp := map[string]any{
+		"status":     "platform_fee_updated",
+		"account_id": req.AccountID,
+	}
+	if req.PlatformFeePercent != nil {
+		resp["platform_fee_percent"] = *req.PlatformFeePercent
+	} else {
+		resp["platform_fee_percent"] = nil
+		resp["note"] = "override cleared — using global default"
+	}
+	s.logger.Info("admin: user platform fee updated", "account_id", req.AccountID, "fee", req.PlatformFeePercent)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleSetPricing handles PUT /v1/pricing.
@@ -540,127 +611,45 @@ func (s *Server) requirePrivyUser(w http.ResponseWriter, r *http.Request) *store
 	return user
 }
 
-// --- Admin Model Catalog ---
-
-// handleAdminListModels handles GET /v1/admin/models.
-// Returns the full supported model catalog. Requires admin auth.
-func (s *Server) handleAdminListModels(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil || !s.isAdmin(user) {
-		writeJSON(w, http.StatusForbidden, errorResponse("forbidden", "admin access required"))
-		return
-	}
-
-	models := s.store.ListSupportedModels()
-	if models == nil {
-		models = []store.SupportedModel{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": models})
-}
-
-// handleAdminSetModel handles POST /v1/admin/models.
-// Adds or updates a model in the catalog. Requires admin auth.
-func (s *Server) handleAdminSetModel(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil || !s.isAdmin(user) {
-		writeJSON(w, http.StatusForbidden, errorResponse("forbidden", "admin access required"))
-		return
-	}
-
-	var model store.SupportedModel
-	if err := json.NewDecoder(r.Body).Decode(&model); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "invalid JSON: "+err.Error()))
-		return
-	}
-	if model.ID == "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "id is required"))
-		return
-	}
-	if model.DisplayName == "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "display_name is required"))
-		return
-	}
-
-	if err := s.store.SetSupportedModel(&model); err != nil {
-		s.logger.Error("admin: set model failed", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse("internal_error", "failed to save model"))
-		return
-	}
-
-	// Sync the updated catalog to the registry so routing reflects the change.
-	s.SyncModelCatalog()
-
-	s.logger.Info("admin: model catalog updated",
-		"model_id", model.ID,
-		"display_name", model.DisplayName,
-		"active", model.Active,
-	)
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "model_saved",
-		"model":  model,
-	})
-}
-
-// handleAdminDeleteModel handles DELETE /v1/admin/models.
-// Removes a model from the catalog. Requires admin auth.
-func (s *Server) handleAdminDeleteModel(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil || !s.isAdmin(user) {
-		writeJSON(w, http.StatusForbidden, errorResponse("forbidden", "admin access required"))
-		return
-	}
-
-	var req struct {
-		ID string `json:"id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "invalid JSON: "+err.Error()))
-		return
-	}
-	if req.ID == "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "id is required"))
-		return
-	}
-
-	if err := s.store.DeleteSupportedModel(req.ID); err != nil {
-		writeJSON(w, http.StatusNotFound, errorResponse("not_found", err.Error()))
-		return
-	}
-
-	// Sync the updated catalog to the registry so routing reflects the change.
-	s.SyncModelCatalog()
-
-	s.logger.Info("admin: model removed from catalog", "model_id", req.ID)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":   "model_deleted",
-		"model_id": req.ID,
-	})
-}
-
 // handleModelCatalog handles GET /v1/models/catalog.
 // Public endpoint — returns active models for providers and the install script.
+// Cached for 60s — the underlying DB query is fast but this endpoint is hit
+// by every provider heartbeat and install script poll.
 func (s *Server) handleModelCatalog(w http.ResponseWriter, r *http.Request) {
-	allModels := s.store.ListSupportedModels()
-
 	// Optional filter: ?type=text
 	typeFilter := r.URL.Query().Get("type")
 
-	// Filter to active models only (and by type if specified)
-	var active []store.SupportedModel
-	for _, m := range allModels {
-		if !m.Active || IsRetiredProviderModel(m) {
-			continue
-		}
-		if typeFilter != "" && m.ModelType != typeFilter {
-			continue
-		}
-		active = append(active, m)
+	cacheKey := "models:catalog"
+	if typeFilter != "" {
+		cacheKey = "models:catalog:" + typeFilter
 	}
-	if active == nil {
-		active = []store.SupportedModel{}
+	if cached, ok := s.readCache.Get(cacheKey); ok {
+		writeCachedJSON(w, cached)
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": active})
+
+	registryRows, err := s.store.ListActiveModelRegistryWithError()
+	if err != nil {
+		s.logger.Error("model registry: failed to list active models", "error", err)
+		writeJSON(w, http.StatusInternalServerError, errorResponse("internal_error", "failed to fetch model catalog"))
+		return
+	}
+	// The catalog is text-only today; an explicit non-text filter yields nothing.
+	models := make([]map[string]any, 0, len(registryRows))
+	if typeFilter == "" || typeFilter == "text" {
+		for i := range registryRows {
+			models = append(models, catalogModelFromRegistryRecord(&registryRows[i]))
+		}
+	}
+	response := map[string]any{"models": models}
+
+	body, err := json.Marshal(response)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse("internal_error", "failed to marshal catalog"))
+		return
+	}
+	s.readCache.Set(cacheKey, body, time.Minute)
+	writeCachedJSON(w, body)
 }
 
 // handleAdminCredit handles POST /v1/admin/credit.
@@ -829,6 +818,7 @@ func (s *Server) handleNodeEarnings(w http.ResponseWriter, r *http.Request) {
 // handleAccountEarnings handles GET /v1/provider/account-earnings?limit=50.
 // Returns recent earnings history, lifetime aggregates, and current account balance
 // for the authenticated provider account.
+// Cached for 20s per account — dashboard polls this frequently.
 func (s *Server) handleAccountEarnings(w http.ResponseWriter, r *http.Request) {
 	accountID := s.resolveAccountID(r)
 
@@ -840,6 +830,12 @@ func (s *Server) handleAccountEarnings(w http.ResponseWriter, r *http.Request) {
 	}
 	if limit > 1000 {
 		limit = 1000
+	}
+
+	cacheKey := "account-earnings:" + accountID + ":" + strconv.Itoa(limit)
+	if cached, ok := s.readCache.Get(cacheKey); ok {
+		writeCachedJSON(w, cached)
+		return
 	}
 
 	earnings, err := s.store.GetAccountEarnings(accountID, limit)
@@ -856,10 +852,9 @@ func (s *Server) handleAccountEarnings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	availableBalance := s.store.GetBalance(accountID)
-	withdrawableBalance := s.store.GetWithdrawableBalance(accountID)
+	availableBalance, withdrawableBalance := s.store.GetBalanceWithWithdrawable(accountID)
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	body, err := json.Marshal(map[string]any{
 		"account_id":                     accountID,
 		"earnings":                       earnings,
 		"total_micro_usd":                summary.TotalMicroUSD,
@@ -872,4 +867,10 @@ func (s *Server) handleAccountEarnings(w http.ResponseWriter, r *http.Request) {
 		"withdrawable_balance_micro_usd": withdrawableBalance,
 		"withdrawable_balance_usd":       fmt.Sprintf("%.6f", float64(withdrawableBalance)/1_000_000),
 	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse("internal_error", "failed to marshal earnings"))
+		return
+	}
+	s.readCache.Set(cacheKey, body, 20*time.Second)
+	writeCachedJSON(w, body)
 }

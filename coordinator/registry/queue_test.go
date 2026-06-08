@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -76,28 +77,22 @@ func TestQueuedRequestGetsProviderWhenIdle(t *testing.T) {
 		Models: []protocol.ModelInfo{{ID: "test-model"}},
 	}
 
-	// TryAssign in a goroutine.
+	// Send provider on the response channel in a goroutine.
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		assigned := q.TryAssign("test-model", provider)
-		if !assigned {
-			t.Error("TryAssign should have succeeded")
-		}
+		req.ResponseCh <- provider
 	}()
 
-	// WaitForProvider should succeed.
-	p, err := q.WaitForProvider(req)
+	// WaitForProviderContext should succeed.
+	p, err := q.WaitForProviderContext(context.Background(), req)
 	if err != nil {
-		t.Fatalf("WaitForProvider: %v", err)
+		t.Fatalf("WaitForProviderContext: %v", err)
 	}
 	if p == nil {
 		t.Fatal("expected non-nil provider")
 	}
 	if p.ID != "p1" {
 		t.Errorf("provider id = %q, want p1", p.ID)
-	}
-	if p.Status != StatusServing {
-		t.Errorf("provider status = %q, want serving", p.Status)
 	}
 }
 
@@ -115,7 +110,7 @@ func TestQueueTimeoutReturnsError(t *testing.T) {
 	}
 
 	// No provider becomes available — should timeout.
-	_, err := q.WaitForProvider(req)
+	_, err := q.WaitForProviderContext(context.Background(), req)
 	if !errors.Is(err, ErrQueueTimeout) {
 		t.Errorf("expected ErrQueueTimeout, got %v", err)
 	}
@@ -140,84 +135,6 @@ func TestQueueRemove(t *testing.T) {
 
 	if q.QueueSize("test-model") != 0 {
 		t.Errorf("queue size after remove = %d, want 0", q.QueueSize("test-model"))
-	}
-}
-
-func TestStaleRequestsCleanedUp(t *testing.T) {
-	q := NewRequestQueue(10, 50*time.Millisecond)
-
-	req := &QueuedRequest{
-		RequestID:  "req-stale",
-		Model:      "test-model",
-		ResponseCh: make(chan *Provider, 1),
-	}
-	q.Enqueue(req)
-
-	// Wait for the request to become stale.
-	time.Sleep(100 * time.Millisecond)
-
-	q.CleanStale()
-
-	if q.QueueSize("test-model") != 0 {
-		t.Errorf("queue size after clean = %d, want 0", q.QueueSize("test-model"))
-	}
-}
-
-func TestTryAssignSkipsStaleRequests(t *testing.T) {
-	q := NewRequestQueue(10, 50*time.Millisecond)
-
-	// Enqueue a request.
-	staleReq := &QueuedRequest{
-		RequestID:  "req-stale",
-		Model:      "test-model",
-		ResponseCh: make(chan *Provider, 1),
-	}
-	q.Enqueue(staleReq)
-
-	// Wait for it to become stale.
-	time.Sleep(100 * time.Millisecond)
-
-	// Enqueue a fresh request.
-	freshReq := &QueuedRequest{
-		RequestID:  "req-fresh",
-		Model:      "test-model",
-		ResponseCh: make(chan *Provider, 1),
-	}
-	q.Enqueue(freshReq)
-
-	provider := &Provider{
-		ID:     "p1",
-		Status: StatusOnline,
-	}
-
-	// TryAssign should skip the stale one and assign to the fresh one.
-	assigned := q.TryAssign("test-model", provider)
-	if !assigned {
-		t.Fatal("TryAssign should have succeeded for fresh request")
-	}
-
-	// Read the assigned provider.
-	select {
-	case p := <-freshReq.ResponseCh:
-		if p.ID != "p1" {
-			t.Errorf("provider id = %q, want p1", p.ID)
-		}
-	default:
-		t.Error("fresh request should have received provider")
-	}
-}
-
-func TestTryAssignNoQueuedRequests(t *testing.T) {
-	q := NewRequestQueue(10, 30*time.Second)
-
-	provider := &Provider{
-		ID:     "p1",
-		Status: StatusOnline,
-	}
-
-	assigned := q.TryAssign("test-model", provider)
-	if assigned {
-		t.Error("TryAssign should return false when queue is empty")
 	}
 }
 
@@ -279,5 +196,127 @@ func TestQueueDifferentModelsMaxSize(t *testing.T) {
 	}
 	if err := q.Enqueue(req3); !errors.Is(err, ErrQueueFull) {
 		t.Errorf("expected ErrQueueFull for model-a, got %v", err)
+	}
+}
+
+// TestFailQueuedRequestsForModelSkipsSelfRoute verifies that a PUBLIC unservable
+// verdict fails public waiters but leaves exclusive self-route waiters queued —
+// their own (busy) machine may still serve them.
+func TestFailQueuedRequestsForModelSkipsSelfRoute(t *testing.T) {
+	q := NewRequestQueue(10, 30*time.Second)
+	model := "queue-self-route"
+
+	public := &QueuedRequest{
+		RequestID:  "pub",
+		Model:      model,
+		ResponseCh: make(chan *Provider, 1),
+		Pending:    &PendingRequest{RequestID: "pub", Model: model},
+	}
+	selfRoute := &QueuedRequest{
+		RequestID:  "self",
+		Model:      model,
+		ResponseCh: make(chan *Provider, 1),
+		Pending:    &PendingRequest{RequestID: "self", Model: model, SelfRouteOnly: true, OwnerAccountID: "acct-A"},
+	}
+	if err := q.Enqueue(public); err != nil {
+		t.Fatalf("enqueue public: %v", err)
+	}
+	if err := q.Enqueue(selfRoute); err != nil {
+		t.Fatalf("enqueue self-route: %v", err)
+	}
+
+	failed := q.FailQueuedRequestsForModel(model, nil)
+	if failed != 1 {
+		t.Fatalf("failed=%d, want 1 (only the public waiter)", failed)
+	}
+	// Public waiter received a nil (rejection).
+	select {
+	case p := <-public.ResponseCh:
+		if p != nil {
+			t.Fatal("public waiter should have received nil rejection")
+		}
+	default:
+		t.Fatal("public waiter was not failed")
+	}
+	// Self-route waiter is still queued (not failed).
+	if q.QueueSize(model) != 1 {
+		t.Fatalf("queue size = %d, want 1 (self-route waiter must remain)", q.QueueSize(model))
+	}
+	select {
+	case <-selfRoute.ResponseCh:
+		t.Fatal("self-route waiter must NOT be failed by a public-unservable verdict")
+	default:
+	}
+}
+
+// TestFailQueuedRequestsForModelSkipsEligiblePreferOwner verifies a prefer
+// waiter whose owner HAS an owned provider for the model survives a
+// public-unservable verdict (its own busy machine may free up).
+func TestFailQueuedRequestsForModelSkipsEligiblePreferOwner(t *testing.T) {
+	q := NewRequestQueue(10, 30*time.Second)
+	model := "queue-prefer"
+
+	public := &QueuedRequest{
+		RequestID:  "pub",
+		Model:      model,
+		ResponseCh: make(chan *Provider, 1),
+		Pending:    &PendingRequest{RequestID: "pub", Model: model},
+	}
+	prefer := &QueuedRequest{
+		RequestID:  "prefer",
+		Model:      model,
+		ResponseCh: make(chan *Provider, 1),
+		Pending:    &PendingRequest{RequestID: "prefer", Model: model, PreferOwner: true, OwnerAccountID: "acct-A"},
+	}
+	_ = q.Enqueue(public)
+	_ = q.Enqueue(prefer)
+
+	// PreferWaiterOwners surfaces the prefer owner so the caller can compute
+	// eligibility; here acct-A has an owned provider for the model.
+	owners := q.PreferWaiterOwners(model)
+	if len(owners) != 1 || owners[0] != "acct-A" {
+		t.Fatalf("PreferWaiterOwners = %v, want [acct-A]", owners)
+	}
+	eligible := map[string]bool{"acct-A": true}
+
+	if failed := q.FailQueuedRequestsForModel(model, eligible); failed != 1 {
+		t.Fatalf("failed=%d, want 1 (only the public waiter)", failed)
+	}
+	if q.QueueSize(model) != 1 {
+		t.Fatalf("queue size = %d, want 1 (eligible prefer waiter must remain)", q.QueueSize(model))
+	}
+	select {
+	case <-prefer.ResponseCh:
+		t.Fatal("eligible prefer waiter must NOT be failed by a public-unservable verdict")
+	default:
+	}
+}
+
+// TestFailQueuedRequestsForModelFailsOwnerlessPreferWaiter verifies a prefer
+// waiter whose owner has NO owned provider is failed fast (it's effectively a
+// public request), not left to hit the 120s stale timeout.
+func TestFailQueuedRequestsForModelFailsOwnerlessPreferWaiter(t *testing.T) {
+	q := NewRequestQueue(10, 30*time.Second)
+	model := "queue-prefer-noowner"
+
+	prefer := &QueuedRequest{
+		RequestID:  "prefer",
+		Model:      model,
+		ResponseCh: make(chan *Provider, 1),
+		Pending:    &PendingRequest{RequestID: "prefer", Model: model, PreferOwner: true, OwnerAccountID: "acct-A"},
+	}
+	_ = q.Enqueue(prefer)
+
+	// acct-A has no owned provider → not eligible → must be failed.
+	if failed := q.FailQueuedRequestsForModel(model, map[string]bool{"acct-A": false}); failed != 1 {
+		t.Fatalf("failed=%d, want 1 (owner-less prefer waiter must fail fast)", failed)
+	}
+	select {
+	case p := <-prefer.ResponseCh:
+		if p != nil {
+			t.Fatal("owner-less prefer waiter should receive a nil rejection")
+		}
+	default:
+		t.Fatal("owner-less prefer waiter was not failed")
 	}
 }

@@ -1,89 +1,127 @@
 // Copyright © 2026 Eigen Labs.
 //
 // Continuous-batching inference scheduler for the Darkbloom provider.
-// All concurrent requests share one `BatchGenerator`, which runs one
-// batched forward pass per step and emits per-row decoded tokens.
+// Wraps `MLXLMCommon.BatchedEngine` with the provider-specific policy
+// layer: GPU enforcement, byte-level KV budgets, admission control,
+// pending-queue timeouts, and the adaptive concurrency cap.
+//
+// The engine itself drives the GPU step loop on its own dispatch queue;
+// this actor's job is to gate submission, surface capacity, and bridge
+// per-request `RequestOutput` streams to our public `GenerationEvent`
+// stream.
+//
+// This file holds the actor declaration, instance state, public
+// surface (`init`/`loadModel`/`unloadModel`/`submit`/`cancel`/
+// `cancelAll`/`capacity`) and tiny internal helpers used by all
+// extensions. Bigger units of behaviour live in:
+//
+//   * `BatchSchedulerTypes.swift`        — supporting types
+//   * `BatchScheduler+EngineBridge.swift`— per-request stream bridge,
+//                                           bridge bookkeeping, the
+//                                           pending-timeout watchdog
+//   * `BatchScheduler+KVEstimation.swift`— pure config.json parsing +
+//                                           KV-bytes math (no actor
+//                                           state)
+//   * `BatchScheduler+Telemetry.swift`   — `backendCapacity` heartbeat,
+//                                           EWMA + adaptive cap,
+//                                           pending-summary cache
 
 import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
 
-/// Events emitted by the scheduler for a single inference request.
-public enum GenerationEvent: Sendable {
-    case chunk(String)
-    case info(promptTokens: Int, completionTokens: Int, tokensPerSecond: Double)
-    case error(String)
-}
-
-/// Snapshot of the scheduler's capacity, reported to the coordinator in heartbeats.
-public struct SchedulerCapacity: Sendable {
-    public let model: String
-    public let activeRequests: Int
-    public let pendingRequests: Int
-    public let maxConcurrent: Int
-    public let gpuMemoryActiveBytes: Int
-    public let gpuMemoryPeakBytes: Int
-    public let gpuMemoryCacheBytes: Int
-    public let totalMemoryBytes: UInt64
-}
-
-/// Continuous-batching scheduler. One shared `BatchGenerator` runs all
-/// concurrent requests through one batched forward pass per step.
-///
-/// Lifecycle:
-///   1. `loadModel(container:modelId:)` snapshots the tokenizer + EOS
-///      tokens and starts a long-running worker task.
-///   2. `submit(request:requestId:)` tokenizes the chat-template prompt,
-///      enqueues into the BatchGenerator, and returns an
-///      `AsyncStream<GenerationEvent>`.
-///   3. The detached worker calls `stepEngine()` repeatedly, dispatching
-///      per-row tokens as detokenized text chunks.
-///   4. `unloadModel()` cancels everything.
+/// Continuous-batching scheduler. Wraps a single `MLXLMCommon.BatchedEngine`
+/// per loaded model. The engine owns the GPU step loop; this actor owns
+/// admission control, KV-byte budgeting, the pending-queue timeout, and
+/// the adaptive concurrency cap.
 public actor BatchScheduler {
 
-    private let maxConcurrentRequests: Int
-    private let pendingTimeout: Duration
-    private let defaultMaxTokens: Int
+    // MARK: - Configuration (immutable after init)
 
-    private var modelContainer: ModelContainer?
-    private var modelId: String = ""
-    private var modelWeightBytes: Int = 0
+    let maxConcurrentRequests: Int
+    let pendingTimeout: Duration
+    /// Default max output tokens when the consumer omits `max_tokens`.
+    /// Starts at the init value (typically 4096) and is raised post-load
+    /// when the model's context length is known.
+    var defaultMaxTokens: Int
+    let kvBudget: GlobalKVCacheBudget?
+    let adaptiveCapPolicy = AdaptiveBatchCapPolicy.default
 
-    private var tokenizer: TokenizerBox?
-    private var generator: BatchGenerator?
-    private var workerTask: Task<Void, Never>?
+    // MARK: - Model-specific state (set by `loadModel`)
 
-    private var active: [Int: ActiveRequest] = [:]
-    private var requestIdToUid: [String: Int] = [:]
-    private var pending: [PendingRequest] = []
-    private var cancelledUIDs = Set<Int>()
-    private var generationEpoch: UInt64 = 0
-    private var engineBusy = false
+    var modelContainer: ModelContainer?
+    var modelId: String = ""
+    var modelWeightBytes: Int = 0
+    var kvBytesPerToken: Int = 400_000
+    var dynamicTokenBudgetMax: Int = 0
+    /// The model's maximum context window read from config.json
+    /// (`max_position_embeddings`). Used to size `maxTokensPerBatch`
+    /// so prompts up to the model's context length are admissible.
+    var maxContextLength: Int = 0
+    var tokenizer: TokenizerHandle?
+    var engine: BatchedEngine?
 
-    /// Once every active row has received its first token, run several decode
-    /// steps per actor/model hop. A single hop per token starves Gemma-class
-    /// models because the CPU actor round trip is larger than one GPU step.
-    private let decodeBurstSteps = 32
+    /// Admission control + token budget tracking. `nil` until `loadModel()`.
+    var planner: BatchQueuePlanner?
 
+    /// Watchdog for planner-pending requests that exceed `pendingTimeout`.
+    var pendingTimeoutTask: Task<Void, Never>?
+    /// Bumped on every `loadModel` / `stopCurrentEngine` so stale model
+    /// loads can detect they've been superseded.
+    var generationEpoch: UInt64 = 0
+
+    // MARK: - Per-request state (mutated by bridge + admission paths)
+
+    /// Populated in `submit(...)` before `engine.core.addRequest`; torn
+    /// down by the per-request streaming Task on finish/abort.
+    var activeBridges: [String: BridgeState] = [:]
+    /// Bridges aborted by the pending-timeout watchdog. Drives the
+    /// distinct "request timed out waiting for capacity" error string
+    /// (vs. "request cancelled" for client-initiated aborts).
+    var timedOutBridges: Set<String> = []
+
+    // MARK: - Telemetry state (read by `backendCapacity`)
+
+    var observedDecodeTpsEwma: Double = 0
+    var ewmaInitialized = false
+    /// Per-batch-size TPS samples that drive `AdaptiveBatchCapPolicy`.
+    var performanceByBatchSize: [Int: AdaptiveBatchPerformanceBucket] = [:]
+    var lastBatchSampleAt: ContinuousClock.Instant = .now
+    var dynamicMaxConcurrentRequests: Int
+    var pendingSummaryCache: PendingSummary = .empty
+
+    /// Memory-kind selector for `gpuMemory(_:)` in the telemetry extension.
+    enum MemoryKind { case active, peak, cache }
+
+    // Computed admission / capacity properties (tokenBudgetMax,
+    // activeTokenBudgetUsed, effectiveMaxConcurrentRequests, etc.)
+    // live in `BatchScheduler+Telemetry.swift` next to the heartbeat
+    // surface that consumes them.
+
+    // MARK: - Init
+
+    /// The init-time default; restored on `stopCurrentEngine()`.
+    private let initDefaultMaxTokens: Int
 
     public init(
         maxConcurrentRequests: Int = 4,
         pendingTimeout: Duration = .seconds(120),
-        defaultMaxTokens: Int = 4096
+        defaultMaxTokens: Int = 4096,
+        kvBudget: GlobalKVCacheBudget? = nil
     ) {
         self.maxConcurrentRequests = max(1, maxConcurrentRequests)
         self.pendingTimeout = pendingTimeout
         self.defaultMaxTokens = defaultMaxTokens
+        self.initDefaultMaxTokens = defaultMaxTokens
+        self.kvBudget = kvBudget
+        self.dynamicMaxConcurrentRequests = min(4, max(1, maxConcurrentRequests))
     }
 
     // MARK: - Model lifecycle
 
     public func loadModel(container: ModelContainer, modelId: String) async {
-        // Hard-fail before we touch any model weights if the GPU is
-        // unavailable. CPU fallback for inference would be a silent
-        // 100\u{D7} performance regression; never acceptable for the
-        // production provider.
+        // Hard-fail if Metal is unavailable; CPU inference is not acceptable.
         do {
             _ = try GPUEnforcement.requireMetal()
         } catch {
@@ -96,33 +134,145 @@ public actor BatchScheduler {
         await stopCurrentEngine()
         let loadEpoch = generationEpoch
 
-        let snapshot: LoadSnapshot = await container.perform { ctx in
-            let bytes = ctx.model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
-            var eos: [[Int]] = []
-            if let id = ctx.tokenizer.convertTokenToId(ctx.tokenizer.eosToken ?? "") {
-                eos.append([id])
-            }
-            return LoadSnapshot(
-                bytes: bytes,
-                eos: eos,
-                tokenizer: TokenizerBox(ctx.tokenizer),
-                model: ctx.model
-            )
-        }
+        let snapshot = await Self.snapshotContainer(container)
+        // Detect concurrent reload that won the race; bail before we
+        // overwrite the new model's state with our stale snapshot.
         guard loadEpoch == generationEpoch else { return }
 
         self.modelContainer = container
         self.modelId = modelId
         self.modelWeightBytes = snapshot.bytes
         self.tokenizer = snapshot.tokenizer
-        self.generator = BatchGenerator(
-            model: snapshot.model,
-            eosTokens: snapshot.eos,
-            defaultMaxTokens: defaultMaxTokens,
-            prefillBatchSize: maxConcurrentRequests,
-            completionBatchSize: maxConcurrentRequests
+
+        let engine = await Self.makeBatchedEngine(
+            container: container,
+            modelId: modelId,
+            maxConcurrentRequests: maxConcurrentRequests,
+            eosTokenIds: snapshot.eosTokenIds
         )
-        startWorker()
+        // Re-check epoch after the engine.start suspension. If another
+        // load/unload won the race, tear down the engine we just built
+        // and bail before we overwrite the winner's state.
+        guard loadEpoch == generationEpoch else {
+            await engine.stop()
+            return
+        }
+        self.engine = engine
+        await engine.start()
+        // Final epoch check after start() — start can suspend too.
+        guard loadEpoch == generationEpoch else {
+            self.engine = nil
+            await engine.stop()
+            return
+        }
+
+        applyPostLoadBudgets(snapshot: snapshot)
+        // Apply the conservative startup cap before admitting any request,
+        // otherwise the first few submits could run at the hard cap until
+        // the adaptive policy kicks in.
+        engine.setMaxNumSeqs(dynamicMaxConcurrentRequests)
+        self.planner = makePlanner(activeTokenBudget: tokenBudgetMax)
+        // Engine has no pending-queue TTL; we enforce `pendingTimeout`.
+        startPendingTimeoutWatchdog()
+    }
+
+    /// Snapshot model bytes + tokenizer + architecture out of the
+    /// container. Runs inside `container.perform` (off-actor); returns
+    /// a Sendable struct so the actor can resume on its own executor.
+    private static func snapshotContainer(_ container: ModelContainer) async -> LoadSnapshot {
+        await container.perform { ctx in
+            let bytes = ctx.model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+
+            // Read architecture from config.json: covers hybrid models
+            // (Gemma 3/3n/4) that don't conform to KVCacheDimensionProvider.
+            let architecture: ModelArchitecture
+            if case .directory(let modelDir) = ctx.configuration.id {
+                let configURL = modelDir.appendingPathComponent("config.json")
+                architecture = KVEstimation.parseModelArchitecture(at: configURL)
+            } else {
+                architecture = .empty
+            }
+            return LoadSnapshot(
+                bytes: bytes,
+                tokenizer: TokenizerHandle(ctx.tokenizer),
+                eosTokenIds: ctx.configuration.eosTokenIds,
+                architecture: architecture
+            )
+        }
+    }
+
+    /// Build a `BatchedEngine` with our scheduler config. Pulled out
+    /// of `loadModel` so the lifecycle code reads as a sequence of
+    /// 5-line steps. SECURITY (TB-007): the engine's prefix cache
+    /// persists token sequences across requests in process memory.
+    /// Cross-tenant data-leak risk; do not enable without a fresh
+    /// threat model.
+    private static func makeBatchedEngine(
+        container: ModelContainer,
+        modelId: String,
+        maxConcurrentRequests: Int,
+        eosTokenIds: Set<Int>
+    ) async -> BatchedEngine {
+        await container.perform { ctx -> BatchedEngine in
+            let scheduler = Scheduler(
+                model: ctx.model,
+                tokenizer: ctx.tokenizer,
+                config: SchedulerConfig(
+                    maxNumSeqs: maxConcurrentRequests,
+                    maxNumBatchedTokens: 8192,
+                    prefillStepSize: 512,
+                    streamInterval: 1,
+                    maxKVCacheTokens: 0  // unlimited — our kvBudget gates by bytes
+                ),
+                eosTokenIds: eosTokenIds,
+                prefixCache: nil  // SECURITY: TB-007
+            )
+            return BatchedEngine(
+                scheduler: scheduler,
+                tokenizer: ctx.tokenizer,
+                modelName: modelId,
+                config: ContinuousBatchingConfig(
+                    schedulerConfig: scheduler.config,
+                    stepInterval: 0.001,
+                    prefixCacheConfig: nil,  // SECURITY: TB-007
+                    mtpEnabled: false
+                ),
+                externalChatTemplate: nil
+            )
+        }
+    }
+
+    /// Set the post-load budgets driven by architecture + physical
+    /// memory. Pulled out of `loadModel` so the lifecycle reads as a
+    /// short sequence; the arithmetic itself is unchanged.
+    private func applyPostLoadBudgets(snapshot: LoadSnapshot) {
+        self.kvBytesPerToken = Self.resolvedKVBytesPerToken(
+            architecture: snapshot.architecture,
+            weightBytes: snapshot.bytes
+        )
+        let totalMemory = Int(ProcessInfo.processInfo.physicalMemory)
+        let osReserve = 4 * 1024 * 1024 * 1024
+        let safetyMargin = totalMemory / 10
+        let availableForKV = totalMemory - snapshot.bytes - osReserve - safetyMargin
+        if availableForKV > 0 && kvBytesPerToken > 0 {
+            self.dynamicTokenBudgetMax = max(availableForKV / kvBytesPerToken, 1024)
+        } else {
+            self.dynamicTokenBudgetMax = 1024
+        }
+
+        // Derive context-aware limits from config.json.
+        self.maxContextLength = snapshot.architecture.maxContextLength ?? 0
+        if maxContextLength > 0 {
+            // Raise the default max output tokens so consumers that omit
+            // `max_tokens` get a reasonable budget for the model's class.
+            // Cap at 8192 so we don't over-reserve with very-long-context
+            // models (e.g. 131K Qwen).
+            self.defaultMaxTokens = min(maxContextLength, 8192)
+        }
+
+        self.dynamicMaxConcurrentRequests = min(4, maxConcurrentRequests)
+        self.performanceByBatchSize.removeAll()
+        self.lastBatchSampleAt = .now
     }
 
     public func unloadModel() async {
@@ -131,19 +281,128 @@ public actor BatchScheduler {
 
     // MARK: - Submit / cancel
 
-    public func submit(
-        request: ChatCompletionRequest,
+    /// Submit a pre-tokenized prompt. Used by `MultiModelBatchSchedulerEngine`
+    /// which tokenizes the full OpenAI request (including tools, tool_call_id,
+    /// reasoning_content, etc.) itself, then hands the token IDs here.
+    ///
+    /// This bypasses the lossy `ChatMessage → applyChatTemplate` path in the
+    /// `ChatCompletionRequest` overload, which drops tool-related fields.
+    public func submitTokenized(
+        promptTokens: [Int],
+        maxTokens: Int,
+        temperature: Float = 0.0,
+        topP: Float? = nil,
+        topK: Int? = nil,
+        seed: UInt64? = nil,
         requestId: String? = nil
-    ) -> AsyncStream<GenerationEvent> {
+    ) async -> AsyncStream<GenerationEvent> {
         let id = requestId ?? "req-\(UUID().uuidString.prefix(12))"
         let (stream, continuation) = AsyncStream<GenerationEvent>.makeStream()
 
-        guard generator != nil, let tk = tokenizer else {
+        guard let engine = self.engine else {
             continuation.yield(.error("No model loaded"))
             continuation.finish()
             return stream
         }
 
+        let requestBudget = promptTokens.count + maxTokens
+        guard requestBudget <= tokenBudgetMax else {
+            continuation.yield(.error(
+                "token_budget_exhausted: request requires \(requestBudget) tokens but only \(tokenBudgetMax) available"
+            ))
+            continuation.finish()
+            return stream
+        }
+
+        let activeUsed = activeTokenBudgetUsed
+        if activeUsed + requestBudget > tokenBudgetMax {
+            continuation.yield(.error(
+                "token_budget_exhausted: request requires \(requestBudget) tokens but only \(tokenBudgetMax - activeUsed) available"
+            ))
+            continuation.finish()
+            return stream
+        }
+        let bridge = BridgeState(
+            requestId: id,
+            promptTokens: promptTokens.count,
+            maxTokens: maxTokens,
+            submittedAt: .now
+        )
+        activeBridges[id] = bridge
+
+        if let planner = self.planner {
+            await refreshPlannerPolicy(activeTokenBudget: tokenBudgetMax)
+            let result = await planner.admit(
+                id: id,
+                promptTokenCount: promptTokens.count,
+                maxOutputTokens: maxTokens
+            )
+            if case .rejected(_, let reason) = result {
+                await dropBridge(requestId: id)
+                continuation.yield(.error(Self.errorMessage(for: reason)))
+                continuation.finish()
+                return stream
+            }
+            await refreshPendingSummaryCache()
+        }
+
+        if let kvBudget {
+            let reserved = await kvBudget.reserve(
+                requestID: id,
+                kvBytesPerToken: kvBytesPerToken,
+                tokenCount: requestBudget
+            )
+            guard reserved else {
+                await dropBridge(requestId: id)
+                continuation.yield(.error("token_budget_exhausted: insufficient global KV cache headroom"))
+                continuation.finish()
+                return stream
+            }
+        }
+
+        var sp = SamplingParams(maxTokens: maxTokens, temperature: temperature)
+        if let topP { sp.topP = topP }
+        if let topK { sp.topK = topK }
+        if let seed { sp.seed = seed }
+
+        let req = Request(
+            requestId: id,
+            prompt: promptTokens as AnyHashable,
+            samplingParams: sp
+        )
+        _ = await engine.core.addRequest(req)
+
+        runBridge(
+            requestId: id,
+            outputStream: engine.core.streamOutputs(requestId: id),
+            continuation: continuation
+        )
+
+        let scheduler = self
+        continuation.onTermination = { @Sendable termination in
+            if case .cancelled = termination {
+                Task { await scheduler.cancel(requestId: id) }
+            }
+        }
+
+        return stream
+    }
+
+    public func submit(
+        request: ChatCompletionRequest,
+        requestId: String? = nil
+    ) async -> AsyncStream<GenerationEvent> {
+        let id = requestId ?? "req-\(UUID().uuidString.prefix(12))"
+        let (stream, continuation) = AsyncStream<GenerationEvent>.makeStream()
+
+        guard let engine = self.engine, let tk = tokenizer else {
+            continuation.yield(.error("No model loaded"))
+            continuation.finish()
+            return stream
+        }
+
+        // Pre-tokenize so chat-template errors surface as `.error` events;
+        // engine's internal `buildPrompt` silently falls back to role:content.
         let messages: [[String: any Sendable]] = request.messages.map { msg in
             ["role": msg.role, "content": msg.content]
         }
@@ -158,30 +417,99 @@ public actor BatchScheduler {
             return stream
         }
 
-        let maxTokens = request.max_tokens ?? defaultMaxTokens
-        let temperature = request.temperature ?? 0.0
-        // Pass `nil` for greedy rows so GenerationBatch.step takes its
-        // vectorized fast path (one batched argMax across all rows)
-        // instead of per-row slice + sample + concat. With temperature=0
-        // the fallback sampler is also greedy, so the result is
-        // identical -- only the dispatch path changes.
-        let sampler: RowSampler? = temperature <= 0
-            ? nil
-            : makeRowSampler(
-                temperature: temperature,
-                topP: request.top_p ?? 1.0,
-                topK: request.top_k ?? 0,
-                seed: request.seed
-            )
-        pending.append(PendingRequest(
+        let maxTokens = Self.resolvedMaxTokens(
+            requested: request.max_tokens, defaultMaxTokens: defaultMaxTokens
+        )
+
+        let requestBudget = promptTokens.count + maxTokens
+        guard requestBudget <= tokenBudgetMax else {
+            continuation.yield(.error(
+                "token_budget_exhausted: request requires \(requestBudget) tokens but only \(tokenBudgetMax) available"
+            ))
+            continuation.finish()
+            return stream
+        }
+
+        // P1 fix (atomic): the cumulative gate + slot reservation must
+        // run in one synchronous block. Actor reentrancy across the
+        // upcoming `planner.admit` / `kvBudget.reserve` awaits would
+        // otherwise let two concurrent submits both read the same
+        // `activeTokenBudgetUsed` and both pass the check.
+        //
+        // Reserve our slot by inserting the bridge into `activeBridges`
+        // BEFORE the first await. Other interleaving submits will see
+        // this request's budget in `activeTokenBudgetUsed`. Any early
+        // exit below (planner reject, KV reject) must roll back the
+        // bridge via `dropBridge(...)`.
+        let activeUsed = activeTokenBudgetUsed
+        if activeUsed + requestBudget > tokenBudgetMax {
+            continuation.yield(.error(
+                "token_budget_exhausted: request requires \(requestBudget) tokens but only \(tokenBudgetMax - activeUsed) available"
+            ))
+            continuation.finish()
+            return stream
+        }
+        let bridge = BridgeState(
             requestId: id,
-            continuation: continuation,
-            promptTokens: promptTokens,
-            detokenizer: NaiveStreamingDetokenizer(tokenizer: tk.inner),
+            promptTokens: promptTokens.count,
             maxTokens: maxTokens,
-            sampler: sampler,
             submittedAt: .now
-        ))
+        )
+        activeBridges[id] = bridge
+
+        if let planner = self.planner {
+            await refreshPlannerPolicy(activeTokenBudget: tokenBudgetMax)
+            let result = await planner.admit(
+                id: id,
+                promptTokenCount: promptTokens.count,
+                maxOutputTokens: maxTokens
+            )
+            if case .rejected(_, let reason) = result {
+                await dropBridge(requestId: id)
+                continuation.yield(.error(Self.errorMessage(for: reason)))
+                continuation.finish()
+                return stream
+            }
+            await refreshPendingSummaryCache()
+        }
+
+        if let kvBudget {
+            let reserved = await kvBudget.reserve(
+                requestID: id,
+                kvBytesPerToken: kvBytesPerToken,
+                tokenCount: requestBudget
+            )
+            guard reserved else {
+                await dropBridge(requestId: id)
+                continuation.yield(.error("token_budget_exhausted: insufficient global KV cache headroom"))
+                continuation.finish()
+                return stream
+            }
+        }
+
+        // Greedy (temperature == 0) hits the engine's vectorized argmax
+        // fast path automatically; just pass the requested value through.
+        let temperature = request.temperature ?? 0.0
+        var sp = SamplingParams(maxTokens: maxTokens, temperature: temperature)
+        if let topP = request.top_p { sp.topP = topP }
+        if let topK = request.top_k { sp.topK = topK }
+        if let seed = request.seed { sp.seed = seed }
+
+        let req = Request(
+            requestId: id,
+            prompt: promptTokens as AnyHashable,
+            samplingParams: sp
+        )
+        _ = await engine.core.addRequest(req)
+
+        // Hand the per-request stream to the bridge extension. Bridge
+        // teardown / finish-event mapping all live in
+        // `BatchScheduler+EngineBridge.swift`.
+        runBridge(
+            requestId: id,
+            outputStream: engine.core.streamOutputs(requestId: id),
+            continuation: continuation
+        )
 
         let scheduler = self
         continuation.onTermination = { @Sendable termination in
@@ -193,27 +521,42 @@ public actor BatchScheduler {
         return stream
     }
 
-    public func cancel(requestId: String) {
-        if let uid = requestIdToUid[requestId] {
-            finishRequest(uid: uid, error: "Request cancelled")
+    public func cancel(requestId: String) async {
+        if let engine = self.engine {
+            // Engine delivers a terminal RequestOutput synchronously; the
+            // streaming Task handles `recordFinish` + KV release.
+            _ = engine.core.abortRequest(requestId)
             return
         }
-        guard let index = pending.firstIndex(where: { $0.requestId == requestId }) else { return }
-        let entry = pending.remove(at: index)
-        entry.continuation.yield(.error("Request cancelled"))
-        entry.continuation.finish()
+        // No engine: request may still be planner-pending.
+        if let planner = self.planner {
+            await planner.cancel(requestID: requestId)
+            await refreshPendingSummaryCache()
+        }
+        await releaseKVReservation(requestID: requestId)
     }
 
-    public func cancelAll() {
-        let uids = Array(active.keys)
-        for uid in uids {
-            finishRequest(uid: uid, error: "Scheduler shutting down")
+    public func cancelAll() async {
+        if let engine = self.engine {
+            _ = engine.core.abortAllRequests()
         }
-        for entry in pending {
-            entry.continuation.yield(.error("Scheduler shutting down"))
-            entry.continuation.finish()
+        // Planner pending queue: engine only knows about admitted requests.
+        if let planner = self.planner {
+            let snapshot = await planner.snapshot()
+            for entry in snapshot.pendingRequests {
+                await planner.cancel(requestID: entry.id)
+            }
+            for entry in snapshot.activeRequests {
+                await planner.cancel(requestID: entry.id)
+            }
+            await refreshPendingSummaryCache()
         }
-        pending.removeAll()
+        let bridgeIds = Array(activeBridges.keys)
+        for id in bridgeIds {
+            await releaseKVReservation(requestID: id)
+        }
+        activeBridges.removeAll()
+        timedOutBridges.removeAll()
     }
 
     // MARK: - Capacity
@@ -221,9 +564,10 @@ public actor BatchScheduler {
     public func capacity() -> SchedulerCapacity {
         SchedulerCapacity(
             model: modelId,
-            activeRequests: active.count + cancelledUIDs.count,
-            pendingRequests: pending.count,
-            maxConcurrent: maxConcurrentRequests,
+            activeRequests: activeBridges.count,
+            pendingRequests: pendingRequestCount,
+            maxConcurrent: effectiveMaxConcurrentRequests,
+            engineMaxConcurrent: maxConcurrentRequests,
             gpuMemoryActiveBytes: gpuMemory(.active),
             gpuMemoryPeakBytes: gpuMemory(.peak),
             gpuMemoryCacheBytes: gpuMemory(.cache),
@@ -231,281 +575,106 @@ public actor BatchScheduler {
         )
     }
 
-    public func backendCapacity() -> BackendCapacity {
-        let cap = capacity()
-        let gbDivisor = 1024.0 * 1024.0 * 1024.0
-        let slot = BackendSlotCapacity(
-            model: cap.model,
-            state: cap.activeRequests > 0 ? "running" : "idle",
-            numRunning: UInt32(cap.activeRequests),
-            numWaiting: UInt32(cap.pendingRequests),
-            activeTokens: 0,
-            maxTokensPotential: Int64(defaultMaxTokens * maxConcurrentRequests)
-        )
-        return BackendCapacity(
-            slots: [slot],
-            gpuMemoryActiveGb: Double(cap.gpuMemoryActiveBytes) / gbDivisor,
-            gpuMemoryPeakGb: Double(cap.gpuMemoryPeakBytes) / gbDivisor,
-            gpuMemoryCacheGb: Double(cap.gpuMemoryCacheBytes) / gbDivisor,
-            totalMemoryGb: Double(cap.totalMemoryBytes) / gbDivisor
-        )
-    }
-
-    // MARK: - Worker (runs in a detached Task; calls into actor only briefly)
-
-    private func startWorker() {
-        workerTask?.cancel()
-        let scheduler = self
-        workerTask = Task.detached {
-            while !Task.isCancelled {
-                let didStep = await scheduler.stepEngine()
-                if !didStep {
-                    try? await Task.sleep(for: .milliseconds(5))
-                }
-            }
-        }
-    }
-
-    private func stepEngine() async -> Bool {
-        guard let gen = generator, let container = modelContainer else { return false }
-        let epoch = generationEpoch
-        expireTimedOutPending()
-        applyCancelledRequests(to: gen)
-        admitPendingRequests(into: gen)
-        if !gen.hasWork { return false }
-
-        let burstSteps = shouldPrioritizeFirstToken ? 1 : decodeBurstSteps
-        engineBusy = true
-        let responses: [GenerationBatchResponse] = await container.perform { _ in
-            var all: [GenerationBatchResponse] = []
-            all.reserveCapacity(max(1, gen.activeCount) * burstSteps)
-            for _ in 0 ..< burstSteps {
-                if !gen.hasWork { break }
-                all.append(contentsOf: gen.next())
-            }
-            return all
-        }
-        engineBusy = false
-        guard epoch == generationEpoch, generator === gen else {
-            return false
-        }
-        applyCancelledRequests(to: gen)
-        dispatchResponses(responses, producedAt: .now)
-        return true
-    }
-
-    private var shouldPrioritizeFirstToken: Bool {
-        active.values.contains { $0.completionTokens == 0 }
-    }
-
-    private func admitPendingRequests(into gen: BatchGenerator) {
-        guard !pending.isEmpty else { return }
-        let freeSlots = max(0, maxConcurrentRequests - active.count)
-        guard freeSlots > 0 else { return }
-
-        let batch = Array(pending.prefix(freeSlots))
-        pending.removeFirst(batch.count)
-
-        let assignedUids = gen.insert(
-            prompts: batch.map(\.promptTokens),
-            maxTokens: batch.map(\.maxTokens),
-            samplers: batch.map(\.sampler)
-        )
-
-        for (uid, entry) in zip(assignedUids, batch) {
-            active[uid] = ActiveRequest(
-                requestId: entry.requestId,
-                continuation: entry.continuation,
-                detokenizer: entry.detokenizer,
-                promptTokens: entry.promptTokens.count,
-                completionTokens: 0,
-                firstTokenAt: nil,
-                lastTokenAt: nil,
-                submittedAt: entry.submittedAt
-            )
-            requestIdToUid[entry.requestId] = uid
-        }
-
-        if assignedUids.count < batch.count {
-            for entry in batch.dropFirst(assignedUids.count) {
-                entry.continuation.yield(.error("BatchGenerator rejected the prompt"))
-                entry.continuation.finish()
-            }
-        }
-    }
-
-    private func expireTimedOutPending(now: ContinuousClock.Instant = .now) {
-        guard !pending.isEmpty else { return }
-
-        var stillPending: [PendingRequest] = []
-        stillPending.reserveCapacity(pending.count)
-        for entry in pending {
-            if now - entry.submittedAt >= pendingTimeout {
-                entry.continuation.yield(.error("Request timed out waiting for capacity"))
-                entry.continuation.finish()
-            } else {
-                stillPending.append(entry)
-            }
-        }
-        pending = stillPending
-    }
-
-    private func applyCancelledRequests(to gen: BatchGenerator) {
-        guard !cancelledUIDs.isEmpty else { return }
-        for uid in cancelledUIDs {
-            gen.cancel(uid: uid)
-        }
-        cancelledUIDs.removeAll()
-    }
+    // MARK: - Internal helpers
 
     private func stopCurrentEngine() async {
-        cancelAll()
         generationEpoch &+= 1
-        workerTask?.cancel()
-        workerTask = nil
-        generator = nil
+        pendingTimeoutTask?.cancel()
+        pendingTimeoutTask = nil
+
+        if let engine = self.engine {
+            _ = engine.core.abortAllRequests()
+            await engine.stop()
+        }
+        self.engine = nil
         modelContainer = nil
         tokenizer = nil
+
+        let bridgeIds = Array(activeBridges.keys)
+        for id in bridgeIds {
+            await releaseKVReservation(requestID: id)
+        }
+        activeBridges.removeAll()
+        timedOutBridges.removeAll()
+        pendingSummaryCache = .empty
+
         modelWeightBytes = 0
         modelId = ""
-
-        while engineBusy {
-            try? await Task.sleep(for: .milliseconds(1))
-        }
-        cancelledUIDs.removeAll()
+        kvBytesPerToken = 400_000
+        dynamicTokenBudgetMax = 0
+        maxContextLength = 0
+        defaultMaxTokens = initDefaultMaxTokens
+        planner = nil
+        observedDecodeTpsEwma = 0
+        ewmaInitialized = false
+        performanceByBatchSize.removeAll()
+        dynamicMaxConcurrentRequests = min(4, maxConcurrentRequests)
     }
 
-    private func dispatchResponses(
-        _ responses: [GenerationBatchResponse],
-        producedAt: ContinuousClock.Instant
-    ) {
-        var byUID: [Int: [GenerationBatchResponse]] = [:]
-        byUID.reserveCapacity(responses.count)
-        for response in responses {
-            byUID[response.uid, default: []].append(response)
-        }
-
-        for uid in responses.map(\.uid) where byUID[uid] != nil {
-            let rowResponses = byUID.removeValue(forKey: uid)!
-            dispatchRowResponses(rowResponses, producedAt: producedAt)
-        }
+    /// P1 fix: cumulative active-bridge gate, called from tests.
+    ///
+    /// `submit()` inlines the same check synchronously before its
+    /// first `await` (so the gate is atomic with respect to actor
+    /// reentrancy). This helper exists so unit tests can probe the
+    /// gate without a loaded model + non-nil engine.
+    ///
+    /// Returns the canonical `token_budget_exhausted:` error string on
+    /// rejection, or `nil` on accept. Does NOT reserve a slot — that
+    /// happens inline in `submit()` to keep the (check + reserve)
+    /// pair atomic.
+    func checkCumulativeTokenBudget(
+        requestId: String,
+        requestBudget: Int
+    ) -> String? {
+        let activeUsed = activeTokenBudgetUsed
+        guard activeUsed + requestBudget > tokenBudgetMax else { return nil }
+        return "token_budget_exhausted: request requires \(requestBudget) tokens but only \(tokenBudgetMax - activeUsed) available"
     }
 
-    private func dispatchRowResponses(
-        _ responses: [GenerationBatchResponse],
-        producedAt: ContinuousClock.Instant
-    ) {
-        guard let first = responses.first, var entry = active[first.uid] else { return }
-
-        var finalResponse: GenerationBatchResponse?
-        for response in responses {
-            entry.detokenizer.append(token: response.token)
-            entry.completionTokens += 1
-            if entry.firstTokenAt == nil {
-                entry.firstTokenAt = producedAt
-            }
-            entry.lastTokenAt = producedAt
-            if response.finishReason != nil {
-                finalResponse = response
-            }
-        }
-
-        if let chunk = entry.detokenizer.next(), !chunk.isEmpty {
-            entry.continuation.yield(.chunk(chunk))
-        }
-        active[first.uid] = entry
-
-        if finalResponse != nil {
-            // One final flush. `NaiveStreamingDetokenizer.next()` returns
-            // the substring added since the last call; once the segment is
-            // fully consumed it returns "" (not nil), so calling it in a
-            // loop would spin forever re-decoding the same prefix.
-            if let tail = entry.detokenizer.next(), !tail.isEmpty {
-                entry.continuation.yield(.chunk(tail))
-            }
-
-            let tps: Double
-            if let firstTokenAt = entry.firstTokenAt, let lastTokenAt = entry.lastTokenAt,
-                entry.completionTokens > 1
-            {
-                let decodeElapsed = lastTokenAt - firstTokenAt
-                let elapsedSeconds = Double(decodeElapsed.components.seconds)
-                    + Double(decodeElapsed.components.attoseconds) / 1e18
-                tps = elapsedSeconds > 0
-                    ? Double(entry.completionTokens - 1) / elapsedSeconds : 0
-            } else {
-                let elapsed = ContinuousClock.now - entry.submittedAt
-                let elapsedSeconds = Double(elapsed.components.seconds)
-                    + Double(elapsed.components.attoseconds) / 1e18
-                tps = elapsedSeconds > 0
-                    ? Double(entry.completionTokens) / elapsedSeconds : 0
-            }
-
-            entry.continuation.yield(.info(
-                promptTokens: entry.promptTokens,
-                completionTokens: entry.completionTokens,
-                tokensPerSecond: tps
-            ))
-            entry.continuation.finish()
-            active.removeValue(forKey: first.uid)
-            requestIdToUid.removeValue(forKey: entry.requestId)
-        }
+    private func makePlanner(activeTokenBudget: Int) -> BatchQueuePlanner {
+        BatchQueuePlanner(
+            policy: BatchSchedulingPolicy(
+                maxConcurrentRequests: maxConcurrentRequests,
+                maxQueuedRequests: 128,
+                maxActiveTokenBudget: activeTokenBudget,
+                maxTokensPerBatch: resolvedMaxTokensPerBatch(activeTokenBudget: activeTokenBudget)
+            )
+        )
     }
 
-    private func finishRequest(uid: Int, error: String) {
-        guard let entry = active.removeValue(forKey: uid) else { return }
-        cancelledUIDs.insert(uid)
-        requestIdToUid.removeValue(forKey: entry.requestId)
-        entry.continuation.yield(.error(error))
-        entry.continuation.finish()
-    }
+    private func refreshPlannerPolicy(activeTokenBudget: Int) async {
+        guard let planner else { return }
+        let updatedPolicy = BatchSchedulingPolicy(
+            maxConcurrentRequests: maxConcurrentRequests,
+            maxQueuedRequests: 128,
+            maxActiveTokenBudget: activeTokenBudget,
+            maxTokensPerBatch: resolvedMaxTokensPerBatch(activeTokenBudget: activeTokenBudget)
+        )
+        let snapshot = await planner.snapshot()
+        guard snapshot.policy != updatedPolicy else { return }
 
-    private enum MemoryKind { case active, peak, cache }
-
-    private func gpuMemory(_ kind: MemoryKind) -> Int {
-        #if canImport(Metal)
-        switch kind {
-        case .active: return MLX.GPU.activeMemory
-        case .peak: return MLX.GPU.peakMemory
-        case .cache: return MLX.GPU.cacheMemory
+        if activeTokenBudget >= snapshot.policy.maxActiveTokenBudget {
+            await planner.updatePolicy(updatedPolicy)
+            return
         }
-        #else
-        return 0
-        #endif
+
+        guard snapshot.pendingRequests.isEmpty,
+              snapshot.activeRequests.isEmpty else { return }
+        await planner.updatePolicy(updatedPolicy)
     }
-}
 
-// MARK: - Supporting types
+    /// Derive the per-request prompt admission limit from the model's
+    /// context window. Falls back to 8192 when `config.json` is missing
+    /// or doesn't declare `max_position_embeddings`. Capped by the live
+    /// token budget so we never admit a prompt that couldn't possibly
+    /// fit in memory.
+    private func resolvedMaxTokensPerBatch(activeTokenBudget: Int) -> Int {
+        let contextBased = maxContextLength > 0 ? maxContextLength : 8192
+        return min(contextBased, max(activeTokenBudget, 1))
+    }
 
-private struct ActiveRequest {
-    let requestId: String
-    let continuation: AsyncStream<GenerationEvent>.Continuation
-    var detokenizer: NaiveStreamingDetokenizer
-    var promptTokens: Int
-    var completionTokens: Int
-    var firstTokenAt: ContinuousClock.Instant?
-    var lastTokenAt: ContinuousClock.Instant?
-    let submittedAt: ContinuousClock.Instant
-}
-
-private struct PendingRequest {
-    let requestId: String
-    let continuation: AsyncStream<GenerationEvent>.Continuation
-    let promptTokens: [Int]
-    var detokenizer: NaiveStreamingDetokenizer
-    let maxTokens: Int
-    let sampler: RowSampler?
-    let submittedAt: ContinuousClock.Instant
-}
-
-private struct LoadSnapshot: @unchecked Sendable {
-    let bytes: Int
-    let eos: [[Int]]
-    let tokenizer: TokenizerBox
-    let model: any LanguageModel
-}
-
-private final class TokenizerBox: @unchecked Sendable {
-    let inner: any MLXLMCommon.Tokenizer
-    init(_ inner: any MLXLMCommon.Tokenizer) { self.inner = inner }
+    // Static helpers live in adjacent extensions:
+    //   * `resolvedMaxTokens`, `resolvedKVBytesPerToken` →
+    //     `BatchScheduler+KVEstimation.swift`
+    //   * `errorMessage(for:)` → `BatchSchedulerTypes.swift`
 }

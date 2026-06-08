@@ -72,9 +72,11 @@ var telemetryFieldAllowlist = map[string]struct{}{
 	"reason":            {},
 	"runtime_component": {},
 	// Connectivity
-	"reconnect_count": {},
-	"last_error":      {},
-	"ws_state":        {},
+	"reconnect_count":   {},
+	"last_error":        {},
+	"ws_state":          {},
+	"network_reachable": {}, // distinguishes "coordinator down" from "box offline"
+	"coordinator_url":   {},
 	// Billing (booleans/enums only — no dollar amounts)
 	"billing_method": {},
 	"payment_failed": {},
@@ -207,12 +209,9 @@ func (s *Server) handleTelemetryIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(records) > 0 {
-		if err := s.store.InsertTelemetryEvents(r.Context(), records); err != nil {
-			s.logger.Error("telemetry: failed to insert events", "error", err, "count", len(records))
-			writeJSON(w, http.StatusInternalServerError, errorResponse("internal_error", "failed to persist telemetry"))
-			return
-		}
-		// Metrics: bump ingestion counters.
+		// Telemetry is NOT written to any store. Datadog is the sole sink.
+
+		// Metrics: bump ingestion counters (in-memory, no DB).
 		if s.metrics != nil {
 			for _, rec := range records {
 				s.metrics.IncCounter("telemetry_events_total",
